@@ -1,5 +1,4 @@
 require('dotenv').config();
-const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const {
@@ -17,6 +16,7 @@ const {
   mapWithConcurrency,
 } = require('./lib/ml');
 const { generateDraftAnswer } = require('./lib/agent');
+const { redis, withLock } = require('./lib/redis');
 
 const CLAIM_ROLE_LABELS = { mediator: 'Mediador (ML)', respondent: 'Vendedor (tú)', complainant: 'Cliente' };
 
@@ -54,31 +54,51 @@ async function resolveMediation(token, claimIds) {
   }
 }
 
-const CACHE_PATH = path.join(__dirname, 'data', 'messages-cache.json');
 const SELLER_ID = process.env.ML_SELLER_ID;
 
-// El sync completo y "regenerar borrador" hacen ambos un ciclo de leer-modificar-escribir
-// sobre el mismo archivo de caché. Sin esto, si corren al mismo tiempo, el que termine
-// último sobrescribe al otro y se pierden borradores ya generados. Esta cola obliga a que
-// esas operaciones corran una a la vez, sin importar desde qué endpoint se disparen.
-let cacheQueue = Promise.resolve();
-function withCacheQueue(task) {
-  const run = cacheQueue.then(task, task);
-  cacheQueue = run.then(() => {}, () => {});
-  return run;
+// El caché completo vive en un hash de Redis (un campo por packId) en vez de un solo
+// archivo JSON: así "regenerar borrador", "guardar edición" y "publicar" pueden tocar
+// SOLO su propio pack (HSET de un campo) sin tener que releer/reescribir los demás
+// ~170, y sin arriesgarse a pisar lo que otra operación concurrente acaba de guardar.
+const CACHE_PACKS_KEY = 'ml:cache:packs';
+const CACHE_META_KEY = 'ml:cache:meta';
+
+function parseMaybeJson(value) {
+  if (value == null) return value;
+  return typeof value === 'string' ? JSON.parse(value) : value;
 }
 
-function loadCache() {
-  try {
-    return JSON.parse(fs.readFileSync(CACHE_PATH, 'utf8'));
-  } catch {
-    return { syncedAt: null, packs: {} };
+async function loadCache() {
+  const [packsHash, meta] = await Promise.all([
+    redis.hgetall(CACHE_PACKS_KEY),
+    redis.get(CACHE_META_KEY),
+  ]);
+  const packs = {};
+  for (const [packId, value] of Object.entries(packsHash || {})) {
+    packs[packId] = parseMaybeJson(value);
   }
+  return { syncedAt: parseMaybeJson(meta)?.syncedAt || null, packs };
 }
 
-function saveCache(cache) {
-  fs.mkdirSync(path.dirname(CACHE_PATH), { recursive: true });
-  fs.writeFileSync(CACHE_PATH, JSON.stringify(cache, null, 2));
+async function loadPackEntry(packId) {
+  const value = await redis.hget(CACHE_PACKS_KEY, packId);
+  return value == null ? null : parseMaybeJson(value);
+}
+
+async function savePackEntry(packId, entry) {
+  await redis.hset(CACHE_PACKS_KEY, { [packId]: entry });
+}
+
+// Escribe varios packs en una sola ida y vuelta (un HSET con N campos), en vez de
+// N escrituras sueltas — se usa después de un sync completo.
+async function savePacksBulk(packsById) {
+  const fields = Object.keys(packsById);
+  if (!fields.length) return;
+  await redis.hset(CACHE_PACKS_KEY, packsById);
+}
+
+async function saveMeta(meta) {
+  await redis.set(CACHE_META_KEY, meta);
 }
 
 function buyerDisplayName(buyer) {
@@ -194,7 +214,9 @@ async function syncPack(token, packEntry, cache) {
 
 // El borrador de IA sigue siendo válido mientras nadie haya hecho una pregunta
 // nueva desde que se generó, así que solo se regenera cuando cambia lastQuestion.
-async function attachDrafts(packs, previousCache, token) {
+// `touched` acumula los packIds que de verdad cambiaron este ciclo, para que
+// runSync() solo reescriba esos en Redis (no los ~170 completos cada vez).
+async function attachDrafts(packs, previousCache, token, touched) {
   const pendingEntries = Object.values(packs).filter((p) => p.record.status === 'pendiente');
   const isEntryFresh = (entry) => {
     const questionDate = entry.record.lastQuestion?.date || null;
@@ -233,14 +255,15 @@ async function attachDrafts(packs, previousCache, token) {
       record.draftAnswer = { error: err.message, forQuestionDate: questionDate };
       failed++;
     }
+    touched.add(record.packId);
   });
   if (pendingToGenerate > 0) console.log(`Borradores IA listos: ${ok} ok, ${failed} con error.`);
 }
 
-async function runSync() {
+async function runSyncInner() {
   const tokenStore = await getAccessToken();
   const token = tokenStore.access_token;
-  const cache = loadCache();
+  const cache = await loadCache();
 
   const unread = await fetchUnreadPacks(token);
   const results = await mapWithConcurrency(unread.results, 5, (entry) => syncPack(token, entry, cache));
@@ -248,8 +271,9 @@ async function runSync() {
   // Arrancamos con todo lo que ya conocíamos: las conversaciones nunca se borran,
   // aunque Mercado Libre deje de reportarlas como "no leídas" (porque alguien ya
   // las abrió directamente en ML). Solo se actualizan las que vienen frescas en
-  // este ciclo; el resto se queda tal cual estaba.
+  // este ciclo; el resto se queda tal cual estaba (y no se reescribe en Redis).
   const packs = { ...cache.packs };
+  const touched = new Set();
   let errors = 0;
   results.forEach((r) => {
     if (r.error) {
@@ -260,23 +284,40 @@ async function runSync() {
       return;
     }
     packs[r.packId] = { info: { orderId: r.orderId, buyerName: r.buyerName, buyerId: r.buyerId, itemTitles: r.itemTitles, itemLinks: r.itemLinks }, record: r };
+    touched.add(r.packId);
   });
 
-  await attachDrafts(packs, cache, token);
+  await attachDrafts(packs, cache, token, touched);
 
-  const newCache = { syncedAt: new Date().toISOString(), packs };
-  saveCache(newCache);
-  return { syncedAt: newCache.syncedAt, totalPacks: Object.keys(packs).length, errors };
+  if (touched.size) {
+    const toWrite = {};
+    touched.forEach((id) => { toWrite[id] = packs[id]; });
+    await savePacksBulk(toWrite);
+  }
+  const syncedAt = new Date().toISOString();
+  await saveMeta({ syncedAt });
+  return { syncedAt, totalPacks: Object.keys(packs).length, errors };
 }
 
-async function regenerateDraft(packId) {
-  const cache = loadCache();
-  const entry = cache.packs[packId];
+// El sync completo toca (potencialmente) todos los packs a la vez, así que necesita
+// el lock global — si dos ciclos corrieran encimados, el que termine después podría
+// pisar drafts que el otro acababa de generar.
+function runSync() {
+  return withLock('lock:ml:sync', 90000, runSyncInner);
+}
+
+async function getPackEntryOrThrow(packId) {
+  const entry = await loadPackEntry(packId);
   if (!entry) {
     const err = new Error(`No se encontró el pack ${packId} en caché`);
     err.status = 404;
     throw err;
   }
+  return entry;
+}
+
+async function regenerateDraftInner(packId) {
+  const entry = await getPackEntryOrThrow(packId);
   const record = entry.record;
   const { access_token: token } = await getAccessToken();
   const { text } = await generateDraftAnswer({
@@ -291,18 +332,16 @@ async function regenerateDraft(packId) {
     generatedAt: new Date().toISOString(),
     forQuestionDate: record.lastQuestion?.date || null,
   };
-  saveCache(cache);
+  await savePackEntry(packId, entry);
   return record.draftAnswer;
 }
 
-function saveDraftText(packId, text) {
-  const cache = loadCache();
-  const entry = cache.packs[packId];
-  if (!entry) {
-    const err = new Error(`No se encontró el pack ${packId} en caché`);
-    err.status = 404;
-    throw err;
-  }
+function regenerateDraft(packId) {
+  return withLock(`lock:pack:${packId}`, 60000, () => regenerateDraftInner(packId));
+}
+
+async function saveDraftTextInner(packId, text) {
+  const entry = await getPackEntryOrThrow(packId);
   const record = entry.record;
   record.draftAnswer = {
     text,
@@ -310,18 +349,16 @@ function saveDraftText(packId, text) {
     forQuestionDate: record.draftAnswer?.forQuestionDate || record.lastQuestion?.date || null,
     edited: true,
   };
-  saveCache(cache);
+  await savePackEntry(packId, entry);
   return record.draftAnswer;
 }
 
-async function publishAnswer(packId) {
-  const cache = loadCache();
-  const entry = cache.packs[packId];
-  if (!entry) {
-    const err = new Error(`No se encontró el pack ${packId} en caché`);
-    err.status = 404;
-    throw err;
-  }
+function saveDraftText(packId, text) {
+  return withLock(`lock:pack:${packId}`, 15000, () => saveDraftTextInner(packId, text));
+}
+
+async function publishAnswerInner(packId) {
+  const entry = await getPackEntryOrThrow(packId);
   const record = entry.record;
   if (!record.draftAnswer?.text) {
     const err = new Error('No hay un borrador listo para publicar');
@@ -370,64 +407,71 @@ async function publishAnswer(packId) {
   record.status = 'respondido';
   record.draftAnswer = null;
 
-  saveCache(cache);
+  await savePackEntry(packId, entry);
   return record;
+}
+
+function publishAnswer(packId) {
+  return withLock(`lock:pack:${packId}`, 30000, () => publishAnswerInner(packId));
 }
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
-let isSyncing = false;
-let lastSyncError = null;
+// Ya no hay un `isSyncing` en memoria: el lock de runSync() (vía withLock) ya
+// resuelve eso entre instancias serverless. El último error sí necesita vivir
+// en Redis (no en una variable de proceso) para que GET /api/messages lo vea
+// sin importar qué instancia atendió el sync que falló.
+const LAST_SYNC_ERROR_KEY = 'ml:cache:lastSyncError';
 
-async function runSyncSafely(trigger) {
-  if (isSyncing) return;
-  isSyncing = true;
-  try {
-    await withCacheQueue(() => runSync());
-    lastSyncError = null;
-  } catch (err) {
-    console.error(`Error en sync automático (${trigger}):`, err);
-    lastSyncError = err.message;
-  } finally {
-    isSyncing = false;
+async function loadLastSyncError() {
+  return redis.get(LAST_SYNC_ERROR_KEY);
+}
+
+async function saveLastSyncError(message) {
+  if (message == null) {
+    await redis.del(LAST_SYNC_ERROR_KEY);
+  } else {
+    await redis.set(LAST_SYNC_ERROR_KEY, message);
   }
 }
 
-app.get('/api/messages', (req, res) => {
-  const cache = loadCache();
-  const records = Object.values(cache.packs)
-    .map((p) => p.record)
-    .sort((a, b) => {
-      const da = a.lastQuestion?.date || 0;
-      const db = b.lastQuestion?.date || 0;
-      return new Date(db) - new Date(da);
-    });
-  res.json({ syncedAt: cache.syncedAt, records, lastSyncError });
+app.get('/api/messages', async (req, res) => {
+  try {
+    const [cache, lastSyncError] = await Promise.all([loadCache(), loadLastSyncError()]);
+    const records = Object.values(cache.packs)
+      .map((p) => p.record)
+      .sort((a, b) => {
+        const da = a.lastQuestion?.date || 0;
+        const db = b.lastQuestion?.date || 0;
+        return new Date(db) - new Date(da);
+      });
+    res.json({ syncedAt: cache.syncedAt, records, lastSyncError });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/sync', async (req, res) => {
-  if (isSyncing) {
-    return res.status(409).json({ error: 'Ya hay una sincronización en curso, intenta en unos segundos' });
-  }
-  isSyncing = true;
   try {
-    const summary = await withCacheQueue(() => runSync());
-    lastSyncError = null;
+    const summary = await runSync();
+    await saveLastSyncError(null);
     res.json(summary);
   } catch (err) {
     console.error(err);
-    lastSyncError = err.message;
+    if (err.status === 409) {
+      return res.status(409).json({ error: err.message });
+    }
+    await saveLastSyncError(err.message);
     res.status(500).json({ error: err.message });
-  } finally {
-    isSyncing = false;
   }
 });
 
 app.post('/api/messages/:packId/regenerate-draft', async (req, res) => {
   try {
-    const draftAnswer = await withCacheQueue(() => regenerateDraft(req.params.packId));
+    const draftAnswer = await regenerateDraft(req.params.packId);
     res.json({ draftAnswer });
   } catch (err) {
     console.error(err);
@@ -441,7 +485,7 @@ app.post('/api/messages/:packId/draft', async (req, res) => {
     if (!text) {
       return res.status(400).json({ error: 'El texto no puede estar vacío' });
     }
-    const draftAnswer = await withCacheQueue(() => saveDraftText(req.params.packId, text));
+    const draftAnswer = await saveDraftText(req.params.packId, text);
     res.json({ draftAnswer });
   } catch (err) {
     console.error(err);
@@ -451,7 +495,7 @@ app.post('/api/messages/:packId/draft', async (req, res) => {
 
 app.post('/api/messages/:packId/publish', async (req, res) => {
   try {
-    const record = await withCacheQueue(() => publishAnswer(req.params.packId));
+    const record = await publishAnswer(req.params.packId);
     res.json({ record });
   } catch (err) {
     console.error(err);
@@ -473,11 +517,38 @@ app.get('/api/attachments/:filename', async (req, res) => {
   }
 });
 
-const port = process.env.PORT || 3000;
-const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS) || 120000;
-
-app.listen(port, () => {
-  console.log(`Mensajes ML disponibles en http://localhost:${port}`);
-  runSyncSafely('inicial');
-  setInterval(() => runSyncSafely('automático'), SYNC_INTERVAL_MS);
+// Vercel Hobby limita su propio Cron a una vez al día, así que la sincronización
+// periódica la dispara un cron externo (cron-job.org) pegándole a esta ruta cada
+// ~2 minutos. El secreto evita que cualquiera en internet la dispare a mano.
+app.get('/api/cron/sync', async (req, res) => {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const summary = await runSync();
+    await saveLastSyncError(null);
+    res.json(summary);
+  } catch (err) {
+    // Si otra invocación ya está sincronizando (lock tomado), no es un error real:
+    // el cron externo vuelve a llamar en un par de minutos de todos modos.
+    if (err.status === 409) {
+      return res.status(200).json({ skipped: true, reason: err.message });
+    }
+    console.error('Error en sync por cron:', err);
+    await saveLastSyncError(err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
+
+const port = process.env.PORT || 3000;
+
+// En Vercel el módulo se importa como función serverless (@vercel/node), sin
+// llamar a listen(); localmente (npm start) sí necesitamos el servidor real.
+if (require.main === module) {
+  app.listen(port, () => {
+    console.log(`Mensajes ML disponibles en http://localhost:${port}`);
+  });
+}
+
+module.exports = app;
