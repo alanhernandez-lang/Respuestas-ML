@@ -7,7 +7,7 @@
 <style>
   :root {
     --bg: #f6f7f5; --surface: #ffffff; --text: #1c1e1b; --muted: #6b7169;
-    --border: #e2e4df; --mediation: #a33a3a;
+    --border: #e2e4df; --accent: #3f8f5f; --accent-contrast: #ffffff; --mediation: #a33a3a;
   }
   * { box-sizing: border-box; }
   body {
@@ -18,38 +18,49 @@
   .card {
     background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
     padding: 2.5rem 3rem; text-align: center; box-shadow: 0 4px 24px rgba(0,0,0,0.06);
-    max-width: 360px;
+    width: 100%; max-width: 320px;
   }
   h1 { font-size: 1.15rem; margin: 0 0 0.35rem; }
   p { color: var(--muted); font-size: 0.9rem; margin: 0 0 1.5rem; }
-  .g-btn-wrap { display: flex; justify-content: center; min-height: 40px; }
+  form { display: flex; flex-direction: column; gap: 0.75rem; }
+  input {
+    font: inherit; padding: 0.6rem 0.75rem; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text);
+  }
+  button {
+    font: inherit; padding: 0.6rem 0.75rem; border-radius: 8px; border: none;
+    background: var(--accent); color: var(--accent-contrast); cursor: pointer; font-weight: 600;
+  }
+  button:disabled { opacity: 0.6; cursor: default; }
   .error { color: var(--mediation); font-size: 0.85rem; margin-top: 1rem; min-height: 1.2em; }
 </style>
 </head>
 <body>
   <div class="card">
     <h1>Mensajes post-venta · Agrobolder</h1>
-    <p>Inicia sesión con tu cuenta de Google autorizada.</p>
-    <div class="g-btn-wrap">
-      <div id="g_id_onload"
-           data-client_id="__GOOGLE_CLIENT_ID__"
-           data-callback="handleCredentialResponse">
-      </div>
-      <div class="g_id_signin" data-type="standard" data-shape="pill" data-theme="outline"></div>
-    </div>
+    <p>Inicia sesión con tu cuenta autorizada.</p>
+    <form id="loginForm">
+      <input type="email" id="email" placeholder="Correo" autocomplete="username" required />
+      <input type="password" id="password" placeholder="Contraseña" autocomplete="current-password" required />
+      <button type="submit" id="submitBtn">Entrar</button>
+    </form>
     <div id="errorMsg" class="error"></div>
   </div>
 
-  <script src="https://accounts.google.com/gsi/client" async defer></script>
   <script>
-    async function handleCredentialResponse(response) {
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = document.getElementById('email').value;
+      const password = document.getElementById('password').value;
       const errorEl = document.getElementById('errorMsg');
+      const btn = document.getElementById('submitBtn');
       errorEl.textContent = '';
+      btn.disabled = true;
       try {
-        const res = await fetch('/api/auth/google', {
+        const res = await fetch('/api/auth/login', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ credential: response.credential }),
+          body: JSON.stringify({ email, password }),
         });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
@@ -58,8 +69,9 @@
         window.location.href = '/';
       } catch (err) {
         errorEl.textContent = err.message;
+        btn.disabled = false;
       }
-    }
+    });
   </script>
 </body>
 </html>

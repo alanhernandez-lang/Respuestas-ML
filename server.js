@@ -1,5 +1,4 @@
 require('dotenv').config();
-const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const cookieParser = require('cookie-parser');
@@ -19,7 +18,7 @@ const {
 } = require('./lib/ml');
 const { generateDraftAnswer } = require('./lib/agent');
 const { redis, withLock } = require('./lib/redis');
-const { SESSION_COOKIE, verifyGoogleCredential, createSessionToken, verifySessionToken } = require('./lib/auth');
+const { SESSION_COOKIE, verifyCredentials, createSessionToken, verifySessionToken } = require('./lib/auth');
 
 const CLAIM_ROLE_LABELS = { mediator: 'Mediador (ML)', respondent: 'Vendedor (tú)', complainant: 'Cliente' };
 
@@ -422,11 +421,10 @@ const app = express();
 app.use(cookieParser());
 app.use(express.json());
 
-const LOGIN_HTML_TEMPLATE = fs.readFileSync(path.join(__dirname, 'public', 'login.html'), 'utf8');
 // Rutas que deben quedar accesibles SIN sesión: la propia página de login, el
-// endpoint que la valida contra Google, y el cron externo (que se autentica con su
-// propio CRON_SECRET, no con una sesión de usuario).
-const PUBLIC_PATHS = new Set(['/login.html', '/api/auth/google', '/api/cron/sync']);
+// endpoint que valida usuario/contraseña, y el cron externo (que se autentica con
+// su propio CRON_SECRET, no con una sesión de usuario).
+const PUBLIC_PATHS = new Set(['/login.html', '/api/auth/login', '/api/cron/sync']);
 
 function requireAuth(req, res, next) {
   if (PUBLIC_PATHS.has(req.path)) return next();
@@ -441,18 +439,14 @@ function requireAuth(req, res, next) {
   next();
 }
 
-app.get('/login.html', (req, res) => {
-  res.type('html').send(LOGIN_HTML_TEMPLATE.replace('__GOOGLE_CLIENT_ID__', process.env.GOOGLE_CLIENT_ID || ''));
-});
+app.use(requireAuth);
+app.use(express.static(path.join(__dirname, 'public')));
 
-app.post('/api/auth/google', async (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   try {
-    const { credential } = req.body || {};
-    if (!credential) {
-      return res.status(400).json({ error: 'Falta el credential de Google' });
-    }
-    const email = await verifyGoogleCredential(credential);
-    res.cookie(SESSION_COOKIE, createSessionToken(email), {
+    const { email, password } = req.body || {};
+    const normalizedEmail = await verifyCredentials(email, password);
+    res.cookie(SESSION_COOKIE, createSessionToken(normalizedEmail), {
       httpOnly: true,
       // Vercel siempre sirve por https; en local (npm start) no hay https, así que la
       // cookie "secure" se desactiva ahí o el navegador la descartaría por completo.
@@ -470,9 +464,6 @@ app.get('/api/auth/logout', (req, res) => {
   res.clearCookie(SESSION_COOKIE);
   res.redirect('/login.html');
 });
-
-app.use(requireAuth);
-app.use(express.static(path.join(__dirname, 'public')));
 
 // Ya no hay un `isSyncing` en memoria: el lock de runSync() (vía withLock) ya
 // resuelve eso entre instancias serverless. El último error sí necesita vivir
