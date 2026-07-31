@@ -8,7 +8,10 @@
 </head>
 <body>
   <header>
-    <h1>Mensajes post-venta · Agrobolder</h1>
+    <div class="brand">
+      <span class="brand-mark">AB</span>
+      <h1>Mensajes post-venta <span class="brand-sep">·</span> Agrobolder</h1>
+    </div>
     <div class="toolbar">
       <button id="syncBtn">Sincronizar</button>
       <span id="syncInfo" class="sync-info"></span>
@@ -45,6 +48,8 @@
             <div>
               <h2 id="chatTitle"></h2>
               <p id="chatItem" class="modal-item"></p>
+              <p id="chatAnsweredBy" class="answered-by" hidden></p>
+              <p id="chatViewingBadge" class="viewing-badge chat-viewing-badge" hidden></p>
             </div>
           </div>
           <div id="chatThread" class="thread chat-thread"></div>

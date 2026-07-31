@@ -359,7 +359,7 @@ function saveDraftText(packId, text) {
   return withLock(`lock:pack:${packId}`, 15000, () => saveDraftTextInner(packId, text));
 }
 
-async function publishAnswerInner(packId) {
+async function publishAnswerInner(packId, answeredBy) {
   const entry = await getPackEntryOrThrow(packId);
   const record = entry.record;
   if (!record.draftAnswer?.text) {
@@ -408,13 +408,14 @@ async function publishAnswerInner(packId) {
   record.lastAnswer = { sender: 'vendedor', text, date: now, hasAttachment: false };
   record.status = 'respondido';
   record.draftAnswer = null;
+  record.answeredBy = answeredBy || null;
 
   await savePackEntry(packId, entry);
   return record;
 }
 
-function publishAnswer(packId) {
-  return withLock(`lock:pack:${packId}`, 30000, () => publishAnswerInner(packId));
+function publishAnswer(packId, answeredBy) {
+  return withLock(`lock:pack:${packId}`, 30000, () => publishAnswerInner(packId, answeredBy));
 }
 
 const app = express();
@@ -545,12 +546,36 @@ app.post('/api/messages/:packId/draft', async (req, res) => {
 
 app.post('/api/messages/:packId/publish', async (req, res) => {
   try {
-    const record = await publishAnswer(req.params.packId);
+    const record = await publishAnswer(req.params.packId, req.userEmail);
     res.json({ record });
   } catch (err) {
     console.error(err);
     res.status(err.status || 500).json({ error: err.message });
   }
+});
+
+// Presencia en vivo: quién tiene abierta cada conversación ahora mismo. No necesita
+// limpieza activa — un valor se considera "vigente" solo si su timestamp es reciente
+// (PRESENCE_TTL_MS), así que una pestaña cerrada simplemente deja de aparecer sola.
+const PRESENCE_KEY = 'app:presence';
+const PRESENCE_TTL_MS = 15000;
+
+app.post('/api/presence/:packId', async (req, res) => {
+  await redis.hset(PRESENCE_KEY, { [req.params.packId]: { email: req.userEmail, ts: Date.now() } });
+  res.status(204).end();
+});
+
+app.get('/api/presence', async (req, res) => {
+  const raw = await redis.hgetall(PRESENCE_KEY);
+  const now = Date.now();
+  const viewers = {};
+  for (const [packId, value] of Object.entries(raw || {})) {
+    const data = parseMaybeJson(value);
+    if (data && now - data.ts < PRESENCE_TTL_MS && data.email !== req.userEmail) {
+      viewers[packId] = data.email;
+    }
+  }
+  res.json({ viewers });
 });
 
 app.get('/api/attachments/:filename', async (req, res) => {

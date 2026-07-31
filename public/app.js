@@ -1,4 +1,12 @@
-const state = { records: [], selectedPackId: null, hasAutoSelected: false, editingPackId: null, editingDraftText: null };
+const state = {
+  records: [],
+  selectedPackId: null,
+  hasAutoSelected: false,
+  editingPackId: null,
+  editingDraftText: null,
+  viewers: {},
+  presenceInterval: null,
+};
 
 const el = {
   search: document.getElementById('search'),
@@ -16,6 +24,8 @@ const el = {
   chatItem: document.getElementById('chatItem'),
   chatThread: document.getElementById('chatThread'),
   chatDraftPanel: document.getElementById('chatDraftPanel'),
+  chatAnsweredBy: document.getElementById('chatAnsweredBy'),
+  chatViewingBadge: document.getElementById('chatViewingBadge'),
   toastContainer: document.getElementById('toastContainer'),
   confirmOverlay: document.getElementById('confirmOverlay'),
   confirmMessage: document.getElementById('confirmMessage'),
@@ -58,9 +68,69 @@ async function loadUserEmail() {
     const res = await fetch('/api/auth/me');
     if (!res.ok) return;
     const data = await res.json();
-    if (data.email) el.userEmail.textContent = data.email;
+    if (data.email) {
+      el.userEmail.textContent = shortName(data.email);
+      el.userEmail.title = data.email;
+    }
   } catch {
     // No es crítico para el uso de la app si esto falla, se omite en silencio.
+  }
+}
+
+function startPresenceHeartbeat(packId) {
+  stopPresenceHeartbeat();
+  const beat = () => fetch(`/api/presence/${packId}`, { method: 'POST' }).catch(() => {});
+  beat();
+  state.presenceInterval = setInterval(beat, 8000);
+}
+
+function stopPresenceHeartbeat() {
+  if (state.presenceInterval) {
+    clearInterval(state.presenceInterval);
+    state.presenceInterval = null;
+  }
+}
+
+// Anota en el DOM ya existente quién está viendo qué, sin reconstruir toda la lista
+// (eso perdería la posición del scroll cada vez que se refresca, cada 8 segundos).
+function applyPresence() {
+  document.querySelectorAll('.conversation-item').forEach((item) => {
+    const packId = item.dataset.pack;
+    const existing = item.querySelector('.viewing-badge');
+    const viewerEmail = state.viewers[packId];
+    if (viewerEmail) {
+      const label = `👁 ${shortName(viewerEmail)}`;
+      if (existing) {
+        existing.textContent = label;
+      } else {
+        const badge = document.createElement('div');
+        badge.className = 'viewing-badge';
+        badge.textContent = label;
+        item.querySelector('.item-body')?.appendChild(badge);
+      }
+    } else if (existing) {
+      existing.remove();
+    }
+  });
+
+  const currentViewer = state.viewers[state.selectedPackId];
+  if (currentViewer) {
+    el.chatViewingBadge.hidden = false;
+    el.chatViewingBadge.textContent = `👁 ${shortName(currentViewer)} también está viendo esta conversación`;
+  } else {
+    el.chatViewingBadge.hidden = true;
+  }
+}
+
+async function refreshPresence() {
+  try {
+    const res = await fetch('/api/presence');
+    if (!res.ok) return;
+    const data = await res.json();
+    state.viewers = data.viewers || {};
+    applyPresence();
+  } catch {
+    // Si falla un refresco de presencia no pasa nada, se reintenta en el siguiente tick.
   }
 }
 
@@ -84,6 +154,12 @@ function timeAgo(iso) {
   if (hours < 24) return `hace ${hours} h`;
   const days = Math.floor(hours / 24);
   return `hace ${days} d`;
+}
+
+function shortName(email) {
+  if (!email) return '';
+  const local = email.split('@')[0];
+  return local.split(/[._-]+/).filter(Boolean).map((p) => p[0].toUpperCase() + p.slice(1)).join(' ');
 }
 
 function initials(name) {
@@ -149,6 +225,10 @@ function render() {
   for (const r of filtered) {
     const item = document.createElement('div');
     item.className = 'conversation-item' + (r.packId === state.selectedPackId ? ' active' : '');
+    item.dataset.pack = r.packId;
+    const answeredLine = r.status === 'respondido' && r.answeredBy
+      ? ` · Respondido por ${escapeHtml(shortName(r.answeredBy))}`
+      : '';
     item.innerHTML = `
       ${avatarHtml(r.buyerName)}
       <div class="item-body">
@@ -160,12 +240,14 @@ function render() {
           <span class="badge ${r.status}">${STATUS_LABELS[r.status] || r.status}</span>
           <span class="preview">${escapeHtml(lastMessagePreview(r))}</span>
         </div>
-        <div class="item-order">Pedido ${escapeHtml(r.orderId || '—')} · ${escapeHtml(r.itemTitles.join(', ') || '—')}</div>
+        <div class="item-order">Pedido ${escapeHtml(r.orderId || '—')} · ${escapeHtml(r.itemTitles.join(', ') || '—')}${answeredLine}</div>
       </div>
     `;
     item.addEventListener('click', () => selectConversation(r.packId));
     el.conversationList.appendChild(item);
   }
+
+  applyPresence();
 
   if (!state.hasAutoSelected && !state.selectedPackId && filtered.length) {
     state.hasAutoSelected = true;
@@ -383,6 +465,7 @@ function renderMediation(mediation) {
 
 function selectConversation(packId) {
   state.selectedPackId = packId;
+  startPresenceHeartbeat(packId);
   render();
 }
 
@@ -402,6 +485,13 @@ function renderChatPanel() {
   el.chatItem.innerHTML = `Pedido ${escapeHtml(r.orderId || '—')} · ${escapeHtml(r.itemTitles.join(', ') || 'Producto no identificado')}
     ${r.orderUrl ? ` · <a class="ml-link" href="${r.orderUrl}" target="_blank" rel="noopener">Ver venta en Mercado Libre ↗</a>` : ''}
     ${itemLinksHtml(r.itemLinks)}`;
+
+  if (r.status === 'respondido' && r.answeredBy) {
+    el.chatAnsweredBy.hidden = false;
+    el.chatAnsweredBy.textContent = `Respondido por ${shortName(r.answeredBy)}`;
+  } else {
+    el.chatAnsweredBy.hidden = true;
+  }
 
   const messagesHtml = r.messages.map((m) => {
     const hasRealText = m.text && m.text !== '[imagen adjunta]';
@@ -461,8 +551,13 @@ el.search.addEventListener('input', render);
 el.statusFilter.addEventListener('change', render);
 el.syncBtn.addEventListener('click', sync);
 
+window.addEventListener('beforeunload', stopPresenceHeartbeat);
+
 const AUTO_REFRESH_MS = 20000;
+const PRESENCE_POLL_MS = 8000;
 setInterval(loadMessages, AUTO_REFRESH_MS);
+setInterval(refreshPresence, PRESENCE_POLL_MS);
 
 loadMessages();
 loadUserEmail();
+refreshPresence();
