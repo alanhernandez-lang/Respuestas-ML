@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mensajes Mercado Libre - Agrobolder</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Mensajes post-venta · Agrobolder</h1>
+    <div class="toolbar">
+      <button id="syncBtn">Sincronizar</button>
+      <span id="syncInfo" class="sync-info"></span>
+    </div>
+  </header>
+
+  <main>
+    <div id="viewMessages" class="chat-layout">
+      <aside class="chat-sidebar">
+        <div class="sidebar-toolbar">
+          <input id="search" type="search" placeholder="Buscar cliente o producto..." />
+          <select id="statusFilter">
+            <option value="">Todos los estados</option>
+            <option value="pendiente">Pendientes</option>
+            <option value="respondido">Respondidos</option>
+            <option value="mediacion">Mediaciones / reclamos</option>
+          </select>
+        </div>
+        <div id="conversationList" class="conversation-list"></div>
+        <p id="emptyState" class="empty-state" hidden>No hay conversaciones. Presiona "Sincronizar" para traerlas de Mercado Libre.</p>
+      </aside>
+
+      <section class="chat-panel">
+        <div id="chatEmpty" class="chat-empty">
+          <div class="chat-empty-icon">💬</div>
+          <div>Selecciona una conversación de la izquierda para ver los mensajes.</div>
+        </div>
+        <div id="chatOpen" class="chat-open" hidden>
+          <div class="chat-header">
+            <div id="chatAvatar"></div>
+            <div>
+              <h2 id="chatTitle"></h2>
+              <p id="chatItem" class="modal-item"></p>
+            </div>
+          </div>
+          <div id="chatThread" class="thread chat-thread"></div>
+          <div id="chatDraftPanel" class="chat-draft-panel" hidden></div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

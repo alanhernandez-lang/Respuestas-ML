@@ -1,0 +1,14 @@
+{
+  "name": "ml-messages-app",
+  "version": "1.0.0",
+  "description": "Mini app para ver mensajes post-venta de Mercado Libre (cliente, fecha, publicación y respuesta)",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}

@@ -1,0 +1,5 @@
+node_modules/
+.env
+data/token-store.json
+data/messages-cache.json
+.claude/
