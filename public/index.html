@@ -12,6 +12,7 @@
     <div class="toolbar">
       <button id="syncBtn">Sincronizar</button>
       <span id="syncInfo" class="sync-info"></span>
+      <span id="userEmail" class="user-email"></span>
       <a href="/api/auth/logout" class="logout-link">Cerrar sesión</a>
     </div>
   </header>
@@ -28,6 +29,7 @@
             <option value="mediacion">Mediaciones / reclamos</option>
           </select>
         </div>
+        <div id="statusCounts" class="status-counts"></div>
         <div id="conversationList" class="conversation-list"></div>
         <p id="emptyState" class="empty-state" hidden>No hay conversaciones. Presiona "Sincronizar" para traerlas de Mercado Libre.</p>
       </aside>
@@ -51,6 +53,18 @@
       </section>
     </div>
   </main>
+
+  <div id="toastContainer" class="toast-container"></div>
+
+  <div id="confirmOverlay" class="confirm-overlay" hidden>
+    <div class="confirm-box">
+      <p id="confirmMessage"></p>
+      <div class="confirm-actions">
+        <button id="confirmCancelBtn" class="btn-secondary">Cancelar</button>
+        <button id="confirmOkBtn" class="btn-primary">Confirmar</button>
+      </div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>

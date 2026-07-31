@@ -465,6 +465,10 @@ app.get('/api/auth/logout', (req, res) => {
   res.redirect('/login.html');
 });
 
+app.get('/api/auth/me', (req, res) => {
+  res.json({ email: req.userEmail });
+});
+
 // Ya no hay un `isSyncing` en memoria: el lock de runSync() (vía withLock) ya
 // resuelve eso entre instancias serverless. El último error sí necesita vivir
 // en Redis (no en una variable de proceso) para que GET /api/messages lo vea

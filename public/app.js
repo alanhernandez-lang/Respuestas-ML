@@ -1,10 +1,12 @@
-const state = { records: [], selectedPackId: null, hasAutoSelected: false, editingPackId: null };
+const state = { records: [], selectedPackId: null, hasAutoSelected: false, editingPackId: null, editingDraftText: null };
 
 const el = {
   search: document.getElementById('search'),
   statusFilter: document.getElementById('statusFilter'),
   syncBtn: document.getElementById('syncBtn'),
   syncInfo: document.getElementById('syncInfo'),
+  userEmail: document.getElementById('userEmail'),
+  statusCounts: document.getElementById('statusCounts'),
   conversationList: document.getElementById('conversationList'),
   empty: document.getElementById('emptyState'),
   chatEmpty: document.getElementById('chatEmpty'),
@@ -14,10 +16,63 @@ const el = {
   chatItem: document.getElementById('chatItem'),
   chatThread: document.getElementById('chatThread'),
   chatDraftPanel: document.getElementById('chatDraftPanel'),
+  toastContainer: document.getElementById('toastContainer'),
+  confirmOverlay: document.getElementById('confirmOverlay'),
+  confirmMessage: document.getElementById('confirmMessage'),
+  confirmCancelBtn: document.getElementById('confirmCancelBtn'),
+  confirmOkBtn: document.getElementById('confirmOkBtn'),
 };
 
 const STATUS_LABELS = { pendiente: 'Pendiente', respondido: 'Respondido', mediacion: 'Mediación' };
+// Pendientes y mediaciones necesitan acción, así que se muestran antes que lo ya respondido.
+const STATUS_PRIORITY = { pendiente: 0, mediacion: 0, respondido: 1 };
 const AVATAR_COLORS = ['av-1', 'av-2', 'av-3', 'av-4', 'av-5', 'av-6', 'av-7', 'av-8'];
+
+function showToast(message, type = 'error') {
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  toast.textContent = message;
+  el.toastContainer.appendChild(toast);
+  setTimeout(() => toast.remove(), 4500);
+}
+
+function showConfirm(message) {
+  return new Promise((resolve) => {
+    el.confirmMessage.textContent = message;
+    el.confirmOverlay.hidden = false;
+    function cleanup(result) {
+      el.confirmOverlay.hidden = true;
+      el.confirmOkBtn.removeEventListener('click', onOk);
+      el.confirmCancelBtn.removeEventListener('click', onCancel);
+      resolve(result);
+    }
+    function onOk() { cleanup(true); }
+    function onCancel() { cleanup(false); }
+    el.confirmOkBtn.addEventListener('click', onOk);
+    el.confirmCancelBtn.addEventListener('click', onCancel);
+  });
+}
+
+async function loadUserEmail() {
+  try {
+    const res = await fetch('/api/auth/me');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.email) el.userEmail.textContent = data.email;
+  } catch {
+    // No es crítico para el uso de la app si esto falla, se omite en silencio.
+  }
+}
+
+function statusCountsHtml(records) {
+  const counts = { pendiente: 0, mediacion: 0, respondido: 0 };
+  records.forEach((r) => { counts[r.status] = (counts[r.status] || 0) + 1; });
+  return `
+    <span class="badge pendiente">${counts.pendiente} pendiente${counts.pendiente === 1 ? '' : 's'}</span>
+    <span class="badge mediacion">${counts.mediacion} mediaci${counts.mediacion === 1 ? 'ón' : 'ones'}</span>
+    <span class="badge respondido">${counts.respondido} respondido${counts.respondido === 1 ? '' : 's'}</span>
+  `;
+}
 
 function timeAgo(iso) {
   if (!iso) return '';
@@ -83,7 +138,11 @@ function render() {
     const matchesStatus = !statusQ || r.status === statusQ;
     return matchesQ && matchesStatus;
   });
+  // sort() es estable: dentro de cada grupo de prioridad se conserva el orden por
+  // fecha que ya trae el arreglo (el servidor lo entrega del más reciente al más viejo).
+  filtered.sort((a, b) => (STATUS_PRIORITY[a.status] ?? 0) - (STATUS_PRIORITY[b.status] ?? 0));
 
+  el.statusCounts.innerHTML = statusCountsHtml(state.records);
   el.conversationList.innerHTML = '';
   el.empty.hidden = filtered.length > 0;
 
@@ -144,7 +203,7 @@ function draftCardHtml(r) {
   }
 
   const isEditing = state.editingPackId === r.packId;
-  const len = r.draftAnswer.text.length;
+  const len = (isEditing ? (state.editingDraftText ?? r.draftAnswer.text) : r.draftAnswer.text).length;
   const overLimit = len > 350;
 
   return `
@@ -166,7 +225,7 @@ function draftCardHtml(r) {
           ${r.draftAnswer.edited ? '<span class="edited-pill">editado a mano</span>' : ''}
         </div>
         ${isEditing
-          ? `<textarea class="draft-edit-textarea" rows="5">${escapeHtml(r.draftAnswer.text)}</textarea>`
+          ? `<textarea class="draft-edit-textarea" rows="5">${escapeHtml(state.editingDraftText ?? r.draftAnswer.text)}</textarea>`
           : `<div class="draft-text">${escapeHtml(r.draftAnswer.text)}</div>`}
         <div class="draft-charcount ${overLimit ? 'char-count-over' : 'char-count'}">${len}/350${overLimit ? ' ⚠ excede el límite de ML' : ''}</div>
       </div>
@@ -201,7 +260,9 @@ async function handleDraftAction(e) {
 
   const editBtn = e.target.closest('.editBtn');
   if (editBtn) {
+    const r = state.records.find((x) => x.packId === editBtn.dataset.pack);
     state.editingPackId = editBtn.dataset.pack;
+    state.editingDraftText = r?.draftAnswer?.text ?? '';
     renderChatPanel();
     return;
   }
@@ -209,6 +270,7 @@ async function handleDraftAction(e) {
   const cancelEditBtn = e.target.closest('.cancelEditBtn');
   if (cancelEditBtn) {
     state.editingPackId = null;
+    state.editingDraftText = null;
     renderChatPanel();
     return;
   }
@@ -219,7 +281,7 @@ async function handleDraftAction(e) {
     const textarea = card.querySelector('.draft-edit-textarea');
     const text = textarea.value.trim();
     if (!text) {
-      alert('El borrador no puede quedar vacío.');
+      showToast('El borrador no puede quedar vacío.');
       return;
     }
     saveEditBtn.disabled = true;
@@ -233,9 +295,11 @@ async function handleDraftAction(e) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Error desconocido');
       state.editingPackId = null;
+      state.editingDraftText = null;
+      showToast('Borrador guardado', 'success');
       await loadMessages();
     } catch (err) {
-      alert(`Error al guardar: ${err.message}`);
+      showToast(`Error al guardar: ${err.message}`);
       saveEditBtn.disabled = false;
       saveEditBtn.textContent = 'Guardar';
     }
@@ -244,7 +308,7 @@ async function handleDraftAction(e) {
 
   const publishBtn = e.target.closest('.publishBtn');
   if (publishBtn) {
-    const confirmed = confirm(
+    const confirmed = await showConfirm(
       `¿Enviar esta respuesta a ${publishBtn.dataset.buyer} en Mercado Libre?\n\nEsta acción es real e irreversible.`,
     );
     if (!confirmed) return;
@@ -254,9 +318,10 @@ async function handleDraftAction(e) {
       const res = await fetch(`/api/messages/${publishBtn.dataset.pack}/publish`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Error desconocido');
+      showToast('Respuesta publicada correctamente', 'success');
       await loadMessages();
     } catch (err) {
-      alert(`Error al publicar: ${err.message}`);
+      showToast(`Error al publicar: ${err.message}`);
       publishBtn.disabled = false;
       publishBtn.textContent = 'Publicar';
     }
@@ -271,16 +336,24 @@ async function handleDraftAction(e) {
       const res = await fetch(`/api/messages/${regenBtn.dataset.pack}/regenerate-draft`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Error desconocido');
+      state.editingDraftText = null;
       await loadMessages();
     } catch (err) {
-      alert(`Error al regenerar borrador: ${err.message}`);
+      showToast(`Error al regenerar borrador: ${err.message}`);
       regenBtn.disabled = false;
       regenBtn.textContent = 'Regenerar';
     }
   }
 }
 
+function handleDraftInput(e) {
+  if (e.target.matches('.draft-edit-textarea') && state.editingPackId) {
+    state.editingDraftText = e.target.value;
+  }
+}
+
 el.chatDraftPanel.addEventListener('click', handleDraftAction);
+el.chatDraftPanel.addEventListener('input', handleDraftInput);
 
 function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({
@@ -377,7 +450,7 @@ async function sync() {
       el.syncInfo.textContent += ` (⚠ ${data.errors} paquetes con error)`;
     }
   } catch (err) {
-    alert(`Error al sincronizar: ${err.message}`);
+    showToast(`Error al sincronizar: ${err.message}`);
   } finally {
     el.syncBtn.disabled = false;
     el.syncBtn.textContent = 'Sincronizar';
@@ -392,3 +465,4 @@ const AUTO_REFRESH_MS = 20000;
 setInterval(loadMessages, AUTO_REFRESH_MS);
 
 loadMessages();
+loadUserEmail();
