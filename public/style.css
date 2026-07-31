@@ -78,6 +78,14 @@ h1 {
   flex-wrap: wrap;
 }
 
+.logout-link {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.85rem;
+  text-decoration: none;
+}
+.logout-link:hover { color: var(--text); text-decoration: underline; }
+
 input, select, button {
   font: inherit;
   padding: 0.5rem 0.75rem;
