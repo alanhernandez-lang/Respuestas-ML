@@ -12,6 +12,10 @@
       <span class="brand-mark">AB</span>
       <h1>Mensajes post-venta <span class="brand-sep">·</span> Agrobolder</h1>
     </div>
+    <nav class="view-switch" aria-label="Vista">
+      <button class="view-tab" id="tabMessages" aria-selected="true">💬 Mensajes</button>
+      <button class="view-tab" id="tabLog" aria-selected="false">📋 Bitácora</button>
+    </nav>
     <div class="toolbar">
       <button id="syncBtn">Sincronizar</button>
       <span id="syncInfo" class="sync-info"></span>
@@ -24,15 +28,10 @@
     <div id="viewMessages" class="chat-layout">
       <aside class="chat-sidebar">
         <div class="sidebar-toolbar">
+          <label for="search" class="visually-hidden">Buscar cliente o producto</label>
           <input id="search" type="search" placeholder="Buscar cliente o producto..." />
-          <select id="statusFilter">
-            <option value="">Todos los estados</option>
-            <option value="pendiente">Pendientes</option>
-            <option value="respondido">Respondidos</option>
-            <option value="mediacion">Mediaciones / reclamos</option>
-          </select>
         </div>
-        <div id="statusCounts" class="status-counts"></div>
+        <div id="statusCounts" class="status-counts" aria-label="Filtrar por estado"></div>
         <div id="conversationList" class="conversation-list"></div>
         <p id="emptyState" class="empty-state" hidden>No hay conversaciones. Presiona "Sincronizar" para traerlas de Mercado Libre.</p>
       </aside>
@@ -57,12 +56,22 @@
         </div>
       </section>
     </div>
+
+    <section id="viewLog" class="log-view" hidden>
+      <div class="live-now">
+        <h3>Activos ahora</h3>
+        <div id="liveNowList"></div>
+      </div>
+      <div id="logFilters" class="log-filters"></div>
+      <div id="logList" class="log-list"></div>
+      <p id="logEmptyState" class="empty-state" hidden>Todavía no hay respuestas publicadas en la bitácora.</p>
+    </section>
   </main>
 
   <div id="toastContainer" class="toast-container"></div>
 
   <div id="confirmOverlay" class="confirm-overlay" hidden>
-    <div class="confirm-box">
+    <div class="confirm-box" role="alertdialog" aria-modal="true" aria-labelledby="confirmMessage">
       <p id="confirmMessage"></p>
       <div class="confirm-actions">
         <button id="confirmCancelBtn" class="btn-secondary">Cancelar</button>

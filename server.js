@@ -103,6 +103,22 @@ async function saveMeta(meta) {
   await redis.set(CACHE_META_KEY, meta);
 }
 
+// Bitácora: historial de quién respondió qué. A diferencia de `record.answeredBy`
+// (que solo guarda la respuesta MÁS RECIENTE de cada conversación), esta lista
+// conserva cada evento de publicación por separado, más nueva primero.
+const ANSWER_LOG_KEY = 'app:answerlog';
+const ANSWER_LOG_MAX = 1000;
+
+async function appendAnswerLog(entry) {
+  await redis.lpush(ANSWER_LOG_KEY, entry);
+  await redis.ltrim(ANSWER_LOG_KEY, 0, ANSWER_LOG_MAX - 1);
+}
+
+async function loadAnswerLog() {
+  const raw = await redis.lrange(ANSWER_LOG_KEY, 0, ANSWER_LOG_MAX - 1);
+  return (raw || []).map(parseMaybeJson).filter(Boolean);
+}
+
 function buyerDisplayName(buyer) {
   if (!buyer) return 'Cliente desconocido';
   const fullName = [buyer.first_name, buyer.last_name].filter(Boolean).join(' ').trim();
@@ -404,6 +420,7 @@ async function publishAnswerInner(packId, answeredBy) {
   // Reflejamos el envío de inmediato en el caché local (en vez de esperar al próximo
   // sync automático) para que la conversación desaparezca de "Borradores IA" al instante.
   const now = new Date().toISOString();
+  const wasEdited = Boolean(record.draftAnswer?.edited);
   record.messages.push({ sender: 'vendedor', text, date: now, hasAttachment: false, attachments: [] });
   record.lastAnswer = { sender: 'vendedor', text, date: now, hasAttachment: false };
   record.status = 'respondido';
@@ -411,6 +428,15 @@ async function publishAnswerInner(packId, answeredBy) {
   record.answeredBy = answeredBy || null;
 
   await savePackEntry(packId, entry);
+  await appendAnswerLog({
+    packId,
+    buyerName: record.buyerName,
+    itemTitles: record.itemTitles,
+    answeredBy: answeredBy || null,
+    wasEdited,
+    text,
+    date: now,
+  });
   return record;
 }
 
@@ -563,6 +589,11 @@ const PRESENCE_TTL_MS = 15000;
 app.post('/api/presence/:packId', async (req, res) => {
   await redis.hset(PRESENCE_KEY, { [req.params.packId]: { email: req.userEmail, ts: Date.now() } });
   res.status(204).end();
+});
+
+app.get('/api/log', async (req, res) => {
+  const entries = await loadAnswerLog();
+  res.json({ entries });
 });
 
 app.get('/api/presence', async (req, res) => {

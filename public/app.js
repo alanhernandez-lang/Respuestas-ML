@@ -6,11 +6,13 @@ const state = {
   editingDraftText: null,
   viewers: {},
   presenceInterval: null,
+  statusFilter: '',
+  logEntries: [],
+  logFilterEmail: '',
 };
 
 const el = {
   search: document.getElementById('search'),
-  statusFilter: document.getElementById('statusFilter'),
   syncBtn: document.getElementById('syncBtn'),
   syncInfo: document.getElementById('syncInfo'),
   userEmail: document.getElementById('userEmail'),
@@ -31,6 +33,14 @@ const el = {
   confirmMessage: document.getElementById('confirmMessage'),
   confirmCancelBtn: document.getElementById('confirmCancelBtn'),
   confirmOkBtn: document.getElementById('confirmOkBtn'),
+  tabMessages: document.getElementById('tabMessages'),
+  tabLog: document.getElementById('tabLog'),
+  viewMessages: document.getElementById('viewMessages'),
+  viewLog: document.getElementById('viewLog'),
+  liveNowList: document.getElementById('liveNowList'),
+  logFilters: document.getElementById('logFilters'),
+  logList: document.getElementById('logList'),
+  logEmptyState: document.getElementById('logEmptyState'),
 };
 
 const STATUS_LABELS = { pendiente: 'Pendiente', respondido: 'Respondido', mediacion: 'Mediación' };
@@ -41,23 +51,49 @@ const AVATAR_COLORS = ['av-1', 'av-2', 'av-3', 'av-4', 'av-5', 'av-6', 'av-7', '
 function showToast(message, type = 'error') {
   const toast = document.createElement('div');
   toast.className = `toast ${type}`;
-  toast.textContent = message;
+  toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+  const text = document.createElement('span');
+  text.textContent = message;
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'toast-close';
+  closeBtn.setAttribute('aria-label', 'Cerrar aviso');
+  closeBtn.textContent = '×';
+  closeBtn.addEventListener('click', () => toast.remove());
+  toast.append(text, closeBtn);
   el.toastContainer.appendChild(toast);
-  setTimeout(() => toast.remove(), 4500);
+  // Los errores se quedan hasta que la persona los cierre a propósito — un aviso de
+  // "falló la sincronización" que desaparece solo en 4.5s es fácil de no alcanzar a leer.
+  if (type !== 'error') setTimeout(() => toast.remove(), 4500);
 }
 
 function showConfirm(message) {
   return new Promise((resolve) => {
+    const trigger = document.activeElement;
     el.confirmMessage.textContent = message;
     el.confirmOverlay.hidden = false;
+    el.confirmOkBtn.focus();
+
+    function onKeydown(e) {
+      if (e.key === 'Escape') {
+        cleanup(false);
+      } else if (e.key === 'Tab') {
+        // Modal chiquito de 2 botones: alterna el foco entre ambos en vez de dejarlo
+        // escapar hacia el contenido de atrás.
+        e.preventDefault();
+        (document.activeElement === el.confirmOkBtn ? el.confirmCancelBtn : el.confirmOkBtn).focus();
+      }
+    }
     function cleanup(result) {
       el.confirmOverlay.hidden = true;
+      document.removeEventListener('keydown', onKeydown);
       el.confirmOkBtn.removeEventListener('click', onOk);
       el.confirmCancelBtn.removeEventListener('click', onCancel);
+      trigger?.focus();
       resolve(result);
     }
     function onOk() { cleanup(true); }
     function onCancel() { cleanup(false); }
+    document.addEventListener('keydown', onKeydown);
     el.confirmOkBtn.addEventListener('click', onOk);
     el.confirmCancelBtn.addEventListener('click', onCancel);
   });
@@ -120,6 +156,8 @@ function applyPresence() {
   } else {
     el.chatViewingBadge.hidden = true;
   }
+
+  renderLiveNow();
 }
 
 async function refreshPresence() {
@@ -134,14 +172,110 @@ async function refreshPresence() {
   }
 }
 
+// El roster de "Activos ahora" en la Bitácora reutiliza state.viewers (el mismo dato
+// que ya se sondea cada 8s para las insignias inline) — no necesita su propio fetch.
+function renderLiveNow() {
+  const packIds = Object.keys(state.viewers);
+  if (!packIds.length) {
+    el.liveNowList.innerHTML = '<p class="live-now-empty">Nadie más está conectado en este momento.</p>';
+    return;
+  }
+  el.liveNowList.innerHTML = packIds.map((packId) => {
+    const email = state.viewers[packId];
+    const r = state.records.find((x) => x.packId === packId);
+    const buyer = r ? r.buyerName : 'una conversación';
+    return `
+      <div class="live-now-row" data-pack="${packId}">
+        ${avatarHtml(shortName(email))}
+        <span>${escapeHtml(shortName(email))} está viendo a <strong>${escapeHtml(buyer)}</strong></span>
+      </div>
+    `;
+  }).join('');
+}
+
+function switchView(view) {
+  const isLog = view === 'log';
+  el.viewMessages.hidden = isLog;
+  el.viewLog.hidden = !isLog;
+  el.tabMessages.setAttribute('aria-selected', String(!isLog));
+  el.tabLog.setAttribute('aria-selected', String(isLog));
+  if (isLog) {
+    stopPresenceHeartbeat();
+    refreshLog();
+  } else if (state.selectedPackId) {
+    startPresenceHeartbeat(state.selectedPackId);
+  }
+}
+
+async function refreshLog() {
+  try {
+    const res = await fetch('/api/log');
+    if (!res.ok) return;
+    const data = await res.json();
+    state.logEntries = data.entries || [];
+    renderLog();
+  } catch {
+    showToast('No se pudo cargar la bitácora');
+  }
+}
+
+function dayLabel(iso) {
+  const d = new Date(iso);
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  const sameDay = (a, b) => a.toDateString() === b.toDateString();
+  if (sameDay(d, today)) return 'Hoy';
+  if (sameDay(d, yesterday)) return 'Ayer';
+  return d.toLocaleDateString('es-MX', { day: 'numeric', month: 'long', year: 'numeric' });
+}
+
+function renderLog() {
+  const uniqueEmails = [...new Set(state.logEntries.map((e) => e.answeredBy).filter(Boolean))];
+  const filterChip = (email, label, count) => `
+    <button class="badge all${state.logFilterEmail === email ? ' active' : ''}" aria-selected="${state.logFilterEmail === email}" data-email="${escapeHtml(email)}">${escapeHtml(label)} (${count})</button>
+  `;
+  el.logFilters.innerHTML = filterChip('', 'Todas', state.logEntries.length)
+    + uniqueEmails.map((email) => filterChip(email, shortName(email), state.logEntries.filter((e) => e.answeredBy === email).length)).join('');
+
+  const entries = state.logEntries.filter((e) => !state.logFilterEmail || e.answeredBy === state.logFilterEmail);
+  el.logEmptyState.hidden = entries.length > 0;
+  if (!entries.length) {
+    el.logList.innerHTML = '';
+    return;
+  }
+
+  let lastDay = null;
+  el.logList.innerHTML = entries.map((e) => {
+    const day = dayLabel(e.date);
+    const heading = day !== lastDay ? `<div class="log-day-heading">${escapeHtml(day)}</div>` : '';
+    lastDay = day;
+    const itemLine = (e.itemTitles || []).join(', ') || 'Producto no identificado';
+    const who = shortName(e.answeredBy) || 'Alguien';
+    return `
+      ${heading}
+      <div class="log-entry" data-pack="${e.packId}">
+        ${avatarHtml(who)}
+        <div class="log-body">
+          <div class="log-line"><strong>${escapeHtml(who)}</strong> respondió a <strong>${escapeHtml(e.buyerName)}</strong></div>
+          <div class="log-meta">${escapeHtml(itemLine)} · ${timeAgo(e.date)}${e.wasEdited ? ' · editado a mano' : ''}</div>
+          <div class="log-snippet">${escapeHtml(e.text)}</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
 function statusCountsHtml(records) {
   const counts = { pendiente: 0, mediacion: 0, respondido: 0 };
   records.forEach((r) => { counts[r.status] = (counts[r.status] || 0) + 1; });
-  return `
-    <span class="badge pendiente">${counts.pendiente} pendiente${counts.pendiente === 1 ? '' : 's'}</span>
-    <span class="badge mediacion">${counts.mediacion} mediaci${counts.mediacion === 1 ? 'ón' : 'ones'}</span>
-    <span class="badge respondido">${counts.respondido} respondido${counts.respondido === 1 ? '' : 's'}</span>
+  const chip = (status, cls, label) => `
+    <button class="badge ${cls}" aria-selected="${state.statusFilter === status}" data-status="${status}">${label}</button>
   `;
+  return chip('', 'all', `Todas (${records.length})`)
+    + chip('pendiente', 'pendiente', `${counts.pendiente} pendiente${counts.pendiente === 1 ? '' : 's'}`)
+    + chip('mediacion', 'mediacion', `${counts.mediacion} mediaci${counts.mediacion === 1 ? 'ón' : 'ones'}`)
+    + chip('respondido', 'respondido', `${counts.respondido} respondido${counts.respondido === 1 ? '' : 's'}`);
 }
 
 function timeAgo(iso) {
@@ -204,14 +338,13 @@ function lastMessagePreview(r) {
 
 function render() {
   const q = el.search.value.trim().toLowerCase();
-  const statusQ = el.statusFilter.value;
 
   const filtered = state.records.filter((r) => {
     const matchesQ = !q
       || r.buyerName.toLowerCase().includes(q)
       || r.itemTitles.join(' ').toLowerCase().includes(q)
       || (r.lastQuestion?.text || '').toLowerCase().includes(q);
-    const matchesStatus = !statusQ || r.status === statusQ;
+    const matchesStatus = !state.statusFilter || r.status === state.statusFilter;
     return matchesQ && matchesStatus;
   });
   // sort() es estable: dentro de cada grupo de prioridad se conserva el orden por
@@ -287,6 +420,10 @@ function draftCardHtml(r) {
   const isEditing = state.editingPackId === r.packId;
   const len = (isEditing ? (state.editingDraftText ?? r.draftAnswer.text) : r.draftAnswer.text).length;
   const overLimit = len > 350;
+  const viewerEmail = state.viewers[r.packId];
+  const collabAlertHtml = viewerEmail
+    ? `<div class="collab-alert">⚠ ${escapeHtml(shortName(viewerEmail))} también está viendo esta conversación ahora mismo. Coordinen para no responder dos veces.</div>`
+    : '';
 
   return `
     <div class="draft-card" data-pack="${r.packId}">
@@ -300,6 +437,8 @@ function draftCardHtml(r) {
           <div class="draft-subtitle">${orderLine}</div>
         </div>
       </div>
+
+      ${collabAlertHtml}
 
       <div class="draft-suggestion">
         <div class="draft-suggestion-head">
@@ -518,6 +657,19 @@ function renderChatPanel() {
 async function loadMessages() {
   const res = await fetch('/api/messages');
   const data = await res.json();
+
+  // Si mientras alguien editaba un borrador, otra persona ya respondió esa misma
+  // conversación, no la pisamos en silencio: avisamos y salimos del modo edición.
+  if (state.editingPackId) {
+    const prev = state.records.find((x) => x.packId === state.editingPackId);
+    const next = (data.records || []).find((x) => x.packId === state.editingPackId);
+    if (prev?.status === 'pendiente' && next && next.status !== 'pendiente') {
+      showToast(`${shortName(next.answeredBy) || 'Alguien más'} ya respondió esta conversación mientras la editabas. Tu borrador no se envió.`);
+      state.editingPackId = null;
+      state.editingDraftText = null;
+    }
+  }
+
   state.records = data.records;
   el.syncInfo.textContent = data.syncedAt
     ? `Última sincronización: ${fmtDate(data.syncedAt)}`
@@ -548,8 +700,39 @@ async function sync() {
 }
 
 el.search.addEventListener('input', render);
-el.statusFilter.addEventListener('change', render);
 el.syncBtn.addEventListener('click', sync);
+
+el.statusCounts.addEventListener('click', (e) => {
+  const btn = e.target.closest('.badge');
+  if (!btn) return;
+  state.statusFilter = btn.dataset.status;
+  render();
+});
+
+el.tabMessages.addEventListener('click', () => switchView('messages'));
+el.tabLog.addEventListener('click', () => switchView('log'));
+
+el.logFilters.addEventListener('click', (e) => {
+  const btn = e.target.closest('.badge');
+  if (!btn) return;
+  state.logFilterEmail = btn.dataset.email || '';
+  renderLog();
+});
+
+function jumpToConversation(packId) {
+  switchView('messages');
+  selectConversation(packId);
+}
+
+el.logList.addEventListener('click', (e) => {
+  const row = e.target.closest('.log-entry');
+  if (row) jumpToConversation(row.dataset.pack);
+});
+
+el.liveNowList.addEventListener('click', (e) => {
+  const row = e.target.closest('.live-now-row');
+  if (row) jumpToConversation(row.dataset.pack);
+});
 
 window.addEventListener('beforeunload', stopPresenceHeartbeat);
 
