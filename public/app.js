@@ -699,6 +699,22 @@ async function sync() {
   }
 }
 
+// Sincronización automática: mientras cualquiera del equipo tenga la app abierta en
+// el navegador, esta misma pestaña pide sincronizar con Mercado Libre cada 2 minutos
+// — sin depender de un cron externo. Si otra pestaña/persona ya está sincronizando en
+// ese momento, el servidor responde 409 (por el lock en Redis) y aquí se ignora en
+// silencio: no es un error real, solo significa que el trabajo ya se está haciendo.
+async function autoSync() {
+  try {
+    const res = await fetch('/api/sync', { method: 'POST' });
+    if (res.ok) {
+      await loadMessages();
+    }
+  } catch {
+    // Fallo de red silencioso: el siguiente tick (cada 2 min) o el botón manual lo reintentan.
+  }
+}
+
 el.search.addEventListener('input', render);
 el.syncBtn.addEventListener('click', sync);
 
@@ -738,9 +754,12 @@ window.addEventListener('beforeunload', stopPresenceHeartbeat);
 
 const AUTO_REFRESH_MS = 20000;
 const PRESENCE_POLL_MS = 8000;
+const AUTO_SYNC_MS = 120000;
 setInterval(loadMessages, AUTO_REFRESH_MS);
 setInterval(refreshPresence, PRESENCE_POLL_MS);
+setInterval(autoSync, AUTO_SYNC_MS);
 
 loadMessages();
 loadUserEmail();
 refreshPresence();
+autoSync();
