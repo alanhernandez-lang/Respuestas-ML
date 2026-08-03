@@ -827,3 +827,8 @@ main {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.bank-entry { cursor: default; align-items: center; }
+.bank-entry:hover { background: transparent; }
+.bank-entry .draft-text { margin-top: 0.35rem; font-size: 0.9rem; }
+.bank-entry .btn-secondary { flex-shrink: 0; }

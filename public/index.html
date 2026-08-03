@@ -15,6 +15,7 @@
     <nav class="view-switch" aria-label="Vista">
       <button class="view-tab" id="tabMessages" aria-selected="true">💬 Mensajes</button>
       <button class="view-tab" id="tabLog" aria-selected="false">📋 Bitácora</button>
+      <button class="view-tab" id="tabBank" aria-selected="false">📚 Banco de respuestas</button>
     </nav>
     <div class="toolbar">
       <button id="syncBtn">Sincronizar</button>
@@ -65,6 +66,15 @@
       <div id="logFilters" class="log-filters"></div>
       <div id="logList" class="log-list"></div>
       <p id="logEmptyState" class="empty-state" hidden>Todavía no hay respuestas publicadas en la bitácora.</p>
+    </section>
+
+    <section id="viewBank" class="log-view" hidden>
+      <div class="sidebar-toolbar bank-toolbar">
+        <label for="bankSearch" class="visually-hidden">Buscar respuesta o pregunta</label>
+        <input id="bankSearch" type="search" placeholder="Buscar respuesta o pregunta..." />
+      </div>
+      <div id="bankList" class="log-list"></div>
+      <p id="bankEmptyState" class="empty-state" hidden>Todavía no hay suficientes respuestas publicadas para armar el banco. Va a ir llenándose conforme el equipo conteste.</p>
     </section>
   </main>
 

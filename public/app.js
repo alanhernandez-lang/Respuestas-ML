@@ -9,6 +9,7 @@ const state = {
   statusFilter: '',
   logEntries: [],
   logFilterEmail: '',
+  bank: [],
 };
 
 const el = {
@@ -35,12 +36,17 @@ const el = {
   confirmOkBtn: document.getElementById('confirmOkBtn'),
   tabMessages: document.getElementById('tabMessages'),
   tabLog: document.getElementById('tabLog'),
+  tabBank: document.getElementById('tabBank'),
   viewMessages: document.getElementById('viewMessages'),
   viewLog: document.getElementById('viewLog'),
+  viewBank: document.getElementById('viewBank'),
   liveNowList: document.getElementById('liveNowList'),
   logFilters: document.getElementById('logFilters'),
   logList: document.getElementById('logList'),
   logEmptyState: document.getElementById('logEmptyState'),
+  bankSearch: document.getElementById('bankSearch'),
+  bankList: document.getElementById('bankList'),
+  bankEmptyState: document.getElementById('bankEmptyState'),
 };
 
 const STATUS_LABELS = { pendiente: 'Pendiente', respondido: 'Respondido', mediacion: 'Mediación' };
@@ -194,18 +200,69 @@ function renderLiveNow() {
 }
 
 function switchView(view) {
+  const isMessages = view === 'messages';
   const isLog = view === 'log';
-  el.viewMessages.hidden = isLog;
+  const isBank = view === 'bank';
+  el.viewMessages.hidden = !isMessages;
   el.viewLog.hidden = !isLog;
-  el.tabMessages.setAttribute('aria-selected', String(!isLog));
+  el.viewBank.hidden = !isBank;
+  el.tabMessages.setAttribute('aria-selected', String(isMessages));
   el.tabLog.setAttribute('aria-selected', String(isLog));
+  el.tabBank.setAttribute('aria-selected', String(isBank));
   if (isLog) {
     stopPresenceHeartbeat();
     refreshLog();
+  } else if (isBank) {
+    stopPresenceHeartbeat();
+    refreshBank();
   } else if (state.selectedPackId) {
     startPresenceHeartbeat(state.selectedPackId);
   }
 }
+
+async function refreshBank() {
+  try {
+    const res = await fetch('/api/response-bank');
+    if (!res.ok) return;
+    const data = await res.json();
+    state.bank = data.bank || [];
+    renderBank();
+  } catch {
+    showToast('No se pudo cargar el banco de respuestas');
+  }
+}
+
+function renderBank() {
+  const q = el.bankSearch.value.trim().toLowerCase();
+  const filtered = state.bank.filter((r) => !q
+    || r.text.toLowerCase().includes(q)
+    || (r.questions || []).some((qq) => qq.toLowerCase().includes(q)));
+
+  el.bankEmptyState.hidden = filtered.length > 0;
+  el.bankList.innerHTML = filtered.map((r) => `
+    <div class="log-entry bank-entry">
+      <div class="log-body">
+        <div class="log-line">
+          <span class="badge all">Usada ${r.count}×</span>
+          <span class="log-meta">última vez ${timeAgo(r.lastUsed)}</span>
+        </div>
+        <div class="draft-text">${escapeHtml(r.text)}</div>
+        ${(r.questions || []).length ? `<div class="log-meta">Preguntas parecidas: ${r.questions.map((qq) => `"${escapeHtml(qq)}"`).join(' · ')}</div>` : ''}
+      </div>
+      <button class="btn-secondary copyBtn" data-text="${escapeHtml(r.text)}">Copiar</button>
+    </div>
+  `).join('');
+}
+
+el.bankSearch.addEventListener('input', renderBank);
+
+el.bankList.addEventListener('click', async (e) => {
+  const copyBtn = e.target.closest('.copyBtn');
+  if (!copyBtn) return;
+  await navigator.clipboard.writeText(copyBtn.dataset.text);
+  copyBtn.textContent = 'Copiado ✓';
+  setTimeout(() => { copyBtn.textContent = 'Copiar'; }, 1500);
+});
 
 async function refreshLog() {
   try {
@@ -727,6 +784,7 @@ el.statusCounts.addEventListener('click', (e) => {
 
 el.tabMessages.addEventListener('click', () => switchView('messages'));
 el.tabLog.addEventListener('click', () => switchView('log'));
+el.tabBank.addEventListener('click', () => switchView('bank'));
 
 el.logFilters.addEventListener('click', (e) => {
   const btn = e.target.closest('.badge');

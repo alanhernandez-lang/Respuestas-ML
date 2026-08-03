@@ -119,6 +119,27 @@ async function loadAnswerLog() {
   return (raw || []).map(parseMaybeJson).filter(Boolean);
 }
 
+// Agrupa el historial de respuestas por texto EXACTO (recortando espacios): así el
+// banco de respuestas no repite la misma respuesta usada 10 veces como 10 renglones
+// distintos. `questions` guarda hasta 5 preguntas distintas que motivaron esa misma
+// respuesta, para que quien la lea (persona o el propio agente de IA) entienda cuándo
+// aplica.
+function computeResponseBank(entries) {
+  const groups = new Map();
+  entries.forEach((e) => {
+    const key = (e.text || '').trim().replace(/\s+/g, ' ');
+    if (!key) return;
+    if (!groups.has(key)) groups.set(key, { text: e.text.trim(), count: 0, questions: [], lastUsed: e.date });
+    const g = groups.get(key);
+    g.count += 1;
+    if (!g.lastUsed || e.date > g.lastUsed) g.lastUsed = e.date;
+    if (e.question && !g.questions.includes(e.question) && g.questions.length < 5) {
+      g.questions.push(e.question);
+    }
+  });
+  return [...groups.values()].sort((a, b) => b.count - a.count || new Date(b.lastUsed) - new Date(a.lastUsed));
+}
+
 function buyerDisplayName(buyer) {
   if (!buyer) return 'Cliente desconocido';
   const fullName = [buyer.first_name, buyer.last_name].filter(Boolean).join(' ').trim();
@@ -243,6 +264,13 @@ async function attachDrafts(packs, previousCache, token, touched) {
   };
   const pendingToGenerate = pendingEntries.filter((entry) => !isEntryFresh(entry)).length;
   if (pendingToGenerate > 0) console.log(`Generando ${pendingToGenerate} borrador(es) IA...`);
+  // Se calcula una sola vez para todo el lote (no por cada pack) — son las mismas
+  // respuestas frecuentes para cualquier borrador que se genere en este ciclo de sync.
+  // Solo se cuentan las usadas 3+ veces, para filtrar casos raros o con errores de una
+  // sola vez que alguien haya editado a mano.
+  const frequentResponses = pendingToGenerate > 0
+    ? computeResponseBank(await loadAnswerLog()).filter((r) => r.count >= 3).slice(0, 15)
+    : [];
   let ok = 0;
   let failed = 0;
   // OJO: este mapWithConcurrency debe correr SIEMPRE para TODOS los pendientes, incluso
@@ -265,6 +293,7 @@ async function attachDrafts(packs, previousCache, token, touched) {
         messages: record.messages,
         orderCreationDate: record.orderCreationDate,
         token,
+        frequentResponses,
       });
       record.draftAnswer = { text, generatedAt: new Date().toISOString(), forQuestionDate: questionDate };
       ok++;
@@ -338,12 +367,14 @@ async function regenerateDraftInner(packId) {
   const entry = await getPackEntryOrThrow(packId);
   const record = entry.record;
   const { access_token: token } = await getAccessToken();
+  const frequentResponses = computeResponseBank(await loadAnswerLog()).filter((r) => r.count >= 3).slice(0, 15);
   const { text } = await generateDraftAnswer({
     buyerName: record.buyerName,
     itemTitles: record.itemTitles,
     messages: record.messages,
     orderCreationDate: record.orderCreationDate,
     token,
+    frequentResponses,
   });
   record.draftAnswer = {
     text,
@@ -435,6 +466,7 @@ async function publishAnswerInner(packId, answeredBy) {
     answeredBy: answeredBy || null,
     wasEdited,
     text,
+    question: record.lastQuestion?.text || null,
     date: now,
   });
   return record;
@@ -594,6 +626,11 @@ app.post('/api/presence/:packId', async (req, res) => {
 app.get('/api/log', async (req, res) => {
   const entries = await loadAnswerLog();
   res.json({ entries });
+});
+
+app.get('/api/response-bank', async (req, res) => {
+  const entries = await loadAnswerLog();
+  res.json({ bank: computeResponseBank(entries) });
 });
 
 app.get('/api/presence', async (req, res) => {
