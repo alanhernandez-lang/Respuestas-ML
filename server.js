@@ -195,8 +195,7 @@ async function resolvePackInfo(token, packId, cache) {
   return { orderId: orderId || null, buyerName, itemTitles, itemLinks, buyerId };
 }
 
-async function syncPack(token, packEntry, cache) {
-  const packId = packEntry.resource.match(/\/packs\/(\d+)\//)[1];
+async function syncPackById(token, packId, cache, unreadCount) {
   const [info, messagesResp] = await Promise.all([
     resolvePackInfo(token, packId, cache),
     fetchPackMessages(token, packId, SELLER_ID),
@@ -240,7 +239,7 @@ async function syncPack(token, packEntry, cache) {
     buyerId: info.buyerId,
     itemTitles: info.itemTitles,
     itemLinks: info.itemLinks || [],
-    unreadCount: packEntry.count,
+    unreadCount,
     status,
     lastQuestion,
     lastAnswer,
@@ -248,8 +247,18 @@ async function syncPack(token, packEntry, cache) {
     orderCreationDate,
     conversationStatus,
     mediation,
+    lastCheckedAt: new Date().toISOString(),
   };
 }
+
+function syncPack(token, packEntry, cache) {
+  const packId = packEntry.resource.match(/\/packs\/(\d+)\//)[1];
+  return syncPackById(token, packId, cache, packEntry.count);
+}
+
+// Cuántas conversaciones "viejas" (ya no reportadas como no leídas por ML) se
+// revisan de nuevo en cada ciclo — ver comentario en runSyncInner().
+const STALE_REFRESH_BATCH = 40;
 
 // El borrador de IA sigue siendo válido mientras nadie haya hecho una pregunta
 // nueva desde que se generó, así que solo se regenera cuando cambia lastQuestion.
@@ -313,16 +322,40 @@ async function runSyncInner() {
   const cache = await loadCache();
 
   const unread = await fetchUnreadPacks(token);
+  const unreadPackIds = new Set(
+    unread.results.map((entry) => entry.resource.match(/\/packs\/(\d+)\//)[1]),
+  );
   const results = await mapWithConcurrency(unread.results, 5, (entry) => syncPack(token, entry, cache));
 
-  // Arrancamos con todo lo que ya conocíamos: las conversaciones nunca se borran,
-  // aunque Mercado Libre deje de reportarlas como "no leídas" (porque alguien ya
-  // las abrió directamente en ML). Solo se actualizan las que vienen frescas en
-  // este ciclo; el resto se queda tal cual estaba (y no se reescribe en Redis).
+  // Lo "no leído" de ML solo avisa de mensajes nuevos, pero una conversación
+  // también cambia de estado cuando alguien la contesta o la lee directamente
+  // en Mercado Libre (sin pasar por esta app) — y en ese caso deja de aparecer
+  // en /messages/unread para siempre, así que nunca nos enteraríamos. Por eso,
+  // además de lo recién marcado no leído, revisamos de nuevo un lote acotado de
+  // lo que YA conocíamos y seguía "pendiente"/"mediación" la última vez. Se hace
+  // en lotes (no las ~600 de golpe) para no saturar el rate limit de la API;
+  // como el sync corre cada 2 minutos, en un rato quedan todas al día. Una vez
+  // que una conversación llega a "respondido" deja de re-consultarse (ya no
+  // puede desactualizarse sola: si el cliente vuelve a escribir, ML la vuelve a
+  // reportar como no leída y entra por la rama de arriba).
+  const staleCandidates = Object.entries(cache.packs)
+    .filter(([packId, entry]) => entry.record?.status !== 'respondido' && !unreadPackIds.has(packId))
+    .sort((a, b) => new Date(a[1].record?.lastCheckedAt || 0) - new Date(b[1].record?.lastCheckedAt || 0))
+    .slice(0, STALE_REFRESH_BATCH)
+    .map(([packId]) => packId);
+  const staleResults = await mapWithConcurrency(
+    staleCandidates,
+    5,
+    (packId) => syncPackById(token, packId, cache, 0),
+  );
+
+  // Arrancamos con todo lo que ya conocíamos: las conversaciones nunca se borran.
+  // Solo se actualizan las que vienen frescas en este ciclo (no leídas + el lote
+  // de refresco); el resto se queda tal cual estaba (y no se reescribe en Redis).
   const packs = { ...cache.packs };
   const touched = new Set();
   let errors = 0;
-  results.forEach((r) => {
+  [...results, ...staleResults].forEach((r) => {
     if (r.error) {
       errors++;
       console.warn('Error en pack:', r.error);
