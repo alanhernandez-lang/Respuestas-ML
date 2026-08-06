@@ -258,7 +258,7 @@ function syncPack(token, packEntry, cache) {
 
 // Cuántas conversaciones "viejas" (ya no reportadas como no leídas por ML) se
 // revisan de nuevo en cada ciclo — ver comentario en runSyncInner().
-const STALE_REFRESH_BATCH = 40;
+const STALE_REFRESH_BATCH = 80;
 
 // El borrador de IA sigue siendo válido mientras nadie haya hecho una pregunta
 // nueva desde que se generó, así que solo se regenera cuando cambia lastQuestion.
