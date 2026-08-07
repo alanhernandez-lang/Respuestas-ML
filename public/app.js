@@ -1160,6 +1160,43 @@ function renderMediation(mediation) {
   `;
 }
 
+// Motivos de cierre de un reclamo que hemos visto en la práctica — si Mercado
+// Libre manda uno que no está aquí, se muestra tal cual (con guiones bajos
+// cambiados por espacios) en vez de ocultarlo, para no perder la información.
+const CLAIM_REASON_LABELS = {
+  timeout: 'venció el plazo sin que nadie respondiera',
+  buyer_favored: 'se resolvió a favor del comprador',
+  seller_favored: 'se resolvió a favor del vendedor',
+  mutual_agreement: 'acuerdo entre comprador y vendedor',
+  return_completed: 'devolución del producto completada',
+};
+const CLAIM_CLOSED_BY_LABELS = {
+  mediator: 'un mediador de Mercado Libre',
+  seller: 'el vendedor',
+  buyer: 'el comprador',
+  system: 'el sistema de Mercado Libre',
+};
+
+// El detalle de cómo se resolvió un reclamo (`resolution`) viene como objeto, no
+// como texto — antes esto se mostraba crudo con JSON.stringify (feo e ilegible).
+// Aquí se traduce a los campos que sí sabemos leer; lo que no reconocemos se
+// muestra igual (en vez de ocultarlo) pero en palabras, nunca como JSON.
+function formatClaimResolution(resolution) {
+  if (!resolution) return null;
+  if (typeof resolution === 'string') return resolution;
+  const bits = [];
+  if (resolution.reason) {
+    bits.push(`Motivo: ${CLAIM_REASON_LABELS[resolution.reason] || String(resolution.reason).replace(/_/g, ' ')}`);
+  }
+  if (resolution.closed_by) {
+    bits.push(`Cerrado por: ${CLAIM_CLOSED_BY_LABELS[resolution.closed_by] || resolution.closed_by}`);
+  }
+  if (typeof resolution.applied_coverage === 'boolean') {
+    bits.push(`Cobertura de ML aplicada: ${resolution.applied_coverage ? 'sí' : 'no'}`);
+  }
+  return bits.length ? bits.join(' · ') : null;
+}
+
 // A diferencia de renderMediation (mediación EN CURSO, bloqueando el chat), esto es
 // para cuando el chat ya no está bloqueado, pero sigue siendo relevante saber que
 // esta venta pasó por un reclamo. No asumimos que ya se resolvió — lo decimos según
@@ -1167,14 +1204,15 @@ function renderMediation(mediation) {
 function renderPastMediation(record) {
   if (record.status === 'mediacion' || !record.pastMediation) return '';
   const { claimId, status, stage, resolution } = record.pastMediation;
-  const resolutionText = typeof resolution === 'string' ? resolution : (resolution ? JSON.stringify(resolution) : null);
+  const resolutionText = formatClaimResolution(resolution);
   const heading = status === 'closed'
     ? `⚖ Esta venta tuvo un reclamo${claimId ? ` (#${claimId})` : ''}, ya cerrado`
     : `⚖ Esta venta tiene un reclamo${claimId ? ` (#${claimId})` : ''} registrado`;
   return `
     <div class="mediation-box mediation-past">
       <strong>${heading}</strong>
-      <div class="mediation-meta">Estado: ${escapeHtml(status || '—')} · Etapa: ${escapeHtml(stage || '—')}${resolutionText ? ` · ${escapeHtml(resolutionText)}` : ''}</div>
+      <div class="mediation-meta">Estado: ${escapeHtml(status || '—')} · Etapa: ${escapeHtml(stage || '—')}</div>
+      ${resolutionText ? `<div class="mediation-meta">${escapeHtml(resolutionText)}</div>` : ''}
     </div>
   `;
 }
