@@ -11,6 +11,7 @@ const {
   fetchItemDetail,
   fetchClaimDetail,
   fetchClaimMessages,
+  fetchClaimsByOrder,
   fetchAttachment,
   sendPackMessage,
   markPackMessagesRead,
@@ -27,7 +28,13 @@ function stripHtml(str) {
 }
 
 async function resolveMediation(token, claimIds) {
-  if (!claimIds || claimIds.length === 0) return null;
+  // Mercado Libre puede reportar la conversación como "blocked" por mediación sin
+  // mandar todavía el claim_id asociado (lo vimos documentado y en casos reales).
+  // Devolvemos un objeto igual (no null) para que el estado "mediación" no dependa
+  // de si ya tenemos el detalle del reclamo o no.
+  if (!claimIds || claimIds.length === 0) {
+    return { claimId: null, status: null, stage: null, resolution: null, messages: [] };
+  }
   const claimId = claimIds[0];
   try {
     const [detail, messages] = await Promise.all([
@@ -196,6 +203,11 @@ async function resolvePackInfo(token, packId, cache) {
 }
 
 async function syncPackById(token, packId, cache, unreadCount) {
+  // El historial de mediación ya cerrada (ver checkPastMediation) se calcula aparte
+  // y por separado del resto de la conversación — si no lo arrastramos aquí, cada
+  // vez que este pack se vuelva a sincronizar (llega un mensaje nuevo, etc.) se
+  // perdería sin que nadie lo vuelva a detectar.
+  const previousRecord = cache.packs[packId]?.record;
   const [info, messagesResp] = await Promise.all([
     resolvePackInfo(token, packId, cache),
     fetchPackMessages(token, packId, SELLER_ID),
@@ -222,14 +234,42 @@ async function syncPackById(token, packId, cache, unreadCount) {
   const lastQuestion = [...messages].reverse().find((m) => m.sender === 'cliente') || null;
   const lastAnswer = [...messages].reverse().find((m) => m.sender === 'vendedor') || null;
   const conversationStatus = messagesResp.conversation_status?.status || null;
-  const mediation = conversationStatus === 'blocked'
+  // OJO: el estado "mediación" depende de que la conversación esté "blocked" AHORA
+  // MISMO, no de si logramos bajar el detalle del reclamo — Mercado Libre puede
+  // reportar "blocked" sin mandar todavía el claim_id, y aun así la conversación
+  // está genuinamente bloqueada por una mediación en curso.
+  const isBlocked = conversationStatus === 'blocked';
+  const mediation = isBlocked
     ? await resolveMediation(token, messagesResp.conversation_status?.claim_ids)
     : null;
-  const status = mediation
+  const status = isBlocked
     ? 'mediacion'
     : (lastAnswer && lastQuestion && new Date(lastAnswer.date) > new Date(lastQuestion.date)
       ? 'respondido'
       : 'pendiente');
+
+  // Mientras la conversación está bloqueada por mediación ya bajamos el detalle
+  // completo del reclamo (vía resolveMediation) — lo guardamos aparte para que, en
+  // cuanto se resuelva y `mediation` vuelva a null, no haga falta gastar otra
+  // llamada a la API (checkPastMediation) para recuperar lo mismo que ya sabíamos.
+  const lastActiveMediation = isBlocked && mediation?.claimId
+    ? { claimId: mediation.claimId, type: mediation.type || null, status: mediation.status, stage: mediation.stage, resolution: mediation.resolution }
+    : (previousRecord?.lastActiveMediation || null);
+
+  let pastMediation = previousRecord?.pastMediation || null;
+  let pastMediationChecked = Boolean(previousRecord?.pastMediationChecked);
+  if (isBlocked) {
+    // Está mediando otra vez ahora mismo: en cuanto se resuelva hay que volver a
+    // revisar (una sola vez, gratis, desde lastActiveMediation de abajo) — si no
+    // reseteáramos esto, una venta que ya se había revisado sin reclamo previo se
+    // quedaría para siempre sin mostrar esta mediación nueva una vez resuelta.
+    pastMediationChecked = false;
+  } else if (!pastMediationChecked && lastActiveMediation) {
+    // Se acaba de resolver y ya tenemos el detalle completo de cuando estaba
+    // bloqueada — nos ahorramos la llamada aparte de checkPastMediation.
+    pastMediation = lastActiveMediation;
+    pastMediationChecked = true;
+  }
 
   return {
     packId,
@@ -248,6 +288,10 @@ async function syncPackById(token, packId, cache, unreadCount) {
     conversationStatus,
     mediation,
     lastCheckedAt: new Date().toISOString(),
+    lastActiveMediation,
+    pastMediation,
+    pastMediationChecked,
+    pastMediationCheckAttempts: previousRecord?.pastMediationCheckAttempts || 0,
   };
 }
 
@@ -256,9 +300,72 @@ function syncPack(token, packEntry, cache) {
   return syncPackById(token, packId, cache, packEntry.count);
 }
 
+// Una vez que una mediación se resuelve, Mercado Libre deja de reportar la
+// conversación como "blocked" — así que el estado "mediación" (arriba) desaparece
+// solo, sin dejar rastro de que esa venta SÍ pasó por un reclamo. Esta función busca
+// aparte, por order_id, cualquier reclamo ligado a la venta (abierto o cerrado) para
+// no perder ese contexto. Solo se llama para packs que NUNCA la vimos bloqueada por
+// mediación (si sí la vimos, syncPackById ya guarda el detalle en lastActiveMediation
+// sin gastar esta llamada aparte — ver ahí).
+async function checkPastMediation(token, record) {
+  if (!record.orderId) {
+    record.pastMediationChecked = true;
+    return;
+  }
+  try {
+    const resp = await fetchClaimsByOrder(token, record.orderId);
+    // La forma exacta de la respuesta no está 100% documentada (results/data/array
+    // plano) — cubrimos las variantes conocidas en vez de asumir una sola.
+    const claims = Array.isArray(resp) ? resp : (resp?.results || resp?.data || []);
+    if (claims.length) {
+      // Nos quedamos con el más reciente (no el primero que venga, el orden no
+      // está garantizado) y le pedimos el detalle completo por el mismo camino que
+      // ya usamos para mediaciones activas, en vez de confiar en que el resumen
+      // del buscador traiga los mismos campos que /claims/{id}.
+      const [mostRecent] = claims
+        .slice()
+        .sort((a, b) => new Date(b.last_updated || b.date_created || 0) - new Date(a.last_updated || a.date_created || 0));
+      try {
+        const detail = await fetchClaimDetail(token, mostRecent.id);
+        record.pastMediation = {
+          claimId: mostRecent.id,
+          type: detail.type || mostRecent.type || null,
+          status: detail.status || mostRecent.status || null,
+          stage: detail.stage || mostRecent.stage || null,
+          resolution: detail.resolution || null,
+        };
+      } catch {
+        // Si falla el detalle, al menos dejamos lo que ya sabíamos por la búsqueda.
+        record.pastMediation = {
+          claimId: mostRecent.id,
+          type: mostRecent.type || null,
+          status: mostRecent.status || null,
+          stage: mostRecent.stage || null,
+          resolution: null,
+        };
+      }
+    }
+    record.pastMediationChecked = true;
+    record.pastMediationCheckAttempts = 0;
+  } catch (err) {
+    console.warn('No se pudo revisar historial de reclamos del pack', record.packId, err.message);
+    // No se marca "checked" en un error transitorio: se reintenta en un ciclo
+    // futuro. Para no reintentar así para siempre si el problema es permanente
+    // (p.ej. el endpoint cambió), nos rendimos después de unos intentos.
+    record.pastMediationCheckAttempts = (record.pastMediationCheckAttempts || 0) + 1;
+    if (record.pastMediationCheckAttempts >= 3) record.pastMediationChecked = true;
+  }
+}
+
 // Cuántas conversaciones "viejas" (ya no reportadas como no leídas por ML) se
 // revisan de nuevo en cada ciclo — ver comentario en runSyncInner().
 const STALE_REFRESH_BATCH = 80;
+
+// Cuántos packs se revisan por ciclo buscando mediaciones YA cerradas (ver
+// checkPastMediation) — como cada pack solo se revisa una vez en su vida
+// (pastMediationChecked), no hace falta que el lote sea tan grande como el de
+// arriba: es un backlog que se agota, no algo que se repita para siempre.
+const PAST_MEDIATION_CHECK_BATCH = 30;
 
 // El borrador de IA sigue siendo válido mientras nadie haya hecho una pregunta
 // nueva desde que se generó, así que solo se regenera cuando cambia lastQuestion.
@@ -365,6 +472,34 @@ async function runSyncInner() {
     }
     packs[r.packId] = { info: { orderId: r.orderId, buyerName: r.buyerName, buyerId: r.buyerId, itemTitles: r.itemTitles, itemLinks: r.itemLinks }, record: r };
     touched.add(r.packId);
+  });
+
+  // Igual que el refresco de arriba, pero para el historial de mediaciones YA
+  // cerradas (ver checkPastMediation) — nunca se re-consulta dos veces el mismo
+  // pack, así que este lote solo cubre lo que todavía no se había revisado ni una
+  // vez, y termina agotándose sin quedar dando vueltas para siempre.
+  //
+  // A propósito esto NO pasa por el `touched`/savePacksBulk de abajo: este lote
+  // puede tocar packs "respondido" (que el resto del sync ya no vuelve a
+  // sincronizar nunca) y con `packs` siendo una foto tomada al inicio del ciclo
+  // (hasta 90s de por medio), un savePacksBulk con esa foto podría pisar una
+  // respuesta recién publicada o un borrador recién editado por alguien del
+  // equipo mientras corría este mismo ciclo. Por eso cada pack se guarda aparte,
+  // leyendo su valor más fresco de Redis justo antes de escribir.
+  const pastMediationCandidates = Object.values(packs)
+    .filter((p) => p.record.status !== 'mediacion' && !p.record.pastMediationChecked)
+    .slice(0, PAST_MEDIATION_CHECK_BATCH);
+  await mapWithConcurrency(pastMediationCandidates, 3, async (entry) => {
+    const packId = entry.record.packId;
+    await checkPastMediation(token, entry.record);
+    const fresh = await loadPackEntry(packId);
+    if (!fresh) return;
+    Object.assign(fresh.record, {
+      pastMediation: entry.record.pastMediation,
+      pastMediationChecked: entry.record.pastMediationChecked,
+      pastMediationCheckAttempts: entry.record.pastMediationCheckAttempts,
+    });
+    await savePackEntry(packId, fresh);
   });
 
   await attachDrafts(packs, cache, token, touched);

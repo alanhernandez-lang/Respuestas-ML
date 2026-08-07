@@ -419,6 +419,12 @@ function render() {
     const answeredLine = r.status === 'respondido' && r.answeredBy
       ? ` · Respondido por ${escapeHtml(shortName(r.answeredBy))}`
       : '';
+    // La mediación se puede haber cerrado y ya no bloquear el chat (status volvió a
+    // "respondido"/"pendiente"), pero sigue siendo importante saber que esta venta
+    // pasó por un reclamo — así que se marca aparte del badge de estado normal.
+    const pastMediationBadge = r.status !== 'mediacion' && r.pastMediation
+      ? ' <span class="badge mediacion-past" title="Esta venta tuvo un reclamo/mediación con Mercado Libre">⚖ Tuvo mediación</span>'
+      : '';
     item.innerHTML = `
       ${avatarHtml(r.buyerName)}
       <div class="item-body">
@@ -427,7 +433,7 @@ function render() {
           <span class="item-time">${fmtTime(r.lastQuestion?.date)}</span>
         </div>
         <div class="row-mid">
-          <span class="badge ${r.status}">${STATUS_LABELS[r.status] || r.status}</span>
+          <span class="badge ${r.status}">${STATUS_LABELS[r.status] || r.status}</span>${pastMediationBadge}
           <span class="preview">${escapeHtml(lastMessagePreview(r))}</span>
         </div>
         <div class="item-order">Pedido ${escapeHtml(r.orderId || '—')} · ${escapeHtml(r.itemTitles.join(', ') || '—')}${answeredLine}</div>
@@ -642,7 +648,15 @@ function escapeHtml(str) {
 function renderMediation(mediation) {
   if (!mediation) return '';
   if (mediation.error) {
-    return `<div class="mediation-box"><strong>⚠ Mediación (reclamo #${mediation.claimId}):</strong> no se pudo cargar el detalle (${escapeHtml(mediation.error)}).</div>`;
+    return `<div class="mediation-box"><strong>⚠ Mediación${mediation.claimId ? ` (reclamo #${mediation.claimId})` : ''}:</strong> no se pudo cargar el detalle (${escapeHtml(mediation.error)}).</div>`;
+  }
+  if (!mediation.claimId) {
+    return `
+      <div class="mediation-box">
+        <strong>⚖ Mediación en curso</strong>
+        <div class="mediation-meta">Mercado Libre bloqueó esta conversación por un reclamo, pero todavía no dio el número de caso.</div>
+      </div>
+    `;
   }
   const thread = mediation.messages.map((m) => `
     <div class="msg ${m.role === 'respondent' ? 'vendedor' : m.role === 'complainant' ? 'cliente' : 'mediador'}">
@@ -655,6 +669,25 @@ function renderMediation(mediation) {
       <strong>Mediación / reclamo #${mediation.claimId}</strong>
       <div class="mediation-meta">Estado: ${escapeHtml(mediation.status || '—')} · Etapa: ${escapeHtml(mediation.stage || '—')}</div>
       <div class="thread">${thread}</div>
+    </div>
+  `;
+}
+
+// A diferencia de renderMediation (mediación EN CURSO, bloqueando el chat), esto es
+// para cuando el chat ya no está bloqueado, pero sigue siendo relevante saber que
+// esta venta pasó por un reclamo. No asumimos que ya se resolvió — lo decimos según
+// el estado real que reporta Mercado Libre, para no contradecir el renglón de abajo.
+function renderPastMediation(record) {
+  if (record.status === 'mediacion' || !record.pastMediation) return '';
+  const { claimId, status, stage, resolution } = record.pastMediation;
+  const resolutionText = typeof resolution === 'string' ? resolution : (resolution ? JSON.stringify(resolution) : null);
+  const heading = status === 'closed'
+    ? `⚖ Esta venta tuvo un reclamo${claimId ? ` (#${claimId})` : ''}, ya cerrado`
+    : `⚖ Esta venta tiene un reclamo${claimId ? ` (#${claimId})` : ''} registrado`;
+  return `
+    <div class="mediation-box mediation-past">
+      <strong>${heading}</strong>
+      <div class="mediation-meta">Estado: ${escapeHtml(status || '—')} · Etapa: ${escapeHtml(stage || '—')}${resolutionText ? ` · ${escapeHtml(resolutionText)}` : ''}</div>
     </div>
   `;
 }
@@ -704,7 +737,7 @@ function renderChatPanel() {
     `;
   }).join('');
 
-  el.chatThread.innerHTML = messagesHtml + renderMediation(r.mediation);
+  el.chatThread.innerHTML = messagesHtml + renderMediation(r.mediation) + renderPastMediation(r);
 
   const showDraft = r.status === 'pendiente' && r.draftAnswer;
   el.chatDraftPanel.hidden = !showDraft;

@@ -687,6 +687,10 @@ main {
 .badge.pendiente { color: var(--pending); background: var(--pending-bg); }
 .badge.respondido { color: var(--answered); background: var(--answered-bg); }
 .badge.mediacion { color: var(--mediation); background: var(--mediation-bg); }
+/* Reclamo/mediación ya cerrado: mismo color que "mediacion" activa pero sin el
+   punto de before (no es un estado de la conversación, es solo un aviso aparte). */
+.badge.mediacion-past { color: var(--mediation); background: var(--mediation-bg); opacity: 0.75; }
+.badge.mediacion-past::before { display: none; }
 
 .empty-state { color: var(--muted); text-align: center; margin-top: 3rem; padding: 0 1.5rem; line-height: 1.5; }
 
@@ -726,6 +730,11 @@ main {
 }
 .mediation-meta { color: var(--muted); font-size: 0.85rem; margin: 0.25rem 0 0.75rem; }
 .mediation-box .thread { margin-top: 0; }
+/* Reclamo ya cerrado (la conversación normal ya no está bloqueada) — se marca más
+   discreto que una mediación EN CURSO, para no confundir "hay que atenderla ahora"
+   con "esto ya se resolvió, solo es contexto". */
+.mediation-box.mediation-past { border-top-style: solid; color: var(--muted); opacity: 0.9; }
+.mediation-box.mediation-past strong { color: var(--mediation); }
 
 .collab-alert {
   display: flex;
