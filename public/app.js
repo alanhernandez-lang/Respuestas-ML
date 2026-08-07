@@ -826,7 +826,7 @@ function render() {
       // "respondido"/"pendiente"), pero sigue siendo importante saber que esta venta
       // pasó por un reclamo — así que se marca aparte del badge de estado normal.
       const pastMediationBadge = r.status !== 'mediacion' && r.pastMediation
-        ? ' <span class="badge mediacion-past" title="Esta venta tuvo un reclamo/mediación con Mercado Libre">⚖ Tuvo mediación</span>'
+        ? ` <span class="badge mediacion-past" title="Esta venta tuvo un caso de ${escapeHtml(claimTypeLabel(r.pastMediation.type).toLowerCase())} con Mercado Libre">⚖ Tuvo ${escapeHtml(claimTypeLabel(r.pastMediation.type).toLowerCase())}</span>`
         : '';
       // "Listo"/"con error" ayuda a distinguir de un vistazo los pendientes que solo
       // necesitan revisar y publicar, de los que de verdad requieren escribir algo.
@@ -1162,15 +1162,29 @@ function escapeHtml(str) {
   }[c]));
 }
 
+// Mercado Libre agrupa mediaciones, devoluciones y cancelaciones de compra bajo el
+// mismo "claim" — sin distinguir el `type`, todo se veía genérico como "Mediación"
+// en la UI aunque en realidad fuera una devolución. "Reclamo" es el resguardo por si
+// llega un `type` que no está en esta lista (para no dejarlo sin etiqueta).
+const CLAIM_TYPE_LABELS = {
+  mediations: 'Mediación',
+  return: 'Devolución',
+  cancel_purchase: 'Cancelación de compra',
+};
+function claimTypeLabel(type) {
+  return CLAIM_TYPE_LABELS[type] || 'Reclamo';
+}
+
 function renderMediation(mediation) {
   if (!mediation) return '';
+  const typeLabel = claimTypeLabel(mediation.type);
   if (mediation.error) {
-    return `<div class="mediation-box"><strong>⚠ Mediación${mediation.claimId ? ` (reclamo #${mediation.claimId})` : ''}:</strong> no se pudo cargar el detalle (${escapeHtml(mediation.error)}).</div>`;
+    return `<div class="mediation-box"><strong>⚠ ${escapeHtml(typeLabel)}${mediation.claimId ? ` (reclamo #${mediation.claimId})` : ''}:</strong> no se pudo cargar el detalle (${escapeHtml(mediation.error)}).</div>`;
   }
   if (!mediation.claimId) {
     return `
       <div class="mediation-box">
-        <strong>⚖ Mediación en curso</strong>
+        <strong>⚖ ${escapeHtml(typeLabel)} en curso</strong>
         <div class="mediation-meta">Mercado Libre bloqueó esta conversación por un reclamo, pero todavía no dio el número de caso.</div>
       </div>
     `;
@@ -1183,7 +1197,7 @@ function renderMediation(mediation) {
   `).join('');
   return `
     <div class="mediation-box">
-      <strong>Mediación / reclamo #${mediation.claimId}</strong>
+      <strong>${escapeHtml(typeLabel)} / reclamo #${mediation.claimId}</strong>
       <div class="mediation-meta">Estado: ${escapeHtml(mediation.status || '—')} · Etapa: ${escapeHtml(mediation.stage || '—')}</div>
       <div class="thread">${thread}</div>
     </div>
@@ -1233,11 +1247,15 @@ function formatClaimResolution(resolution) {
 // el estado real que reporta Mercado Libre, para no contradecir el renglón de abajo.
 function renderPastMediation(record) {
   if (record.status === 'mediacion' || !record.pastMediation) return '';
-  const { claimId, status, stage, resolution } = record.pastMediation;
+  const { claimId, type, status, stage, resolution } = record.pastMediation;
+  const typeLabel = claimTypeLabel(type).toLowerCase();
   const resolutionText = formatClaimResolution(resolution);
+  // "un caso de <tipo>" en vez de pegar el artículo directo al tipo: así funciona
+  // igual de bien con "mediación"/"devolución" (femenino) que con "reclamo"
+  // genérico (masculino), sin tener que cargar el género de cada etiqueta.
   const heading = status === 'closed'
-    ? `⚖ Esta venta tuvo un reclamo${claimId ? ` (#${claimId})` : ''}, ya cerrado`
-    : `⚖ Esta venta tiene un reclamo${claimId ? ` (#${claimId})` : ''} registrado`;
+    ? `⚖ Esta venta tuvo un caso de ${typeLabel}${claimId ? ` (#${claimId})` : ''}, ya cerrado`
+    : `⚖ Esta venta tiene un caso de ${typeLabel}${claimId ? ` (#${claimId})` : ''} registrado`;
   return `
     <div class="mediation-box mediation-past">
       <strong>${heading}</strong>

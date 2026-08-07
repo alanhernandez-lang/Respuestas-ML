@@ -33,7 +33,7 @@ async function resolveMediation(token, claimIds) {
   // Devolvemos un objeto igual (no null) para que el estado "mediación" no dependa
   // de si ya tenemos el detalle del reclamo o no.
   if (!claimIds || claimIds.length === 0) {
-    return { claimId: null, status: null, stage: null, resolution: null, messages: [] };
+    return { claimId: null, type: null, status: null, stage: null, resolution: null, messages: [] };
   }
   const claimId = claimIds[0];
   try {
@@ -52,6 +52,10 @@ async function resolveMediation(token, claimIds) {
       }));
     return {
       claimId,
+      // `type` distingue una devolución (type: "return") de una mediación propiamente
+      // dicha o una cancelación de compra — sin esto, todo se veía genérico como
+      // "Mediación" en la UI aunque en realidad fuera una devolución.
+      type: detail.type || null,
       status: detail.status,
       stage: detail.stage,
       reasonId: detail.reason_id,
