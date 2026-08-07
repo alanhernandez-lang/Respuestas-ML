@@ -10,6 +10,19 @@ const state = {
   logEntries: [],
   logFilterEmail: '',
   bank: [],
+  // Preferencias de uso diario que sí importa recordar entre sesiones, pero que no
+  // necesitan vivir en el servidor (son de cómo cada persona quiere ver la lista, no
+  // datos de negocio) — se guardan en localStorage, ver loadFlags()/loadSortMode().
+  flags: new Set(),
+  sortMode: 'reciente',
+  showFlaggedOnly: false,
+  // Se recalcula en cada render() a partir de `filtered`, para que los atajos j/k
+  // (ver moveSelection()) naveguen exactamente la lista que la persona está viendo
+  // ahora (con su búsqueda/filtro/orden aplicados), no el arreglo completo sin filtrar.
+  filteredIds: [],
+  // packId de la conversación cuya tarjeta de borrador tiene abierto el selector de
+  // "Banco de respuestas" (ver bankPickerHtml()) — como mucho una a la vez.
+  bankPickerOpenFor: null,
 };
 
 const el = {
@@ -52,9 +65,20 @@ const el = {
   lightboxOverlay: document.getElementById('lightboxOverlay'),
   lightboxImg: document.getElementById('lightboxImg'),
   lightboxClose: document.getElementById('lightboxClose'),
+  sortMode: document.getElementById('sortMode'),
+  flagFilterBtn: document.getElementById('flagFilterBtn'),
+  densityToggle: document.getElementById('densityToggle'),
+  shortcutsBtn: document.getElementById('shortcutsBtn'),
+  shortcutsOverlay: document.getElementById('shortcutsOverlay'),
+  shortcutsClose: document.getElementById('shortcutsClose'),
+  chatFlagBtn: document.getElementById('chatFlagBtn'),
+  chatWaitPill: document.getElementById('chatWaitPill'),
 };
 
 const STATUS_LABELS = { pendiente: 'Pendiente', respondido: 'Respondido', mediacion: 'Mediación' };
+// Ícono de forma distinta por estado (además del color): así el estado se distingue
+// también por forma, no solo por color, y es más fácil de escanear en una lista larga.
+const STATUS_ICON = { pendiente: '●', mediacion: '⚖', respondido: '✓' };
 // Pendientes y mediaciones necesitan acción, así que se muestran antes que lo ya respondido.
 const STATUS_PRIORITY = { pendiente: 0, mediacion: 0, respondido: 1 };
 const AVATAR_COLORS = ['av-1', 'av-2', 'av-3', 'av-4', 'av-5', 'av-6', 'av-7', 'av-8'];
@@ -148,6 +172,204 @@ function toggleTheme() {
 }
 
 el.themeToggle.addEventListener('click', toggleTheme);
+
+// "Marcados para seguimiento": un aparte personal e independiente del estado real de
+// Mercado Libre, para no perder de vista un caso que necesita revisarse de nuevo más
+// tarde aunque ya esté "respondido" (p. ej. "avisar cuando llegue el repuesto") o
+// aunque siga "pendiente" pero de baja prioridad y quieras encontrarlo rápido después.
+// Vive solo en localStorage de este navegador (no en el servidor): es una nota para
+// quien esté usando ESTE equipo/sesión, no un dato compartido con el resto del equipo.
+function loadFlags() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('ml_flags') || '[]');
+    return new Set(Array.isArray(raw) ? raw : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveFlags() {
+  localStorage.setItem('ml_flags', JSON.stringify([...state.flags]));
+}
+
+function toggleFlag(packId) {
+  if (!packId) return;
+  if (state.flags.has(packId)) state.flags.delete(packId);
+  else state.flags.add(packId);
+  saveFlags();
+  render();
+}
+
+el.chatFlagBtn.addEventListener('click', () => toggleFlag(state.selectedPackId));
+
+el.flagFilterBtn.addEventListener('click', () => {
+  state.showFlaggedOnly = !state.showFlaggedOnly;
+  render();
+});
+
+// Densidad de la lista: para quien prefiera ver más filas de un vistazo a costa de
+// menos aire entre ellas. Preferencia de comodidad visual, así que se recuerda entre
+// sesiones igual que el tema, y no toca ningún dato.
+function loadDensity() {
+  return localStorage.getItem('ml_density') === 'compact' ? 'compact' : 'cozy';
+}
+
+function applyDensity(mode) {
+  const compact = mode === 'compact';
+  document.body.classList.toggle('density-compact', compact);
+  el.densityToggle.setAttribute('aria-pressed', String(compact));
+  el.densityToggle.title = compact ? 'Vista cómoda de la lista' : 'Vista compacta de la lista';
+}
+
+function toggleDensity() {
+  const next = document.body.classList.contains('density-compact') ? 'cozy' : 'compact';
+  localStorage.setItem('ml_density', next);
+  applyDensity(next);
+}
+
+el.densityToggle.addEventListener('click', toggleDensity);
+
+el.sortMode.addEventListener('change', () => {
+  state.sortMode = el.sortMode.value === 'urgencia' ? 'urgencia' : 'reciente';
+  localStorage.setItem('ml_sortMode', state.sortMode);
+  render();
+});
+
+// Indicador de urgencia por tiempo esperando respuesta: no basta con saber que algo
+// está "pendiente"/"en mediación", importa hace CUÁNTO. Se deriva del mismo
+// `lastQuestion.date` que ya trae cada registro — sin pedir nada nuevo al backend.
+function waitingInfo(r) {
+  if (r.status === 'respondido') return null;
+  const dateStr = r.lastQuestion?.date;
+  if (!dateStr) return null;
+  const hours = (Date.now() - new Date(dateStr).getTime()) / 3600000;
+  let level = 'fresh';
+  if (hours >= 72) level = 'critical';
+  else if (hours >= 24) level = 'warn';
+  return { shortLabel: timeAgo(dateStr).replace(/^hace /, ''), level };
+}
+
+// Sugiere del banco de respuestas cuáles se usaron antes para preguntas parecidas a
+// la última del cliente en ESTA conversación — coincidencia simple por palabras (sin
+// backend nuevo: solo compara texto que ya tenemos en memoria). No es IA, es una
+// heurística barata para subir al principio lo más probablemente útil.
+function suggestBankEntries(record, bank, limit) {
+  if (!bank.length) return [];
+  const questionText = (record?.lastQuestion?.text || '').toLowerCase();
+  const words = [...new Set(questionText.split(/[^a-z0-9áéíóúñ]+/i).filter((w) => w.length >= 4))];
+  const scored = bank.map((entry) => {
+    const haystack = `${entry.text} ${(entry.questions || []).join(' ')}`.toLowerCase();
+    const score = words.reduce((acc, w) => acc + (haystack.includes(w) ? 1 : 0), 0);
+    return { ...entry, matched: score > 0 };
+  });
+  if (words.length) {
+    // sort() es estable: dentro del mismo puntaje se conserva el orden en que ya
+    // venía el banco (por frecuencia de uso, ver computeResponseBank en el servidor).
+    scored.sort((a, b) => (b.matched ? 1 : 0) - (a.matched ? 1 : 0));
+  }
+  return scored.slice(0, limit);
+}
+
+// Navegación de la lista con teclado (atajos j/k, ver el manejador global de abajo):
+// se mueve dentro de `state.filteredIds`, que render() recalcula con la búsqueda/
+// filtro/orden que la persona tenga puestos en ese momento — no la lista completa.
+function moveSelection(delta) {
+  const ids = state.filteredIds;
+  if (!ids.length) return;
+  const currentIndex = ids.indexOf(state.selectedPackId);
+  const nextIndex = currentIndex === -1
+    ? 0
+    : Math.min(ids.length - 1, Math.max(0, currentIndex + delta));
+  const nextId = ids[nextIndex];
+  if (nextId === state.selectedPackId) return;
+  selectConversation(nextId);
+  el.conversationList.querySelector(`.conversation-item[data-pack="${CSS.escape(nextId)}"]`)
+    ?.scrollIntoView({ block: 'nearest' });
+}
+
+function openShortcuts() {
+  el.shortcutsOverlay.hidden = false;
+  el._shortcutsTrigger = document.activeElement;
+  el.shortcutsClose.focus();
+  document.addEventListener('keydown', onShortcutsKeydown);
+}
+
+function closeShortcuts() {
+  el.shortcutsOverlay.hidden = true;
+  document.removeEventListener('keydown', onShortcutsKeydown);
+  el._shortcutsTrigger?.focus();
+}
+
+function onShortcutsKeydown(e) {
+  if (e.key === 'Escape') {
+    closeShortcuts();
+    return;
+  }
+  // El botón de cerrar es el único elemento enfocable dentro del modal — sin esto,
+  // Tab se escapa hacia el contenido de atrás (visualmente tapado por el overlay,
+  // pero sigue en el orden de tabulación del DOM), rompiendo el atrapa-foco que
+  // aria-modal="true" promete a lectores de pantalla.
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    el.shortcutsClose.focus();
+  }
+}
+
+el.shortcutsBtn.addEventListener('click', openShortcuts);
+el.shortcutsClose.addEventListener('click', closeShortcuts);
+el.shortcutsOverlay.addEventListener('click', (e) => {
+  if (e.target === el.shortcutsOverlay) closeShortcuts();
+});
+
+// Atajos de teclado para quien use la herramienta muchas horas al día (ver también
+// el modal de ayuda que abre "?", con la lista completa). Se ignoran por completo
+// mientras la persona esté escribiendo en un campo de texto (isEditableField) o
+// mientras haya un modal propio abierto (confirmación/imagen/atajos), que ya manejan
+// su propio teclado.
+document.addEventListener('keydown', (e) => {
+  if (!el.confirmOverlay.hidden || !el.lightboxOverlay.hidden || !el.shortcutsOverlay.hidden) return;
+
+  // Sin esto, cualquier combinación con Ctrl/Cmd/Alt donde la tecla coincida con uno
+  // de nuestros atajos de letra sin modificador (sobre todo Ctrl/Cmd+F "buscar en la
+  // página" y Ctrl/Cmd+C "copiar selección", ambos atajos nativos del navegador de
+  // uso constante) quedaba secuestrada por error — p. ej. seleccionar texto del hilo
+  // y presionar Ctrl+C copiaba el borrador de IA en vez del texto seleccionado.
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+  const target = e.target;
+  const isEditableField = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA'
+    || target.tagName === 'SELECT' || target.isContentEditable;
+
+  if (e.key === 'Escape') {
+    if (target === el.search && el.search.value) {
+      el.search.value = '';
+      render();
+      return;
+    }
+    if (state.editingPackId) {
+      state.editingPackId = null;
+      state.editingDraftText = null;
+      renderChatPanel();
+    }
+    return;
+  }
+
+  if (isEditableField) return;
+
+  if (e.key === '?') { e.preventDefault(); openShortcuts(); return; }
+  if (e.key === '/') { e.preventDefault(); el.search.focus(); return; }
+  if (e.key === '1') { e.preventDefault(); switchView('messages'); return; }
+  if (e.key === '2') { e.preventDefault(); switchView('log'); return; }
+  if (e.key === '3') { e.preventDefault(); switchView('bank'); return; }
+
+  if (el.viewMessages.hidden) return; // j/k/f/e/c son de la vista de Mensajes
+
+  if (e.key === 'j') { e.preventDefault(); moveSelection(1); return; }
+  if (e.key === 'k') { e.preventDefault(); moveSelection(-1); return; }
+  if (e.key === 'f') { e.preventDefault(); toggleFlag(state.selectedPackId); return; }
+  if (e.key === 'e') { e.preventDefault(); el.chatDraftPanel.querySelector('.editBtn')?.click(); return; }
+  if (e.key === 'c') { e.preventDefault(); el.chatDraftPanel.querySelector('.copyBtn')?.click(); }
+});
 
 // Visor de imágenes: al hacer clic en una foto del hilo se amplía sobre la app en
 // vez de abrir una pestaña nueva del navegador (el <a href> de respaldo sigue ahí
@@ -328,6 +550,16 @@ function renderBank() {
     || r.text.toLowerCase().includes(q)
     || (r.questions || []).some((qq) => qq.toLowerCase().includes(q)));
 
+  // Si hay una conversación pendiente abierta, cada respuesta del banco también
+  // ofrece "Usar en <comprador>" — un camino más corto que copiar aquí y luego ir a
+  // pegarlo a mano en la otra pestaña.
+  const activeRecord = state.records.find((x) => x.packId === state.selectedPackId);
+  // Si el borrador de esa conversación falló (draftAnswer.error), draftCardHtml no
+  // pinta el textarea de edición — insertar ahí dejaría el estado de edición seteado
+  // sin nada visible donde aterrizar, y el toast de "insertado" mentiría.
+  const canInsert = Boolean(activeRecord && activeRecord.status === 'pendiente'
+    && activeRecord.draftAnswer && !activeRecord.draftAnswer.error);
+
   el.bankEmptyState.hidden = filtered.length > 0;
   el.bankList.innerHTML = filtered.map((r) => `
     <div class="log-entry bank-entry">
@@ -339,7 +571,10 @@ function renderBank() {
         <div class="draft-text">${escapeHtml(r.text)}</div>
         ${(r.questions || []).length ? `<div class="log-meta">Preguntas parecidas: ${r.questions.map((qq) => `"${escapeHtml(qq)}"`).join(' · ')}</div>` : ''}
       </div>
-      <button class="btn-secondary copyBtn" data-text="${escapeHtml(r.text)}">Copiar</button>
+      <div class="bank-entry-actions">
+        <button class="btn-secondary copyBtn" data-text="${escapeHtml(r.text)}">Copiar</button>
+        ${canInsert ? `<button class="btn-secondary useInChatBtn" data-text="${escapeHtml(r.text)}">Usar en "${escapeHtml(activeRecord.buyerName)}"</button>` : ''}
+      </div>
     </div>
   `).join('');
 }
@@ -348,10 +583,23 @@ el.bankSearch.addEventListener('input', renderBank);
 
 el.bankList.addEventListener('click', async (e) => {
   const copyBtn = e.target.closest('.copyBtn');
-  if (!copyBtn) return;
-  await navigator.clipboard.writeText(copyBtn.dataset.text);
-  copyBtn.textContent = 'Copiado ✓';
-  setTimeout(() => { copyBtn.textContent = 'Copiar'; }, 1500);
+  if (copyBtn) {
+    await navigator.clipboard.writeText(copyBtn.dataset.text);
+    copyBtn.textContent = 'Copiado ✓';
+    setTimeout(() => { copyBtn.textContent = 'Copiar'; }, 1500);
+    return;
+  }
+
+  const useInChatBtn = e.target.closest('.useInChatBtn');
+  if (useInChatBtn && state.selectedPackId) {
+    state.editingPackId = state.selectedPackId;
+    state.editingDraftText = useInChatBtn.dataset.text;
+    state.bankPickerOpenFor = null;
+    renderChatPanel();
+    switchView('messages');
+    el.chatDraftPanel.querySelector('.draft-edit-textarea')?.focus();
+    showToast('Respuesta insertada en el borrador — revísala antes de publicar.', 'success');
+  }
 });
 
 async function refreshLog() {
@@ -423,9 +671,9 @@ function statusCountsHtml(records) {
     <button class="badge ${cls}" aria-selected="${state.statusFilter === status}" data-status="${status}">${label}</button>
   `;
   return chip('', 'all', `Todas (${records.length})`)
-    + chip('pendiente', 'pendiente', `${counts.pendiente} pendiente${counts.pendiente === 1 ? '' : 's'}`)
-    + chip('mediacion', 'mediacion', `${counts.mediacion} mediaci${counts.mediacion === 1 ? 'ón' : 'ones'}`)
-    + chip('respondido', 'respondido', `${counts.respondido} respondido${counts.respondido === 1 ? '' : 's'}`);
+    + chip('pendiente', 'pendiente', `${STATUS_ICON.pendiente} ${counts.pendiente} pendiente${counts.pendiente === 1 ? '' : 's'}`)
+    + chip('mediacion', 'mediacion', `${STATUS_ICON.mediacion} ${counts.mediacion} mediaci${counts.mediacion === 1 ? 'ón' : 'ones'}`)
+    + chip('respondido', 'respondido', `${STATUS_ICON.respondido} ${counts.respondido} respondido${counts.respondido === 1 ? '' : 's'}`);
 }
 
 function timeAgo(iso) {
@@ -511,25 +759,45 @@ function render() {
       || r.itemTitles.join(' ').toLowerCase().includes(q)
       || (r.lastQuestion?.text || '').toLowerCase().includes(q);
     const matchesStatus = !state.statusFilter || r.status === state.statusFilter;
-    return matchesQ && matchesStatus;
+    const matchesFlag = !state.showFlaggedOnly || state.flags.has(r.packId);
+    return matchesQ && matchesStatus && matchesFlag;
   });
   // sort() es estable: dentro de cada grupo de prioridad se conserva el orden por
-  // fecha que ya trae el arreglo (el servidor lo entrega del más reciente al más viejo).
-  filtered.sort((a, b) => (STATUS_PRIORITY[a.status] ?? 0) - (STATUS_PRIORITY[b.status] ?? 0));
+  // fecha que ya trae el arreglo (el servidor lo entrega del más reciente al más viejo)
+  // — salvo en modo "urgencia", donde dentro de lo pendiente/mediación se reordena por
+  // cuánto lleva esperando (más viejo primero), para no dejar enterrado bajo mensajes
+  // recientes un caso que lleva días sin respuesta.
+  filtered.sort((a, b) => {
+    const byPriority = (STATUS_PRIORITY[a.status] ?? 0) - (STATUS_PRIORITY[b.status] ?? 0);
+    if (byPriority !== 0) return byPriority;
+    if (state.sortMode === 'urgencia' && a.status !== 'respondido') {
+      return new Date(a.lastQuestion?.date || 0) - new Date(b.lastQuestion?.date || 0);
+    }
+    return 0;
+  });
+
+  state.filteredIds = filtered.map((r) => r.packId);
 
   el.statusCounts.innerHTML = statusCountsHtml(state.records);
+  const flaggedTotal = state.records.filter((r) => state.flags.has(r.packId)).length;
+  el.flagFilterBtn.textContent = `⭐ Marcados (${flaggedTotal})`;
+  el.flagFilterBtn.setAttribute('aria-pressed', String(state.showFlaggedOnly));
   el.empty.hidden = filtered.length > 0;
 
   withFocusPreserved(el.conversationList, () => {
     el.conversationList.innerHTML = '';
     for (const r of filtered) {
+      const isFlagged = state.flags.has(r.packId);
+      const wait = waitingInfo(r);
       const item = document.createElement('div');
       item.className = 'conversation-item' + (r.packId === state.selectedPackId ? ' active' : '');
       item.dataset.pack = r.packId;
+      item.dataset.status = r.status;
       item.setAttribute('role', 'button');
       item.setAttribute('tabindex', '0');
       item.setAttribute('aria-current', String(r.packId === state.selectedPackId));
-      item.setAttribute('aria-label', `Conversación con ${r.buyerName}, ${STATUS_LABELS[r.status] || r.status}`);
+      const waitAria = wait ? `, lleva ${wait.shortLabel} sin responder` : '';
+      item.setAttribute('aria-label', `Conversación con ${r.buyerName}, ${STATUS_LABELS[r.status] || r.status}${waitAria}${isFlagged ? ', marcada para seguimiento' : ''}`);
       const answeredLine = r.status === 'respondido' && r.answeredBy
         ? ` · Respondido por ${escapeHtml(shortName(r.answeredBy))}`
         : '';
@@ -539,21 +807,50 @@ function render() {
       const pastMediationBadge = r.status !== 'mediacion' && r.pastMediation
         ? ' <span class="badge mediacion-past" title="Esta venta tuvo un reclamo/mediación con Mercado Libre">⚖ Tuvo mediación</span>'
         : '';
+      // "Listo"/"con error" ayuda a distinguir de un vistazo los pendientes que solo
+      // necesitan revisar y publicar, de los que de verdad requieren escribir algo.
+      const draftFlagBadge = r.status === 'pendiente' && r.draftAnswer
+        ? (r.draftAnswer.error
+          ? ' <span class="badge draft-error" title="El borrador de IA falló para esta conversación">⚠ borrador con error</span>'
+          : ' <span class="badge draft-ready" title="Ya hay un borrador de IA listo para revisar y publicar">✨ listo para revisar</span>')
+        : '';
+      const unreadHtml = r.unreadCount > 1
+        ? `<span class="unread-pill" title="Mensajes nuevos sin leer en Mercado Libre">${r.unreadCount} sin leer</span>`
+        : '';
+      const rightTimeHtml = wait
+        ? `<span class="wait-pill wait-${wait.level}" title="Tiempo desde el último mensaje del cliente sin responder">⏱ ${wait.shortLabel}</span>`
+        : `<span class="item-time">${fmtTime(r.lastQuestion?.date)}</span>`;
       item.innerHTML = `
         ${avatarHtml(r.buyerName)}
         <div class="item-body">
           <div class="row-top">
             <span class="buyer-name">${escapeHtml(r.buyerName)}</span>
-            <span class="item-time">${fmtTime(r.lastQuestion?.date)}</span>
+            <div class="row-top-right">
+              ${rightTimeHtml}
+              <button type="button" class="flag-btn${isFlagged ? ' flagged' : ''}" aria-pressed="${isFlagged}" aria-label="${isFlagged ? 'Quitar de seguimiento' : 'Marcar para seguimiento'}" title="Marcar para seguimiento (f)">${isFlagged ? '★' : '☆'}</button>
+            </div>
           </div>
           <div class="row-mid">
-            <span class="badge ${r.status}">${STATUS_LABELS[r.status] || r.status}</span>${pastMediationBadge}
-            <span class="preview">${escapeHtml(lastMessagePreview(r))}</span>
+            <span class="badge ${r.status}">${STATUS_ICON[r.status] || ''} ${STATUS_LABELS[r.status] || r.status}</span>${pastMediationBadge}${draftFlagBadge}${unreadHtml}
           </div>
+          <div class="preview">${escapeHtml(lastMessagePreview(r))}</div>
           <div class="item-order">Pedido ${escapeHtml(r.orderId || '—')} · ${escapeHtml(r.itemTitles.join(', ') || '—')}${answeredLine}</div>
         </div>
       `;
       item.addEventListener('click', () => selectConversation(r.packId));
+      const flagBtn = item.querySelector('.flag-btn');
+      flagBtn.addEventListener('click', (e) => {
+        // La estrella vive dentro de una fila que también es clicable entera (para
+        // abrir la conversación) — sin esto, marcar/desmarcar también la abriría.
+        e.stopPropagation();
+        toggleFlag(r.packId);
+      });
+      flagBtn.addEventListener('keydown', (e) => {
+        // Mismo motivo que arriba, pero para el manejador de teclado delegado del
+        // contenedor (activateRowOnEnterOrSpace) — sin esto, Enter/Espacio sobre la
+        // estrella también activaría la fila completa.
+        if (e.key === 'Enter' || e.key === ' ') e.stopPropagation();
+      });
       el.conversationList.appendChild(item);
     }
   });
@@ -602,6 +899,7 @@ function draftCardHtml(r) {
   const collabAlertHtml = viewerEmail
     ? `<div class="collab-alert">⚠ ${escapeHtml(shortName(viewerEmail))} también está viendo esta conversación ahora mismo. Coordinen para no responder dos veces.</div>`
     : '';
+  const bankBtnHtml = `<button class="btn-secondary bankPickerBtn" data-pack="${r.packId}" aria-expanded="${state.bankPickerOpenFor === r.packId}">📚 Banco</button>`;
 
   return `
     <div class="draft-card" data-pack="${r.packId}">
@@ -633,6 +931,7 @@ function draftCardHtml(r) {
         ${isEditing ? `
           <div class="draft-actions-secondary">
             <button class="btn-secondary cancelEditBtn" data-pack="${r.packId}">Cancelar</button>
+            ${bankBtnHtml}
           </div>
           <button class="btn-primary saveEditBtn" data-pack="${r.packId}">Guardar cambios</button>
         ` : `
@@ -640,10 +939,37 @@ function draftCardHtml(r) {
             <button class="btn-secondary copyBtn" data-text="${escapeHtml(r.draftAnswer.text)}">Copiar</button>
             <button class="btn-secondary editBtn" data-pack="${r.packId}">Editar</button>
             <button class="btn-secondary regenerateBtn" data-pack="${r.packId}">Regenerar</button>
+            ${bankBtnHtml}
           </div>
           <button class="btn-primary publishBtn" data-pack="${r.packId}" data-buyer="${escapeHtml(r.buyerName)}">Publicar ↗</button>
         `}
       </div>
+
+      ${bankPickerHtml(r)}
+    </div>
+  `;
+}
+
+// Selector de "Banco de respuestas" dentro de la propia tarjeta del borrador: deja
+// insertar una respuesta ya usada antes sin salir a la pestaña de Banco. Prioriza las
+// que parecen relacionadas con la última pregunta de este cliente (ver
+// suggestBankEntries), pero siempre deja ver también las demás más usadas.
+function bankPickerHtml(r) {
+  if (state.bankPickerOpenFor !== r.packId) return '';
+  if (!state.bank.length) {
+    return `<div class="bank-picker"><p class="bank-picker-empty">Todavía no hay respuestas frecuentes guardadas — se van llenando conforme el equipo publique respuestas.</p></div>`;
+  }
+  const suggestions = suggestBankEntries(r, state.bank, 6);
+  const hasMatches = suggestions.some((s) => s.matched);
+  return `
+    <div class="bank-picker">
+      <div class="bank-picker-head">${hasMatches ? 'Respuestas frecuentes relacionadas con esta pregunta' : 'Respuestas más usadas por el equipo'}</div>
+      ${suggestions.map((s) => `
+        <div class="bank-picker-item${s.matched ? ' matched' : ''}">
+          <div class="bank-picker-text">${escapeHtml(s.text)}</div>
+          <button type="button" class="btn-secondary useBankBtn" data-pack="${r.packId}" data-text="${escapeHtml(s.text)}">Usar</button>
+        </div>
+      `).join('')}
     </div>
   `;
 }
@@ -670,6 +996,26 @@ async function handleDraftAction(e) {
   if (cancelEditBtn) {
     state.editingPackId = null;
     state.editingDraftText = null;
+    renderChatPanel();
+    return;
+  }
+
+  const bankPickerBtn = e.target.closest('.bankPickerBtn');
+  if (bankPickerBtn) {
+    const pid = bankPickerBtn.dataset.pack;
+    state.bankPickerOpenFor = state.bankPickerOpenFor === pid ? null : pid;
+    renderChatPanel();
+    return;
+  }
+
+  const useBankBtn = e.target.closest('.useBankBtn');
+  if (useBankBtn) {
+    // Insertar una respuesta del banco entra en modo edición con ese texto ya puesto
+    // (en vez de guardarlo directo): siempre queda una oportunidad de ajustarlo al
+    // caso concreto antes de publicar, igual que si se hubiera escrito a mano.
+    state.editingPackId = useBankBtn.dataset.pack;
+    state.editingDraftText = useBankBtn.dataset.text;
+    state.bankPickerOpenFor = null;
     renderChatPanel();
     return;
   }
@@ -856,6 +1202,21 @@ function renderChatPanel() {
     ${r.orderUrl ? ` · <a class="ml-link" href="${r.orderUrl}" target="_blank" rel="noopener">Ver venta en Mercado Libre ↗</a>` : ''}
     ${itemLinksHtml(r.itemLinks)}`;
 
+  const isFlagged = state.flags.has(r.packId);
+  el.chatFlagBtn.textContent = isFlagged ? '★' : '☆';
+  el.chatFlagBtn.classList.toggle('flagged', isFlagged);
+  el.chatFlagBtn.setAttribute('aria-pressed', String(isFlagged));
+  el.chatFlagBtn.setAttribute('aria-label', isFlagged ? 'Quitar de seguimiento' : 'Marcar para seguimiento');
+
+  const wait = waitingInfo(r);
+  if (wait) {
+    el.chatWaitPill.hidden = false;
+    el.chatWaitPill.className = `wait-pill wait-${wait.level}`;
+    el.chatWaitPill.textContent = `⏱ lleva ${wait.shortLabel} sin responder`;
+  } else {
+    el.chatWaitPill.hidden = true;
+  }
+
   if (r.status === 'respondido' && r.answeredBy) {
     el.chatAnsweredBy.hidden = false;
     el.chatAnsweredBy.textContent = `Respondido por ${shortName(r.answeredBy)}`;
@@ -1026,8 +1387,20 @@ setInterval(loadMessages, AUTO_REFRESH_MS);
 setInterval(refreshPresence, PRESENCE_POLL_MS);
 setInterval(autoSync, AUTO_SYNC_MS);
 
+// Preferencias personales de este navegador (ver comentarios junto a cada loader):
+// se cargan antes del primer render() para que la lista ya salga ordenada/filtrada
+// como la persona la dejó la última vez, sin un parpadeo con los valores por default.
+state.flags = loadFlags();
+state.sortMode = localStorage.getItem('ml_sortMode') === 'urgencia' ? 'urgencia' : 'reciente';
+el.sortMode.value = state.sortMode;
+applyDensity(loadDensity());
+
 initTheme();
 loadMessages();
 loadUserEmail();
 refreshPresence();
 autoSync();
+// El banco de respuestas se precarga desde el arranque (no solo al abrir su pestaña)
+// para que el selector "📚 Banco" dentro de cada borrador ya tenga datos disponibles
+// desde el primer momento, sin que la persona tenga que visitar esa pestaña primero.
+refreshBank();

@@ -30,6 +30,7 @@
     <div class="toolbar">
       <button id="syncBtn" type="button">Sincronizar</button>
       <span id="syncInfo" class="sync-info" role="status" aria-live="polite"></span>
+      <button id="shortcutsBtn" class="icon-btn" type="button" aria-label="Ver atajos de teclado" title="Atajos de teclado (?)">⌨</button>
       <button id="themeToggle" class="icon-btn" type="button" aria-label="Cambiar a tema oscuro" title="Cambiar tema claro/oscuro">🌙</button>
       <span id="userEmail" class="user-email"></span>
       <a href="/api/auth/logout" class="logout-link">Cerrar sesión</a>
@@ -41,7 +42,16 @@
       <aside class="chat-sidebar">
         <div class="sidebar-toolbar">
           <label for="search" class="visually-hidden">Buscar cliente o producto</label>
-          <input id="search" type="search" placeholder="Buscar cliente o producto..." />
+          <input id="search" type="search" placeholder="Buscar cliente o producto... (/)" />
+          <div class="sidebar-controls">
+            <label for="sortMode" class="visually-hidden">Ordenar conversaciones</label>
+            <select id="sortMode" title="Ordenar conversaciones">
+              <option value="reciente">Más recientes</option>
+              <option value="urgencia">Más urgentes</option>
+            </select>
+            <button id="flagFilterBtn" class="chip-toggle" type="button" aria-pressed="false">⭐ Marcados (0)</button>
+            <button id="densityToggle" class="icon-btn" type="button" aria-pressed="false" aria-label="Vista compacta de la lista" title="Vista compacta de la lista">☰</button>
+          </div>
         </div>
         <div id="statusCounts" class="status-counts" role="group" aria-label="Filtrar por estado"></div>
         <div id="conversationList" class="conversation-list"></div>
@@ -57,14 +67,20 @@
           <div class="chat-header">
             <div id="chatAvatar"></div>
             <div>
-              <h2 id="chatTitle"></h2>
+              <div class="chat-title-row">
+                <h2 id="chatTitle"></h2>
+                <button id="chatFlagBtn" class="flag-btn" type="button" aria-pressed="false" aria-label="Marcar para seguimiento" title="Marcar para seguimiento (f)">☆</button>
+                <span id="chatWaitPill" class="wait-pill" hidden></span>
+              </div>
               <p id="chatItem" class="modal-item"></p>
               <p id="chatAnsweredBy" class="answered-by" hidden></p>
               <p id="chatViewingBadge" class="viewing-badge chat-viewing-badge" hidden></p>
             </div>
           </div>
-          <div id="chatThread" class="thread chat-thread"></div>
-          <div id="chatDraftPanel" class="chat-draft-panel" hidden></div>
+          <div class="chat-body">
+            <div id="chatThread" class="thread chat-thread"></div>
+            <div id="chatDraftPanel" class="chat-draft-panel" hidden></div>
+          </div>
         </div>
       </section>
     </div>
@@ -104,6 +120,26 @@
   <div id="lightboxOverlay" class="lightbox-overlay" hidden role="dialog" aria-modal="true" aria-label="Imagen ampliada">
     <button id="lightboxClose" class="lightbox-close" type="button" aria-label="Cerrar imagen">×</button>
     <img id="lightboxImg" class="lightbox-img" alt="" />
+  </div>
+
+  <div id="shortcutsOverlay" class="confirm-overlay" hidden>
+    <div class="confirm-box shortcuts-box" role="dialog" aria-modal="true" aria-labelledby="shortcutsTitle">
+      <div class="shortcuts-head">
+        <h2 id="shortcutsTitle">Atajos de teclado</h2>
+        <button id="shortcutsClose" class="icon-btn" type="button" aria-label="Cerrar">×</button>
+      </div>
+      <dl class="shortcuts-list">
+        <div><dt>/</dt><dd>Buscar</dd></div>
+        <div><dt>j</dt><dd>Conversación siguiente</dd></div>
+        <div><dt>k</dt><dd>Conversación anterior</dd></div>
+        <div><dt>f</dt><dd>Marcar/quitar seguimiento de la conversación abierta</dd></div>
+        <div><dt>e</dt><dd>Editar el borrador de la conversación abierta</dd></div>
+        <div><dt>c</dt><dd>Copiar el borrador de la conversación abierta</dd></div>
+        <div><dt>1 2 3</dt><dd>Ir a Mensajes / Bitácora / Banco</dd></div>
+        <div><dt>Esc</dt><dd>Cancelar edición / limpiar búsqueda / cerrar</dd></div>
+        <div><dt>?</dt><dd>Mostrar esta ayuda</dd></div>
+      </dl>
+    </div>
   </div>
 
   <script src="app.js"></script>
