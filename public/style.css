@@ -1023,7 +1023,12 @@ input[type="search"] {
   padding: 0.5rem 0.65rem;
 }
 .bank-picker-item.matched { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
-.bank-picker-text { font-size: 0.84rem; line-height: 1.4; flex: 1; }
+.bank-picker-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.35rem; }
+.bank-picker-text { font-size: 0.84rem; line-height: 1.4; }
+/* Respuesta que probablemente trae un dato específico del pedido original (número
+   de guía, folio...) — ver looksOrderSpecific() en app.js. Mismo tono que el badge
+   "borrador con error" para que se lea como "cuidado", no como error real. */
+.bank-picker-warning { font-size: 0.78rem; color: var(--pending); line-height: 1.35; }
 .bank-picker-item .btn-secondary { flex-shrink: 0; }
 .bank-picker-empty { color: var(--muted); font-size: 0.85rem; margin: 0; }
 

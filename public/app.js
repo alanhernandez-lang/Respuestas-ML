@@ -249,6 +249,16 @@ function waitingInfo(r) {
   return { shortLabel: timeAgo(dateStr).replace(/^hace /, ''), level };
 }
 
+// Detecta si una respuesta del banco probablemente trae un dato que cambia por
+// pedido (número de guía/rastreo tipo "CMM004975", folio, etc.) — coincide con
+// letras+dígitos pegados o una corrida larga de dígitos sueltos. No es perfecto
+// (puede marcar de más algo como "12 meses de garantía"), pero el costo de un
+// falso positivo es solo un aviso de más, mientras que el de un falso negativo es
+// reenviarle a un cliente el número de guía de otro. Ver renderBank/bankPickerHtml.
+function looksOrderSpecific(text) {
+  return /\b[a-z]{2,6}\d{4,}\b/i.test(text) || /\b\d{6,}\b/.test(text);
+}
+
 // Sugiere del banco de respuestas cuáles se usaron antes para preguntas parecidas a
 // la última del cliente en ESTA conversación — coincidencia simple por palabras (sin
 // backend nuevo: solo compara texto que ya tenemos en memoria). No es IA, es una
@@ -561,12 +571,17 @@ function renderBank() {
     && activeRecord.draftAnswer && !activeRecord.draftAnswer.error);
 
   el.bankEmptyState.hidden = filtered.length > 0;
-  el.bankList.innerHTML = filtered.map((r) => `
+  el.bankList.innerHTML = filtered.map((r) => {
+    const specific = looksOrderSpecific(r.text);
+    const warningHtml = specific
+      ? ' <span class="badge draft-error" title="Parece traer un dato específico de ese pedido (número de guía, folio, etc.) — si lo usas en otro cliente, revisa y actualízalo">⚠ Revisa datos del pedido</span>'
+      : '';
+    return `
     <div class="log-entry bank-entry">
       <div class="log-body">
         <div class="log-line">
           <span class="badge all">Usada ${r.count}×</span>
-          <span class="log-meta">última vez ${timeAgo(r.lastUsed)}</span>
+          <span class="log-meta">última vez ${timeAgo(r.lastUsed)}</span>${warningHtml}
         </div>
         <div class="draft-text">${escapeHtml(r.text)}</div>
         ${(r.questions || []).length ? `<div class="log-meta">Preguntas parecidas: ${r.questions.map((qq) => `"${escapeHtml(qq)}"`).join(' · ')}</div>` : ''}
@@ -576,7 +591,8 @@ function renderBank() {
         ${canInsert ? `<button class="btn-secondary useInChatBtn" data-text="${escapeHtml(r.text)}">Usar en "${escapeHtml(activeRecord.buyerName)}"</button>` : ''}
       </div>
     </div>
-  `).join('');
+  `;
+  }).join('');
 }
 
 el.bankSearch.addEventListener('input', renderBank);
@@ -598,7 +614,12 @@ el.bankList.addEventListener('click', async (e) => {
     renderChatPanel();
     switchView('messages');
     el.chatDraftPanel.querySelector('.draft-edit-textarea')?.focus();
-    showToast('Respuesta insertada en el borrador — revísala antes de publicar.', 'success');
+    showToast(
+      looksOrderSpecific(useInChatBtn.dataset.text)
+        ? 'Respuesta insertada — esta trae un dato específico del pedido original (ej. número de guía): verifica y actualízalo antes de publicar.'
+        : 'Respuesta insertada en el borrador — revísala antes de publicar.',
+      'success',
+    );
   }
 });
 
@@ -964,12 +985,18 @@ function bankPickerHtml(r) {
   return `
     <div class="bank-picker">
       <div class="bank-picker-head">${hasMatches ? 'Respuestas frecuentes relacionadas con esta pregunta' : 'Respuestas más usadas por el equipo'}</div>
-      ${suggestions.map((s) => `
+      ${suggestions.map((s) => {
+        const specific = looksOrderSpecific(s.text);
+        return `
         <div class="bank-picker-item${s.matched ? ' matched' : ''}">
-          <div class="bank-picker-text">${escapeHtml(s.text)}</div>
+          <div class="bank-picker-body">
+            <div class="bank-picker-text">${escapeHtml(s.text)}</div>
+            ${specific ? '<div class="bank-picker-warning">⚠ Parece traer un dato de ese pedido (número de guía, folio...) — revisa y actualízalo antes de publicar.</div>' : ''}
+          </div>
           <button type="button" class="btn-secondary useBankBtn" data-pack="${r.packId}" data-text="${escapeHtml(s.text)}">Usar</button>
         </div>
-      `).join('')}
+      `;
+      }).join('')}
     </div>
   `;
 }
@@ -1017,6 +1044,9 @@ async function handleDraftAction(e) {
     state.editingDraftText = useBankBtn.dataset.text;
     state.bankPickerOpenFor = null;
     renderChatPanel();
+    if (looksOrderSpecific(useBankBtn.dataset.text)) {
+      showToast('Esta respuesta trae un dato específico del pedido original (ej. número de guía): verifica y actualízalo antes de publicar.', 'success');
+    }
     return;
   }
 
