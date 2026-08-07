@@ -34,6 +34,7 @@ const el = {
   confirmMessage: document.getElementById('confirmMessage'),
   confirmCancelBtn: document.getElementById('confirmCancelBtn'),
   confirmOkBtn: document.getElementById('confirmOkBtn'),
+  viewSwitch: document.querySelector('.view-switch'),
   tabMessages: document.getElementById('tabMessages'),
   tabLog: document.getElementById('tabLog'),
   tabBank: document.getElementById('tabBank'),
@@ -47,6 +48,10 @@ const el = {
   bankSearch: document.getElementById('bankSearch'),
   bankList: document.getElementById('bankList'),
   bankEmptyState: document.getElementById('bankEmptyState'),
+  themeToggle: document.getElementById('themeToggle'),
+  lightboxOverlay: document.getElementById('lightboxOverlay'),
+  lightboxImg: document.getElementById('lightboxImg'),
+  lightboxClose: document.getElementById('lightboxClose'),
 };
 
 const STATUS_LABELS = { pendiente: 'Pendiente', respondido: 'Respondido', mediacion: 'Mediación' };
@@ -104,6 +109,82 @@ function showConfirm(message) {
     el.confirmCancelBtn.addEventListener('click', onCancel);
   });
 }
+
+// Tema claro/oscuro: por default sigue al sistema operativo (ver style.css), pero
+// si la persona lo cambia a mano aquí, esa preferencia gana y se recuerda entre
+// sesiones. No hay un tercer botón para "volver a automático" a propósito — para
+// una herramienta de trabajo de uso diario, un toggle de 2 estados es más simple.
+function applyTheme(theme) {
+  if (theme === 'dark' || theme === 'light') {
+    document.documentElement.setAttribute('data-theme', theme);
+  } else {
+    document.documentElement.removeAttribute('data-theme');
+  }
+  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const isDark = theme === 'dark' || (theme !== 'light' && prefersDark);
+  el.themeToggle.textContent = isDark ? '☀️' : '🌙';
+  el.themeToggle.setAttribute('aria-label', isDark ? 'Cambiar a tema claro' : 'Cambiar a tema oscuro');
+}
+
+function initTheme() {
+  applyTheme(localStorage.getItem('theme'));
+  // El CSS ya sigue en vivo los cambios de tema del sistema operativo (la variable
+  // se recalcula sola vía @media), pero el ícono/aria-label del botón no — si nadie
+  // eligió un tema a mano y el sistema cambia de claro a oscuro mientras la pestaña
+  // sigue abierta (p. ej. el cambio automático nocturno del SO), sin esto el botón
+  // se queda mostrando el ícono/aria-label del tema viejo hasta el siguiente clic.
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (!localStorage.getItem('theme')) applyTheme(null);
+  });
+}
+
+function toggleTheme() {
+  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const currentlyDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    || (!document.documentElement.getAttribute('data-theme') && prefersDark);
+  const next = currentlyDark ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  applyTheme(next);
+}
+
+el.themeToggle.addEventListener('click', toggleTheme);
+
+// Visor de imágenes: al hacer clic en una foto del hilo se amplía sobre la app en
+// vez de abrir una pestaña nueva del navegador (el <a href> de respaldo sigue ahí
+// por si el JS falla, o para quien prefiera abrirla aparte con clic-derecho/ctrl-clic).
+function openLightbox(src, alt, trigger) {
+  el.lightboxImg.src = src;
+  el.lightboxImg.alt = alt || 'Imagen adjunta';
+  el.lightboxOverlay.hidden = false;
+  el._lightboxTrigger = trigger || document.activeElement;
+  el._lightboxSrc = src;
+  el.lightboxClose.focus();
+  document.addEventListener('keydown', onLightboxKeydown);
+}
+
+function closeLightbox() {
+  el.lightboxOverlay.hidden = true;
+  el.lightboxImg.removeAttribute('src');
+  document.removeEventListener('keydown', onLightboxKeydown);
+  // El hilo se puede haber vuelto a pintar entero mientras el visor estaba abierto
+  // (loadMessages sondea cada 20s y reconstruye el <img> que abrió el visor), en cuyo
+  // caso el elemento guardado como "trigger" quedó desconectado del documento y
+  // .focus() no haría nada. Si pasó eso, se busca la imagen equivalente por su src en
+  // el hilo actual en vez de dejar que el foco caiga a <body> sin avisar.
+  const trigger = document.contains(el._lightboxTrigger)
+    ? el._lightboxTrigger
+    : el.chatThread.querySelector(`img.msg-image[src="${CSS.escape(el._lightboxSrc || '')}"]`);
+  trigger?.focus();
+}
+
+function onLightboxKeydown(e) {
+  if (e.key === 'Escape') closeLightbox();
+}
+
+el.lightboxClose.addEventListener('click', closeLightbox);
+el.lightboxOverlay.addEventListener('click', (e) => {
+  if (e.target === el.lightboxOverlay) closeLightbox();
+});
 
 async function loadUserEmail() {
   try {
@@ -182,21 +263,23 @@ async function refreshPresence() {
 // que ya se sondea cada 8s para las insignias inline) — no necesita su propio fetch.
 function renderLiveNow() {
   const packIds = Object.keys(state.viewers);
-  if (!packIds.length) {
-    el.liveNowList.innerHTML = '<p class="live-now-empty">Nadie más está conectado en este momento.</p>';
-    return;
-  }
-  el.liveNowList.innerHTML = packIds.map((packId) => {
-    const email = state.viewers[packId];
-    const r = state.records.find((x) => x.packId === packId);
-    const buyer = r ? r.buyerName : 'una conversación';
-    return `
-      <div class="live-now-row" data-pack="${packId}">
-        ${avatarHtml(shortName(email))}
-        <span>${escapeHtml(shortName(email))} está viendo a <strong>${escapeHtml(buyer)}</strong></span>
-      </div>
-    `;
-  }).join('');
+  withFocusPreserved(el.liveNowList, () => {
+    if (!packIds.length) {
+      el.liveNowList.innerHTML = '<p class="live-now-empty">Nadie más está conectado en este momento.</p>';
+      return;
+    }
+    el.liveNowList.innerHTML = packIds.map((packId) => {
+      const email = state.viewers[packId];
+      const r = state.records.find((x) => x.packId === packId);
+      const buyer = r ? r.buyerName : 'una conversación';
+      return `
+        <div class="live-now-row" data-pack="${escapeHtml(packId)}" role="button" tabindex="0" aria-label="Ir a la conversación con ${escapeHtml(buyer)}">
+          ${avatarHtml(shortName(email))}
+          <span>${escapeHtml(shortName(email))} está viendo a <strong>${escapeHtml(buyer)}</strong></span>
+        </div>
+      `;
+    }).join('');
+  });
 }
 
 function switchView(view) {
@@ -209,6 +292,13 @@ function switchView(view) {
   el.tabMessages.setAttribute('aria-selected', String(isMessages));
   el.tabLog.setAttribute('aria-selected', String(isLog));
   el.tabBank.setAttribute('aria-selected', String(isBank));
+  // Patrón ARIA de tabs (WAI-ARIA APG): solo la pestaña seleccionada queda en el
+  // orden de tabulación (tabindex 0); las demás se navegan con las flechas ←/→,
+  // no con Tab. Sin esto, role="tab" anuncia a lectores de pantalla un widget que
+  // no se comporta como tal.
+  el.tabMessages.setAttribute('tabindex', isMessages ? '0' : '-1');
+  el.tabLog.setAttribute('tabindex', isLog ? '0' : '-1');
+  el.tabBank.setAttribute('tabindex', isBank ? '0' : '-1');
   if (isLog) {
     stopPresenceHeartbeat();
     refreshLog();
@@ -297,30 +387,33 @@ function renderLog() {
 
   const entries = state.logEntries.filter((e) => !state.logFilterEmail || e.answeredBy === state.logFilterEmail);
   el.logEmptyState.hidden = entries.length > 0;
-  if (!entries.length) {
-    el.logList.innerHTML = '';
-    return;
-  }
 
-  let lastDay = null;
-  el.logList.innerHTML = entries.map((e) => {
-    const day = dayLabel(e.date);
-    const heading = day !== lastDay ? `<div class="log-day-heading">${escapeHtml(day)}</div>` : '';
-    lastDay = day;
-    const itemLine = (e.itemTitles || []).join(', ') || 'Producto no identificado';
-    const who = shortName(e.answeredBy) || 'Alguien';
-    return `
-      ${heading}
-      <div class="log-entry" data-pack="${e.packId}">
-        ${avatarHtml(who)}
-        <div class="log-body">
-          <div class="log-line"><strong>${escapeHtml(who)}</strong> respondió a <strong>${escapeHtml(e.buyerName)}</strong></div>
-          <div class="log-meta">${escapeHtml(itemLine)} · ${timeAgo(e.date)}${e.wasEdited ? ' · editado a mano' : ''}</div>
-          <div class="log-snippet">${escapeHtml(e.text)}</div>
+  withFocusPreserved(el.logList, () => {
+    if (!entries.length) {
+      el.logList.innerHTML = '';
+      return;
+    }
+
+    let lastDay = null;
+    el.logList.innerHTML = entries.map((e) => {
+      const day = dayLabel(e.date);
+      const heading = day !== lastDay ? `<div class="log-day-heading">${escapeHtml(day)}</div>` : '';
+      lastDay = day;
+      const itemLine = (e.itemTitles || []).join(', ') || 'Producto no identificado';
+      const who = shortName(e.answeredBy) || 'Alguien';
+      return `
+        ${heading}
+        <div class="log-entry" data-pack="${escapeHtml(e.packId)}" role="button" tabindex="0" aria-label="Ir a la conversación con ${escapeHtml(e.buyerName)}">
+          ${avatarHtml(who)}
+          <div class="log-body">
+            <div class="log-line"><strong>${escapeHtml(who)}</strong> respondió a <strong>${escapeHtml(e.buyerName)}</strong></div>
+            <div class="log-meta">${escapeHtml(itemLine)} · ${timeAgo(e.date)}${e.wasEdited ? ' · editado a mano' : ''}</div>
+            <div class="log-snippet">${escapeHtml(e.text)}</div>
+          </div>
         </div>
-      </div>
-    `;
-  }).join('');
+      `;
+    }).join('');
+  });
 }
 
 function statusCountsHtml(records) {
@@ -393,6 +486,22 @@ function lastMessagePreview(r) {
   return prefix + (last.text || (last.hasAttachment ? '[imagen adjunta]' : ''));
 }
 
+// Las filas de conversationList/liveNowList/logList ahora son role="button" con
+// tabindex y se pueden enfocar con teclado — pero se reconstruyen enteras (innerHTML
+// o remove+append) cada vez que llega un refresco de fondo (polling de mensajes o de
+// presencia, cada 8-20s), no solo cuando la persona interactúa. Sin esto, una fila
+// enfocada con teclado pierde el foco (cae a <body>) en cuanto pasa el siguiente tick,
+// aunque nadie haya tocado nada. Esto reubica el foco en la fila equivalente (mismo
+// data-pack) después de reconstruir el contenedor.
+function withFocusPreserved(container, rebuild) {
+  const active = document.activeElement;
+  const focusedPack = active && container.contains(active) ? active.dataset.pack : null;
+  rebuild();
+  if (focusedPack) {
+    container.querySelector(`[data-pack="${CSS.escape(focusedPack)}"]`)?.focus();
+  }
+}
+
 function render() {
   const q = el.search.value.trim().toLowerCase();
 
@@ -409,39 +518,45 @@ function render() {
   filtered.sort((a, b) => (STATUS_PRIORITY[a.status] ?? 0) - (STATUS_PRIORITY[b.status] ?? 0));
 
   el.statusCounts.innerHTML = statusCountsHtml(state.records);
-  el.conversationList.innerHTML = '';
   el.empty.hidden = filtered.length > 0;
 
-  for (const r of filtered) {
-    const item = document.createElement('div');
-    item.className = 'conversation-item' + (r.packId === state.selectedPackId ? ' active' : '');
-    item.dataset.pack = r.packId;
-    const answeredLine = r.status === 'respondido' && r.answeredBy
-      ? ` · Respondido por ${escapeHtml(shortName(r.answeredBy))}`
-      : '';
-    // La mediación se puede haber cerrado y ya no bloquear el chat (status volvió a
-    // "respondido"/"pendiente"), pero sigue siendo importante saber que esta venta
-    // pasó por un reclamo — así que se marca aparte del badge de estado normal.
-    const pastMediationBadge = r.status !== 'mediacion' && r.pastMediation
-      ? ' <span class="badge mediacion-past" title="Esta venta tuvo un reclamo/mediación con Mercado Libre">⚖ Tuvo mediación</span>'
-      : '';
-    item.innerHTML = `
-      ${avatarHtml(r.buyerName)}
-      <div class="item-body">
-        <div class="row-top">
-          <span class="buyer-name">${escapeHtml(r.buyerName)}</span>
-          <span class="item-time">${fmtTime(r.lastQuestion?.date)}</span>
+  withFocusPreserved(el.conversationList, () => {
+    el.conversationList.innerHTML = '';
+    for (const r of filtered) {
+      const item = document.createElement('div');
+      item.className = 'conversation-item' + (r.packId === state.selectedPackId ? ' active' : '');
+      item.dataset.pack = r.packId;
+      item.setAttribute('role', 'button');
+      item.setAttribute('tabindex', '0');
+      item.setAttribute('aria-current', String(r.packId === state.selectedPackId));
+      item.setAttribute('aria-label', `Conversación con ${r.buyerName}, ${STATUS_LABELS[r.status] || r.status}`);
+      const answeredLine = r.status === 'respondido' && r.answeredBy
+        ? ` · Respondido por ${escapeHtml(shortName(r.answeredBy))}`
+        : '';
+      // La mediación se puede haber cerrado y ya no bloquear el chat (status volvió a
+      // "respondido"/"pendiente"), pero sigue siendo importante saber que esta venta
+      // pasó por un reclamo — así que se marca aparte del badge de estado normal.
+      const pastMediationBadge = r.status !== 'mediacion' && r.pastMediation
+        ? ' <span class="badge mediacion-past" title="Esta venta tuvo un reclamo/mediación con Mercado Libre">⚖ Tuvo mediación</span>'
+        : '';
+      item.innerHTML = `
+        ${avatarHtml(r.buyerName)}
+        <div class="item-body">
+          <div class="row-top">
+            <span class="buyer-name">${escapeHtml(r.buyerName)}</span>
+            <span class="item-time">${fmtTime(r.lastQuestion?.date)}</span>
+          </div>
+          <div class="row-mid">
+            <span class="badge ${r.status}">${STATUS_LABELS[r.status] || r.status}</span>${pastMediationBadge}
+            <span class="preview">${escapeHtml(lastMessagePreview(r))}</span>
+          </div>
+          <div class="item-order">Pedido ${escapeHtml(r.orderId || '—')} · ${escapeHtml(r.itemTitles.join(', ') || '—')}${answeredLine}</div>
         </div>
-        <div class="row-mid">
-          <span class="badge ${r.status}">${STATUS_LABELS[r.status] || r.status}</span>${pastMediationBadge}
-          <span class="preview">${escapeHtml(lastMessagePreview(r))}</span>
-        </div>
-        <div class="item-order">Pedido ${escapeHtml(r.orderId || '—')} · ${escapeHtml(r.itemTitles.join(', ') || '—')}${answeredLine}</div>
-      </div>
-    `;
-    item.addEventListener('click', () => selectConversation(r.packId));
-    el.conversationList.appendChild(item);
-  }
+      `;
+      item.addEventListener('click', () => selectConversation(r.packId));
+      el.conversationList.appendChild(item);
+    }
+  });
 
   applyPresence();
 
@@ -639,6 +754,32 @@ function handleDraftInput(e) {
 el.chatDraftPanel.addEventListener('click', handleDraftAction);
 el.chatDraftPanel.addEventListener('input', handleDraftInput);
 
+el.chatThread.addEventListener('click', (e) => {
+  const img = e.target.closest('.msg-image');
+  if (!img) return;
+  // Ctrl/Cmd/Shift+clic o clic con el botón central se dejan pasar tal cual, para
+  // quien prefiera el comportamiento nativo de abrir la imagen en una pestaña nueva.
+  if (e.ctrlKey || e.metaKey || e.shiftKey || e.button !== 0) return;
+  e.preventDefault();
+  openLightbox(img.src, img.alt, img);
+});
+
+// Activar el visor con el teclado (Enter sobre el <a> enfocado) es un caso distinto
+// al del click de arriba: al activar un <a> por teclado, el navegador dispara el
+// click con e.target = el propio <a>, no el <img> que envuelve — así que ".closest
+// ('.msg-image')" ahí nunca encuentra nada y quien usa teclado siempre terminaba en
+// el comportamiento nativo (pestaña nueva) sin el visor, aunque con el mouse sí lo
+// tenga. Este listener aparte cubre ese caso para que el teclado tenga la misma
+// experiencia que el mouse.
+el.chatThread.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  const link = e.target.closest('.msg-image-link');
+  const img = link?.querySelector('.msg-image');
+  if (!img) return;
+  e.preventDefault();
+  openLightbox(img.src, img.alt, img);
+});
+
 function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -726,7 +867,7 @@ function renderChatPanel() {
     const hasRealText = m.text && m.text !== '[imagen adjunta]';
     const imagesHtml = (m.attachments || []).map((a) => {
       const src = `/api/attachments/${encodeURIComponent(a.filename)}?siteId=${encodeURIComponent(a.siteId || '')}`;
-      return `<a href="${src}" target="_blank" rel="noopener"><img class="msg-image" src="${src}" alt="Imagen adjunta del cliente" loading="lazy" /></a>`;
+      return `<a class="msg-image-link" href="${src}" target="_blank" rel="noopener"><img class="msg-image" src="${src}" alt="Imagen adjunta del cliente" loading="lazy" /></a>`;
     }).join('');
     return `
       <div class="msg ${m.sender}">
@@ -808,6 +949,20 @@ async function autoSync() {
 el.search.addEventListener('input', render);
 el.syncBtn.addEventListener('click', sync);
 
+// Filas clicables que son <div role="button"> (no <button>/<a> nativos): el navegador
+// no les da activación por teclado gratis, así que Enter/Espacio se manejan a mano
+// aquí y se delegan al mismo listener de click ya puesto en cada fila.
+function activateRowOnEnterOrSpace(rowSelector) {
+  return (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const row = e.target.closest(rowSelector);
+    if (!row) return;
+    e.preventDefault();
+    row.click();
+  };
+}
+el.conversationList.addEventListener('keydown', activateRowOnEnterOrSpace('.conversation-item'));
+
 el.statusCounts.addEventListener('click', (e) => {
   const btn = e.target.closest('.badge');
   if (!btn) return;
@@ -818,6 +973,25 @@ el.statusCounts.addEventListener('click', (e) => {
 el.tabMessages.addEventListener('click', () => switchView('messages'));
 el.tabLog.addEventListener('click', () => switchView('log'));
 el.tabBank.addEventListener('click', () => switchView('bank'));
+
+// Navegación con flechas del role="tablist" de arriba, siguiendo el patrón ARIA de
+// tabs: ←/→ (y Home/End) mueven el foco Y activan la pestaña; Tab ya no entra a cada
+// una por separado porque switchView() deja tabindex=-1 en las no seleccionadas.
+el.viewSwitch?.addEventListener('keydown', (e) => {
+  const tabs = [el.tabMessages, el.tabLog, el.tabBank];
+  const views = ['messages', 'log', 'bank'];
+  const currentIndex = tabs.indexOf(document.activeElement);
+  if (currentIndex === -1) return;
+  let nextIndex = null;
+  if (e.key === 'ArrowRight') nextIndex = (currentIndex + 1) % tabs.length;
+  else if (e.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+  else if (e.key === 'Home') nextIndex = 0;
+  else if (e.key === 'End') nextIndex = tabs.length - 1;
+  if (nextIndex === null) return;
+  e.preventDefault();
+  switchView(views[nextIndex]);
+  tabs[nextIndex].focus();
+});
 
 el.logFilters.addEventListener('click', (e) => {
   const btn = e.target.closest('.badge');
@@ -835,11 +1009,13 @@ el.logList.addEventListener('click', (e) => {
   const row = e.target.closest('.log-entry');
   if (row) jumpToConversation(row.dataset.pack);
 });
+el.logList.addEventListener('keydown', activateRowOnEnterOrSpace('.log-entry'));
 
 el.liveNowList.addEventListener('click', (e) => {
   const row = e.target.closest('.live-now-row');
   if (row) jumpToConversation(row.dataset.pack);
 });
+el.liveNowList.addEventListener('keydown', activateRowOnEnterOrSpace('.live-now-row'));
 
 window.addEventListener('beforeunload', stopPresenceHeartbeat);
 
@@ -850,6 +1026,7 @@ setInterval(loadMessages, AUTO_REFRESH_MS);
 setInterval(refreshPresence, PRESENCE_POLL_MS);
 setInterval(autoSync, AUTO_SYNC_MS);
 
+initTheme();
 loadMessages();
 loadUserEmail();
 refreshPresence();

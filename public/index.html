@@ -5,36 +5,47 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Mensajes Mercado Libre - Agrobolder</title>
   <link rel="stylesheet" href="style.css" />
+  <script>
+    // Aplica el tema guardado ANTES de pintar, para no dar el "flash" del tema
+    // equivocado (el resto de la lógica del toggle vive en app.js).
+    (function () {
+      var saved = localStorage.getItem('theme');
+      if (saved === 'dark' || saved === 'light') document.documentElement.setAttribute('data-theme', saved);
+    })();
+  </script>
 </head>
 <body>
+  <a href="#mainContent" class="skip-link">Saltar al contenido</a>
+
   <header>
     <div class="brand">
       <span class="brand-mark">AB</span>
       <h1>Mensajes post-venta <span class="brand-sep">·</span> Agrobolder</h1>
     </div>
-    <nav class="view-switch" aria-label="Vista">
-      <button class="view-tab" id="tabMessages" aria-selected="true">💬 Mensajes</button>
-      <button class="view-tab" id="tabLog" aria-selected="false">📋 Bitácora</button>
-      <button class="view-tab" id="tabBank" aria-selected="false">📚 Banco de respuestas</button>
+    <nav class="view-switch" aria-label="Vista" role="tablist">
+      <button class="view-tab" id="tabMessages" type="button" role="tab" aria-selected="true" tabindex="0" aria-controls="viewMessages">💬 Mensajes</button>
+      <button class="view-tab" id="tabLog" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="viewLog">📋 Bitácora</button>
+      <button class="view-tab" id="tabBank" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="viewBank">📚 Banco de respuestas</button>
     </nav>
     <div class="toolbar">
-      <button id="syncBtn">Sincronizar</button>
-      <span id="syncInfo" class="sync-info"></span>
+      <button id="syncBtn" type="button">Sincronizar</button>
+      <span id="syncInfo" class="sync-info" role="status" aria-live="polite"></span>
+      <button id="themeToggle" class="icon-btn" type="button" aria-label="Cambiar a tema oscuro" title="Cambiar tema claro/oscuro">🌙</button>
       <span id="userEmail" class="user-email"></span>
       <a href="/api/auth/logout" class="logout-link">Cerrar sesión</a>
     </div>
   </header>
 
-  <main>
-    <div id="viewMessages" class="chat-layout">
+  <main id="mainContent" tabindex="-1">
+    <div id="viewMessages" class="chat-layout" role="tabpanel" aria-labelledby="tabMessages">
       <aside class="chat-sidebar">
         <div class="sidebar-toolbar">
           <label for="search" class="visually-hidden">Buscar cliente o producto</label>
           <input id="search" type="search" placeholder="Buscar cliente o producto..." />
         </div>
-        <div id="statusCounts" class="status-counts" aria-label="Filtrar por estado"></div>
+        <div id="statusCounts" class="status-counts" role="group" aria-label="Filtrar por estado"></div>
         <div id="conversationList" class="conversation-list"></div>
-        <p id="emptyState" class="empty-state" hidden>No hay conversaciones. Presiona "Sincronizar" para traerlas de Mercado Libre.</p>
+        <p id="emptyState" class="empty-state" hidden><span class="empty-state-icon" aria-hidden="true">📭</span>No hay conversaciones. Presiona "Sincronizar" para traerlas de Mercado Libre.</p>
       </aside>
 
       <section class="chat-panel">
@@ -58,23 +69,23 @@
       </section>
     </div>
 
-    <section id="viewLog" class="log-view" hidden>
+    <section id="viewLog" class="log-view" hidden role="tabpanel" aria-labelledby="tabLog">
       <div class="live-now">
         <h3>Activos ahora</h3>
         <div id="liveNowList"></div>
       </div>
       <div id="logFilters" class="log-filters"></div>
       <div id="logList" class="log-list"></div>
-      <p id="logEmptyState" class="empty-state" hidden>Todavía no hay respuestas publicadas en la bitácora.</p>
+      <p id="logEmptyState" class="empty-state" hidden><span class="empty-state-icon" aria-hidden="true">🗒</span>Todavía no hay respuestas publicadas en la bitácora.</p>
     </section>
 
-    <section id="viewBank" class="log-view" hidden>
+    <section id="viewBank" class="log-view" hidden role="tabpanel" aria-labelledby="tabBank">
       <div class="sidebar-toolbar bank-toolbar">
         <label for="bankSearch" class="visually-hidden">Buscar respuesta o pregunta</label>
         <input id="bankSearch" type="search" placeholder="Buscar respuesta o pregunta..." />
       </div>
       <div id="bankList" class="log-list"></div>
-      <p id="bankEmptyState" class="empty-state" hidden>Todavía no hay suficientes respuestas publicadas para armar el banco. Va a ir llenándose conforme el equipo conteste.</p>
+      <p id="bankEmptyState" class="empty-state" hidden><span class="empty-state-icon" aria-hidden="true">📚</span>Todavía no hay suficientes respuestas publicadas para armar el banco. Va a ir llenándose conforme el equipo conteste.</p>
     </section>
   </main>
 
@@ -84,10 +95,15 @@
     <div class="confirm-box" role="alertdialog" aria-modal="true" aria-labelledby="confirmMessage">
       <p id="confirmMessage"></p>
       <div class="confirm-actions">
-        <button id="confirmCancelBtn" class="btn-secondary">Cancelar</button>
-        <button id="confirmOkBtn" class="btn-primary">Confirmar</button>
+        <button id="confirmCancelBtn" class="btn-secondary" type="button">Cancelar</button>
+        <button id="confirmOkBtn" class="btn-primary" type="button">Confirmar</button>
       </div>
     </div>
+  </div>
+
+  <div id="lightboxOverlay" class="lightbox-overlay" hidden role="dialog" aria-modal="true" aria-label="Imagen ampliada">
+    <button id="lightboxClose" class="lightbox-close" type="button" aria-label="Cerrar imagen">×</button>
+    <img id="lightboxImg" class="lightbox-img" alt="" />
   </div>
 
   <script src="app.js"></script>
