@@ -367,6 +367,11 @@ const STALE_REFRESH_BATCH = 80;
 // arriba: es un backlog que se agota, no algo que se repita para siempre.
 const PAST_MEDIATION_CHECK_BATCH = 30;
 
+// Igual de acotado y por el mismo motivo (backlog que se agota una sola vez, no
+// algo que se repita) — ver comentario junto a messagesBackfillCandidates en
+// runSyncInner().
+const MESSAGES_BACKFILL_BATCH = 40;
+
 // El borrador de IA sigue siendo válido mientras nadie haya hecho una pregunta
 // nueva desde que se generó, así que solo se regenera cuando cambia lastQuestion.
 // `touched` acumula los packIds que de verdad cambiaron este ciclo, para que
@@ -500,6 +505,37 @@ async function runSyncInner() {
       pastMediationCheckAttempts: entry.record.pastMediationCheckAttempts,
     });
     await savePackEntry(packId, fresh);
+  });
+
+  // Antes, fetchPackMessages no pedía paginación y Mercado Libre solo mandaba la
+  // primera página (10 mensajes por default) — en conversaciones largas el resto
+  // del historial se perdía en silencio (ver fetchPackMessages en lib/ml.js, ya
+  // corregido para pedir todas las páginas). Pero eso solo arregla las conversaciones
+  // que se vuelvan a sincronizar; las que ya están "respondido" en caché con el
+  // historial viejo (recortado) nunca se tocan de nuevo. Este lote las rellena UNA
+  // sola vez (marcando `messagesBackfilled`) para no volver a re-sincronizar algo
+  // ya resuelto en cada ciclo para siempre.
+  const messagesBackfillCandidates = Object.values(packs)
+    .filter((p) => p.record.status === 'respondido' && !p.record.messagesBackfilled)
+    .slice(0, MESSAGES_BACKFILL_BATCH);
+  await mapWithConcurrency(messagesBackfillCandidates, 3, async (entry) => {
+    const packId = entry.record.packId;
+    try {
+      const refreshed = await syncPackById(token, packId, cache, entry.record.unreadCount || 0);
+      refreshed.messagesBackfilled = true;
+      const fresh = await loadPackEntry(packId);
+      if (!fresh) return;
+      // Solo pisamos si sigue "respondido": si en el rato que tomó esta llamada
+      // alguien contestó de nuevo (nueva pregunta del cliente, otra mediación...),
+      // preferimos dejar que el flujo normal de arriba lo resuelva en el próximo
+      // ciclo en vez de arriesgarnos a pisar ese cambio con datos ya obsoletos.
+      if (fresh.record.status === 'respondido') {
+        fresh.record = refreshed;
+        await savePackEntry(packId, fresh);
+      }
+    } catch (err) {
+      console.warn('No se pudo rellenar el historial completo del pack', packId, err.message);
+    }
   });
 
   await attachDrafts(packs, cache, token, touched);
