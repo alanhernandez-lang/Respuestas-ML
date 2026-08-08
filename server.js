@@ -27,6 +27,15 @@ function stripHtml(str) {
   return (str || '').replace(/<[^>]+>/g, '');
 }
 
+// Ver el comentario junto a su uso en syncPackById: un reclamo/mediación/devolución
+// ya CERRADO significa que no hay nada que contestar en el chat normal, aunque el
+// hilo se haya quedado con el último mensaje del cliente sin responder. Se reutiliza
+// tanto ahí (recién sincronizado) como en checkPastMediation (cuando el cierre se
+// descubre después, para un pack que ya estaba en caché como "pendiente").
+function applyClosedClaimOverride(status, pastMediation) {
+  return (status === 'pendiente' && pastMediation?.status === 'closed') ? 'respondido' : status;
+}
+
 async function resolveMediation(token, claimIds) {
   // Mercado Libre puede reportar la conversación como "blocked" por mediación sin
   // mandar todavía el claim_id asociado (lo vimos documentado y en casos reales).
@@ -275,6 +284,15 @@ async function syncPackById(token, packId, cache, unreadCount) {
     pastMediationChecked = true;
   }
 
+  // Si el reclamo/mediación de esta venta ya está CERRADO, el hilo normal de
+  // mensajes puede quedarse "pendiente" para siempre aunque no haya nada que
+  // contestar aquí — la resolución llegó por el reclamo (Mercado Libre aplicó un
+  // reembolso, venció el plazo, etc.), no por una respuesta en este chat. Mostrarlo
+  // como "pendiente" solo confundiría al equipo con un caso donde ya no se puede
+  // hacer nada por esta vía (ver applyClosedClaimOverride, se reutiliza también en
+  // checkPastMediation para cuando el reclamo cerrado se descubre después).
+  const finalStatus = applyClosedClaimOverride(status, pastMediation);
+
   return {
     packId,
     orderId: info.orderId,
@@ -284,7 +302,7 @@ async function syncPackById(token, packId, cache, unreadCount) {
     itemTitles: info.itemTitles,
     itemLinks: info.itemLinks || [],
     unreadCount,
-    status,
+    status: finalStatus,
     lastQuestion,
     lastAnswer,
     messages,
@@ -349,6 +367,10 @@ async function checkPastMediation(token, record) {
         };
       }
     }
+    // Igual que en syncPackById: si esto descubre que el reclamo ya está cerrado y
+    // el pack seguía "pendiente" en caché, ya no hay nada que contestar por el chat
+    // normal — se reclasifica para no dejarlo inflando la cola de pendientes.
+    record.status = applyClosedClaimOverride(record.status, record.pastMediation);
     record.pastMediationChecked = true;
     record.pastMediationCheckAttempts = 0;
   } catch (err) {

@@ -16,6 +16,12 @@ const state = {
   flags: new Set(),
   sortMode: 'reciente',
   showFlaggedOnly: false,
+  // '' (todos) / 'unread' / 'read' — filtro de leído/no leído EN MERCADO LIBRE (no
+  // es el estado pendiente/mediación/respondido de esta app). Se combina con
+  // cualquier filtro de estado ya activo: ver matchesRead en render(). No se
+  // recuerda entre sesiones a propósito, igual que statusFilter — es de "qué estoy
+  // viendo ahora", no una preferencia fija.
+  readFilter: '',
   // Se recalcula en cada render() a partir de `filtered`, para que los atajos j/k
   // (ver moveSelection()) naveguen exactamente la lista que la persona está viendo
   // ahora (con su búsqueda/filtro/orden aplicados), no el arreglo completo sin filtrar.
@@ -67,6 +73,7 @@ const el = {
   lightboxClose: document.getElementById('lightboxClose'),
   sortMode: document.getElementById('sortMode'),
   flagFilterBtn: document.getElementById('flagFilterBtn'),
+  readFilterBtn: document.getElementById('readFilterBtn'),
   densityToggle: document.getElementById('densityToggle'),
   shortcutsBtn: document.getElementById('shortcutsBtn'),
   shortcutsOverlay: document.getElementById('shortcutsOverlay'),
@@ -204,6 +211,14 @@ el.chatFlagBtn.addEventListener('click', () => toggleFlag(state.selectedPackId))
 
 el.flagFilterBtn.addEventListener('click', () => {
   state.showFlaggedOnly = !state.showFlaggedOnly;
+  render();
+});
+
+const READ_FILTER_CYCLE = { '': 'unread', unread: 'read', read: '' };
+const READ_FILTER_LABELS = { '': '👁 Todos', unread: '👁 No leídos', read: '✓ Leídos' };
+
+el.readFilterBtn.addEventListener('click', () => {
+  state.readFilter = READ_FILTER_CYCLE[state.readFilter];
   render();
 });
 
@@ -781,7 +796,12 @@ function render() {
       || (r.lastQuestion?.text || '').toLowerCase().includes(q);
     const matchesStatus = !state.statusFilter || r.status === state.statusFilter;
     const matchesFlag = !state.showFlaggedOnly || state.flags.has(r.packId);
-    return matchesQ && matchesStatus && matchesFlag;
+    // "No leídos"/"Leídos" es el concepto de Mercado Libre (¿hay mensajes sin abrir
+    // en ML?), no el estado pendiente/mediación/respondido de esta app — por eso se
+    // combina con el filtro de estado en vez de reemplazarlo (ver READ_FILTER_CYCLE).
+    const matchesRead = !state.readFilter
+      || (state.readFilter === 'unread' ? r.unreadCount > 0 : !(r.unreadCount > 0));
+    return matchesQ && matchesStatus && matchesFlag && matchesRead;
   });
   // sort() es estable: dentro de cada grupo de prioridad se conserva el orden por
   // fecha que ya trae el arreglo (el servidor lo entrega del más reciente al más viejo)
@@ -803,6 +823,8 @@ function render() {
   const flaggedTotal = state.records.filter((r) => state.flags.has(r.packId)).length;
   el.flagFilterBtn.textContent = `⭐ Marcados (${flaggedTotal})`;
   el.flagFilterBtn.setAttribute('aria-pressed', String(state.showFlaggedOnly));
+  el.readFilterBtn.textContent = READ_FILTER_LABELS[state.readFilter];
+  el.readFilterBtn.setAttribute('aria-pressed', String(Boolean(state.readFilter)));
   el.empty.hidden = filtered.length > 0;
 
   withFocusPreserved(el.conversationList, () => {
