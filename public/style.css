@@ -1136,6 +1136,26 @@ input[type="search"] {
    anillo de foco va ahí — un .msg-image:focus-visible aquí quedaría muerto. */
 .msg-image-link:focus-visible { outline: none; border-radius: var(--radius-sm); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent); }
 
+/* Un PDF no se amplía como una foto (no hay lightbox para esto) — se ve como un
+   botón que abre/descarga el archivo tal cual en una pestaña nueva. */
+.msg-pdf-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.35rem;
+  padding: 0.45rem 0.75rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-decoration: none;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.msg-pdf-link:hover { border-color: var(--muted); background: var(--surface); }
+.msg-pdf-link:focus-visible { outline: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent); }
+
 .mediation-box {
   margin-top: 1rem;
   padding-top: 1rem;

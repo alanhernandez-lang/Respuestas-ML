@@ -1339,17 +1339,22 @@ function renderChatPanel() {
     el.chatAnsweredBy.hidden = true;
   }
 
+  const ATTACHMENT_PLACEHOLDER_TEXTS = ['[imagen adjunta]', '[PDF adjunto]', '[imagen y PDF adjuntos]'];
   const messagesHtml = r.messages.map((m) => {
-    const hasRealText = m.text && m.text !== '[imagen adjunta]';
-    const imagesHtml = (m.attachments || []).map((a) => {
+    const hasRealText = m.text && !ATTACHMENT_PLACEHOLDER_TEXTS.includes(m.text);
+    const attachmentsHtml = (m.attachments || []).map((a) => {
       const src = `/api/attachments/${encodeURIComponent(a.filename)}?siteId=${encodeURIComponent(a.siteId || '')}`;
+      if (a.kind === 'pdf') {
+        // Sin lightbox ni <img> — un PDF se abre/descarga tal cual, no se amplía.
+        return `<a class="msg-pdf-link" href="${src}" target="_blank" rel="noopener">📄 Ver PDF adjunto</a>`;
+      }
       return `<a class="msg-image-link" href="${src}" target="_blank" rel="noopener"><img class="msg-image" src="${src}" alt="Imagen adjunta del cliente" loading="lazy" /></a>`;
     }).join('');
     return `
       <div class="msg ${m.sender}">
         <div class="meta">${m.sender === 'cliente' ? 'Cliente' : 'Vendedor'} · ${fmtDate(m.date)}</div>
         ${hasRealText ? `<div>${escapeHtml(m.text)}</div>` : ''}
-        ${imagesHtml}
+        ${attachmentsHtml}
       </div>
     `;
   }).join('');

@@ -229,15 +229,30 @@ async function syncPackById(token, packId, cache, unreadCount) {
   const messages = (messagesResp.messages || [])
     .slice()
     .sort((a, b) => new Date(a.message_date.created) - new Date(b.message_date.created))
-    .map((m) => ({
-      sender: String(m.from.user_id) === String(SELLER_ID) ? 'vendedor' : 'cliente',
-      text: m.text || (m.message_attachments ? '[imagen adjunta]' : ''),
-      date: m.message_date.created,
-      hasAttachment: Boolean(m.message_attachments),
-      attachments: (m.message_attachments || [])
-        .filter((a) => a.type?.startsWith('image/'))
-        .map((a) => ({ filename: a.filename, mimeType: a.type, siteId: m.site_id })),
-    }));
+    .map((m) => {
+      // Antes solo se guardaban las fotos — un PDF adjunto (factura, constancia
+      // fiscal, comprobante...) se descartaba por completo aquí y ni siquiera
+      // quedaba guardado, así que no había manera de verlo ni de que el agente de
+      // IA se enterara de que existía.
+      const attachments = (m.message_attachments || [])
+        .filter((a) => a.type?.startsWith('image/') || a.type === 'application/pdf')
+        .map((a) => ({
+          filename: a.filename,
+          mimeType: a.type,
+          siteId: m.site_id,
+          kind: a.type === 'application/pdf' ? 'pdf' : 'image',
+        }));
+      const attachmentLabel = attachments.some((a) => a.kind === 'pdf')
+        ? (attachments.some((a) => a.kind === 'image') ? '[imagen y PDF adjuntos]' : '[PDF adjunto]')
+        : '[imagen adjunta]';
+      return {
+        sender: String(m.from.user_id) === String(SELLER_ID) ? 'vendedor' : 'cliente',
+        text: m.text || (m.message_attachments ? attachmentLabel : ''),
+        date: m.message_date.created,
+        hasAttachment: Boolean(m.message_attachments),
+        attachments,
+      };
+    });
 
   // Se usa para que el agente de IA sepa si una garantía (30 días) sigue vigente,
   // sin tener que adivinarlo a partir del tono del cliente.
