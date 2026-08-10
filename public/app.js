@@ -942,6 +942,12 @@ function draftCardHtml(r) {
   const collabAlertHtml = viewerEmail
     ? `<div class="collab-alert">⚠ ${escapeHtml(shortName(viewerEmail))} también está viendo esta conversación ahora mismo. Coordinen para no responder dos veces.</div>`
     : '';
+  // Gemini bloqueó al menos una de las fotos de este hilo por seguridad y el
+  // borrador se generó solo con el texto — avisar para que alguien las revise a
+  // mano antes de publicar (ver imagesExcluded en lib/agent.js).
+  const imagesExcludedHtml = r.draftAnswer.imagesExcluded
+    ? '<div class="collab-alert">⚠ Este borrador se generó SIN analizar las fotos del hilo (Gemini las bloqueó por seguridad) — revísalas tú mismo antes de publicar.</div>'
+    : '';
   const bankBtnHtml = `<button class="btn-secondary bankPickerBtn" data-pack="${r.packId}" aria-expanded="${state.bankPickerOpenFor === r.packId}">📚 Banco</button>`;
 
   return `
@@ -958,6 +964,7 @@ function draftCardHtml(r) {
       </div>
 
       ${collabAlertHtml}
+      ${imagesExcludedHtml}
 
       <div class="draft-suggestion">
         <div class="draft-suggestion-head">

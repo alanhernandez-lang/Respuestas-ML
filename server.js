@@ -434,7 +434,7 @@ async function attachDrafts(packs, previousCache, token, touched) {
       return;
     }
     try {
-      const { text } = await generateDraftAnswer({
+      const { text, imagesExcluded } = await generateDraftAnswer({
         buyerName: record.buyerName,
         itemTitles: record.itemTitles,
         messages: record.messages,
@@ -442,7 +442,7 @@ async function attachDrafts(packs, previousCache, token, touched) {
         token,
         frequentResponses,
       });
-      record.draftAnswer = { text, generatedAt: new Date().toISOString(), forQuestionDate: questionDate };
+      record.draftAnswer = { text, generatedAt: new Date().toISOString(), forQuestionDate: questionDate, imagesExcluded };
       ok++;
     } catch (err) {
       console.warn('Error generando borrador IA para pack', record.packId, err.message);
@@ -598,7 +598,7 @@ async function regenerateDraftInner(packId) {
   const record = entry.record;
   const { access_token: token } = await getAccessToken();
   const frequentResponses = computeResponseBank(await loadAnswerLog()).filter((r) => r.count >= 3).slice(0, 15);
-  const { text } = await generateDraftAnswer({
+  const { text, imagesExcluded } = await generateDraftAnswer({
     buyerName: record.buyerName,
     itemTitles: record.itemTitles,
     messages: record.messages,
@@ -610,6 +610,7 @@ async function regenerateDraftInner(packId) {
     text,
     generatedAt: new Date().toISOString(),
     forQuestionDate: record.lastQuestion?.date || null,
+    imagesExcluded,
   };
   await savePackEntry(packId, entry);
   return record.draftAnswer;
