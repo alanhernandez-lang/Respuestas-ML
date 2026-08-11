@@ -29,12 +29,19 @@ function stripHtml(str) {
 }
 
 // Ver el comentario junto a su uso en syncPackById: un reclamo/mediación/devolución
-// ya CERRADO significa que no hay nada que contestar en el chat normal, aunque el
-// hilo se haya quedado con el último mensaje del cliente sin responder. Se reutiliza
-// tanto ahí (recién sincronizado) como en checkPastMediation (cuando el cierre se
-// descubre después, para un pack que ya estaba en caché como "pendiente").
+// que YA NO está bloqueando la conversación (o sea, existe `pastMediation`) significa
+// que no hay nada que contestar en el chat normal, aunque el hilo se haya quedado con
+// el último mensaje del cliente sin responder. Se reutiliza tanto ahí (recién
+// sincronizado) como en checkPastMediation (cuando esto se descubre después, para un
+// pack que ya estaba en caché como "pendiente").
+//
+// OJO: a propósito NO se exige pastMediation.status === 'closed' — en la práctica
+// Mercado Libre no siempre manda ese campo con ese valor exacto (a veces viene null
+// o con otro texto), y el badge "Tuvo mediación" ya se muestra con solo que exista
+// `pastMediation` — así que basta con eso para decidir el mismo criterio en los dos
+// lados y no dejar casos con el badge pero atorados en "pendiente".
 function applyClosedClaimOverride(status, pastMediation) {
-  return (status === 'pendiente' && pastMediation?.status === 'closed') ? 'respondido' : status;
+  return (status === 'pendiente' && pastMediation) ? 'respondido' : status;
 }
 
 async function resolveMediation(token, claimIds) {
