@@ -29,6 +29,15 @@ const state = {
   // packId de la conversación cuya tarjeta de borrador tiene abierto el selector de
   // "Banco de respuestas" (ver bankPickerHtml()) — como mucho una a la vez.
   bankPickerOpenFor: null,
+  // PDF que el vendedor quiere adjuntar a su respuesta, por packId — ver
+  // startAttachmentUpload(). No se manda a Mercado Libre hasta publicar; antes de
+  // eso solo vive en el estado de la app (y ya subido a ML en un archivo temporal,
+  // listo para referenciarse). Shape: { uploading, originalFilename, mimeType,
+  // filename (nombre hasheado que ya asignó ML), error }.
+  pendingAttachments: {},
+  // packId al que se le va a asociar el próximo archivo que se elija en
+  // el.attachmentFileInput (compartido entre todas las tarjetas, como el lightbox).
+  attachTargetPackId: null,
 };
 
 const el = {
@@ -71,6 +80,7 @@ const el = {
   lightboxOverlay: document.getElementById('lightboxOverlay'),
   lightboxImg: document.getElementById('lightboxImg'),
   lightboxClose: document.getElementById('lightboxClose'),
+  attachmentFileInput: document.getElementById('attachmentFileInput'),
   sortMode: document.getElementById('sortMode'),
   flagFilterBtn: document.getElementById('flagFilterBtn'),
   readFilterBtn: document.getElementById('readFilterBtn'),
@@ -909,6 +919,68 @@ function render() {
   renderChatPanel();
 }
 
+// Sube el PDF a Mercado Libre EN CUANTO se elige (no hasta publicar): así, si algo
+// sale mal (archivo inválido, ML lo rechaza, etc.), la persona se entera de una vez
+// en vez de descubrirlo justo al momento de publicar la respuesta. El archivo ya
+// subido queda guardado temporalmente en ML (máx. 48h) esperando a que se publique
+// el mensaje que lo referencia — ver /api/messages/:packId/attachment en server.js.
+async function startAttachmentUpload(packId, file) {
+  if (file.type !== 'application/pdf') {
+    showToast('Por ahora solo se pueden adjuntar archivos PDF.');
+    return;
+  }
+  if (file.size > 25 * 1024 * 1024) {
+    showToast('El archivo supera el máximo de 25 MB que permite Mercado Libre.');
+    return;
+  }
+  state.pendingAttachments[packId] = { uploading: true, originalFilename: file.name, mimeType: file.type };
+  renderChatPanel();
+  try {
+    const res = await fetch(
+      `/api/messages/${packId}/attachment?filename=${encodeURIComponent(file.name)}&mimeType=${encodeURIComponent(file.type)}`,
+      { method: 'POST', headers: { 'content-type': file.type }, body: file },
+    );
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Error desconocido');
+    state.pendingAttachments[packId] = { filename: data.filename, originalFilename: file.name, mimeType: file.type };
+  } catch (err) {
+    state.pendingAttachments[packId] = { error: err.message, originalFilename: file.name, mimeType: file.type };
+    showToast(`Error al subir el adjunto: ${err.message}`);
+  }
+  renderChatPanel();
+}
+
+el.attachmentFileInput.addEventListener('change', () => {
+  const file = el.attachmentFileInput.files[0];
+  const packId = state.attachTargetPackId;
+  el.attachmentFileInput.value = ''; // permite volver a elegir el mismo archivo si se quita y se agrega otra vez
+  if (file && packId) startAttachmentUpload(packId, file);
+});
+
+// Botón "📎 Adjuntar PDF" (si no hay nada elegido/subiendo todavía) o la
+// "tarjetita" del archivo ya subido (con opción de quitarlo) — nunca los dos a la
+// vez, para no dar la impresión de que se pueden adjuntar varios PDFs por mensaje.
+function attachmentControlHtml(packId) {
+  const pending = state.pendingAttachments[packId];
+  if (!pending) {
+    return `<button type="button" class="btn-secondary attachPdfBtn" data-pack="${packId}">📎 Adjuntar PDF</button>`;
+  }
+  if (pending.uploading) {
+    return `<span class="attachment-chip attachment-chip-pending">📄 Subiendo ${escapeHtml(pending.originalFilename)}...</span>`;
+  }
+  if (pending.error) {
+    return `
+      <span class="attachment-chip attachment-chip-error">⚠ No se pudo subir "${escapeHtml(pending.originalFilename)}"</span>
+      <button type="button" class="btn-secondary attachPdfBtn" data-pack="${packId}">Reintentar</button>
+    `;
+  }
+  return `
+    <span class="attachment-chip">📄 ${escapeHtml(pending.originalFilename)}
+      <button type="button" class="attachment-chip-remove removeAttachmentBtn" data-pack="${packId}" aria-label="Quitar adjunto">✕</button>
+    </span>
+  `;
+}
+
 function draftCardHtml(r) {
   const orderLine = `Pedido ${escapeHtml(r.orderId || '—')} · ${escapeHtml(r.itemTitles.join(', ') || '—')}${r.itemLinks && r.itemLinks.length ? ` · ${itemLinksHtml(r.itemLinks)}` : ''}`;
 
@@ -949,6 +1021,7 @@ function draftCardHtml(r) {
     ? '<div class="collab-alert">⚠ Este borrador se generó SIN analizar las fotos del hilo (Gemini las bloqueó por seguridad) — revísalas tú mismo antes de publicar.</div>'
     : '';
   const bankBtnHtml = `<button class="btn-secondary bankPickerBtn" data-pack="${r.packId}" aria-expanded="${state.bankPickerOpenFor === r.packId}">📚 Banco</button>`;
+  const attachHtml = attachmentControlHtml(r.packId);
 
   return `
     <div class="draft-card" data-pack="${r.packId}">
@@ -982,6 +1055,7 @@ function draftCardHtml(r) {
           <div class="draft-actions-secondary">
             <button class="btn-secondary cancelEditBtn" data-pack="${r.packId}">Cancelar</button>
             ${bankBtnHtml}
+            ${attachHtml}
           </div>
           <button class="btn-primary saveEditBtn" data-pack="${r.packId}">Guardar cambios</button>
         ` : `
@@ -990,6 +1064,7 @@ function draftCardHtml(r) {
             <button class="btn-secondary editBtn" data-pack="${r.packId}">Editar</button>
             <button class="btn-secondary regenerateBtn" data-pack="${r.packId}">Regenerar</button>
             ${bankBtnHtml}
+            ${attachHtml}
           </div>
           <button class="btn-primary publishBtn" data-pack="${r.packId}" data-buyer="${escapeHtml(r.buyerName)}">Publicar ↗</button>
         `}
@@ -1044,6 +1119,20 @@ async function handleDraftAction(e) {
     const r = state.records.find((x) => x.packId === editBtn.dataset.pack);
     state.editingPackId = editBtn.dataset.pack;
     state.editingDraftText = r?.draftAnswer?.text ?? '';
+    renderChatPanel();
+    return;
+  }
+
+  const attachPdfBtn = e.target.closest('.attachPdfBtn');
+  if (attachPdfBtn) {
+    state.attachTargetPackId = attachPdfBtn.dataset.pack;
+    el.attachmentFileInput.click();
+    return;
+  }
+
+  const removeAttachmentBtn = e.target.closest('.removeAttachmentBtn');
+  if (removeAttachmentBtn) {
+    delete state.pendingAttachments[removeAttachmentBtn.dataset.pack];
     renderChatPanel();
     return;
   }
@@ -1112,6 +1201,16 @@ async function handleDraftAction(e) {
 
   const publishBtn = e.target.closest('.publishBtn');
   if (publishBtn) {
+    const packId = publishBtn.dataset.pack;
+    const pending = state.pendingAttachments[packId];
+    if (pending?.uploading) {
+      showToast('Espera a que termine de subirse el PDF antes de publicar.');
+      return;
+    }
+    if (pending?.error) {
+      showToast('El PDF no se subió correctamente — quítalo o reinténtalo antes de publicar.');
+      return;
+    }
     const confirmed = await showConfirm(
       `¿Enviar esta respuesta a ${publishBtn.dataset.buyer} en Mercado Libre?\n\nEsta acción es real e irreversible.`,
     );
@@ -1119,9 +1218,14 @@ async function handleDraftAction(e) {
     publishBtn.disabled = true;
     publishBtn.textContent = 'Publicando...';
     try {
-      const res = await fetch(`/api/messages/${publishBtn.dataset.pack}/publish`, { method: 'POST' });
+      const res = await fetch(`/api/messages/${packId}/publish`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ attachments: pending ? [{ filename: pending.filename, mimeType: pending.mimeType }] : [] }),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Error desconocido');
+      delete state.pendingAttachments[packId];
       showToast('Respuesta publicada correctamente', 'success');
       await loadMessages();
     } catch (err) {

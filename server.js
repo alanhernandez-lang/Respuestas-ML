@@ -13,6 +13,7 @@ const {
   fetchClaimMessages,
   fetchClaimsByOrder,
   fetchAttachment,
+  uploadAttachment,
   sendPackMessage,
   markPackMessagesRead,
   mapWithConcurrency,
@@ -666,7 +667,7 @@ function saveDraftText(packId, text) {
   return withLock(`lock:pack:${packId}`, 15000, () => saveDraftTextInner(packId, text));
 }
 
-async function publishAnswerInner(packId, answeredBy) {
+async function publishAnswerInner(packId, answeredBy, attachments) {
   const entry = await getPackEntryOrThrow(packId);
   const record = entry.record;
   if (!record.draftAnswer?.text) {
@@ -696,7 +697,12 @@ async function publishAnswerInner(packId, answeredBy) {
   }
 
   const text = record.draftAnswer.text;
-  await sendPackMessage(token, packId, SELLER_ID, record.buyerId, text);
+  // `attachments` viene de /api/messages/:packId/attachment (subido momentos antes
+  // por el vendedor) — son filenames hasheados que ML ya tiene guardados, listos
+  // para referenciarse aquí. Si viene vacío, se manda el mensaje sin adjuntos igual
+  // que siempre.
+  const attachmentFilenames = (attachments || []).map((a) => a.filename).filter(Boolean);
+  await sendPackMessage(token, packId, SELLER_ID, record.buyerId, text, attachmentFilenames);
 
   // Marcamos la conversación como leída en Mercado Libre: por defecto nuestra app
   // sincroniza con mark_as_read=false (para no marcar nada leído solo por consultar),
@@ -712,8 +718,17 @@ async function publishAnswerInner(packId, answeredBy) {
   // sync automático) para que la conversación desaparezca de "Borradores IA" al instante.
   const now = new Date().toISOString();
   const wasEdited = Boolean(record.draftAnswer?.edited);
-  record.messages.push({ sender: 'vendedor', text, date: now, hasAttachment: false, attachments: [] });
-  record.lastAnswer = { sender: 'vendedor', text, date: now, hasAttachment: false };
+  // Guarda igual que los adjuntos del cliente (mismo shape: filename/mimeType/
+  // siteId/kind) para que se muestre con el mismo botón "Ver PDF"/miniatura en el
+  // hilo. 'MLM' porque esta app solo maneja la cuenta de México.
+  const localAttachments = (attachments || []).map((a) => ({
+    filename: a.filename,
+    mimeType: a.mimeType,
+    siteId: 'MLM',
+    kind: a.mimeType === 'application/pdf' ? 'pdf' : 'image',
+  }));
+  record.messages.push({ sender: 'vendedor', text, date: now, hasAttachment: localAttachments.length > 0, attachments: localAttachments });
+  record.lastAnswer = { sender: 'vendedor', text, date: now, hasAttachment: localAttachments.length > 0 };
   record.status = 'respondido';
   record.draftAnswer = null;
   record.answeredBy = answeredBy || null;
@@ -732,8 +747,8 @@ async function publishAnswerInner(packId, answeredBy) {
   return record;
 }
 
-function publishAnswer(packId, answeredBy) {
-  return withLock(`lock:pack:${packId}`, 30000, () => publishAnswerInner(packId, answeredBy));
+function publishAnswer(packId, answeredBy, attachments) {
+  return withLock(`lock:pack:${packId}`, 30000, () => publishAnswerInner(packId, answeredBy, attachments));
 }
 
 const app = express();
@@ -864,13 +879,49 @@ app.post('/api/messages/:packId/draft', async (req, res) => {
 
 app.post('/api/messages/:packId/publish', async (req, res) => {
   try {
-    const record = await publishAnswer(req.params.packId, req.userEmail);
+    const record = await publishAnswer(req.params.packId, req.userEmail, req.body?.attachments);
     res.json({ record });
   } catch (err) {
     console.error(err);
     res.status(err.status || 500).json({ error: err.message });
   }
 });
+
+// Formatos y tamaño que Mercado Libre acepta para adjuntar a un mensaje de
+// postventa (no es una limitación nuestra, es la que documenta la API).
+const ALLOWED_ATTACHMENT_MIME_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png', 'text/plain']);
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+// A diferencia del resto de rutas (JSON), esta recibe el archivo tal cual en el
+// body (bytes crudos) — el navegador lo manda como blob, sin envolverlo en
+// multipart, así que del lado de esta app no hace falta ninguna librería para
+// parsearlo. El multipart/form-data que sí exige la API de Mercado Libre se arma
+// en uploadAttachment (lib/ml.js) al reenviarlo.
+app.post(
+  '/api/messages/:packId/attachment',
+  express.raw({ type: '*/*', limit: MAX_ATTACHMENT_BYTES }),
+  async (req, res) => {
+    try {
+      const mimeType = req.query.mimeType;
+      const filename = req.query.filename;
+      if (!Buffer.isBuffer(req.body) || !req.body.length) {
+        return res.status(400).json({ error: 'No se recibió ningún archivo' });
+      }
+      if (!ALLOWED_ATTACHMENT_MIME_TYPES.has(mimeType)) {
+        return res.status(400).json({ error: 'Mercado Libre solo acepta PDF, JPG, PNG o TXT como adjunto' });
+      }
+      if (req.body.length > MAX_ATTACHMENT_BYTES) {
+        return res.status(400).json({ error: 'El archivo supera el máximo de 25 MB que permite Mercado Libre' });
+      }
+      const { access_token: token } = await getAccessToken();
+      const uploaded = await uploadAttachment(token, req.body, filename || 'adjunto', mimeType, 'MLM');
+      res.json({ filename: uploaded.filename, originalFilename: filename || null, mimeType });
+    } catch (err) {
+      console.error(err);
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
 
 // Presencia en vivo: quién tiene abierta cada conversación ahora mismo. No necesita
 // limpieza activa — un valor se considera "vigente" solo si su timestamp es reciente

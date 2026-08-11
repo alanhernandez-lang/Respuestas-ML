@@ -622,6 +622,36 @@ main {
   padding: 0.1rem 0.5rem;
 }
 
+/* El PDF que el vendedor está adjuntando a su respuesta (ver attachmentControlHtml
+   en app.js) — vive junto a los demás botones secundarios de la tarjeta. */
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 0.35rem 0.6rem;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  max-width: 220px;
+}
+.attachment-chip-pending { color: var(--muted); }
+.attachment-chip-error { color: var(--mediation); background: var(--mediation-bg); border-color: transparent; }
+.attachment-chip-remove {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.9rem;
+  line-height: 1;
+  padding: 0;
+  min-width: 20px;
+  min-height: 20px;
+}
+.attachment-chip-remove:hover { color: var(--mediation); }
+
 .draft-text { white-space: pre-wrap; line-height: 1.5; }
 
 .draft-charcount {

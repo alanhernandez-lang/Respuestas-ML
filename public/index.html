@@ -123,6 +123,10 @@
     <img id="lightboxImg" class="lightbox-img" alt="" />
   </div>
 
+  <!-- Compartido entre todas las tarjetas de borrador (como el lightbox de arriba):
+       state.attachTargetPackId dice a cuál conversación va el próximo archivo. -->
+  <input id="attachmentFileInput" type="file" accept="application/pdf" hidden />
+
   <div id="shortcutsOverlay" class="confirm-overlay" hidden>
     <div class="confirm-box shortcuts-box" role="dialog" aria-modal="true" aria-labelledby="shortcutsTitle">
       <div class="shortcuts-head">
