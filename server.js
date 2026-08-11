@@ -329,6 +329,11 @@ async function syncPackById(token, packId, cache, unreadCount) {
     pastMediation,
     pastMediationChecked,
     pastMediationCheckAttempts: previousRecord?.pastMediationCheckAttempts || 0,
+    // Se arrastra igual que el resto del historial de mediación: si no lo
+    // conserváramos aquí, un pack "respondido" que se re-sincroniza por cualquier
+    // otro motivo (aunque sea raro que eso pase) perdería su versión de backfill y
+    // volvería a ser candidato sin necesidad.
+    messagesBackfillVersion: previousRecord?.messagesBackfillVersion || 0,
   };
 }
 
@@ -411,7 +416,17 @@ const PAST_MEDIATION_CHECK_BATCH = 30;
 // Igual de acotado y por el mismo motivo (backlog que se agota una sola vez, no
 // algo que se repita) — ver comentario junto a messagesBackfillCandidates en
 // runSyncInner().
-const MESSAGES_BACKFILL_BATCH = 40;
+// Subido de 40 a 80: con la versión 2 (PDFs) TODAS las "respondido" vuelven a ser
+// candidatas de golpe (~600+), y a 40/ciclo tardaría casi una hora en cubrirlas todas.
+const MESSAGES_BACKFILL_BATCH = 80;
+
+// Cada vez que una corrección necesite releer el historial completo de las
+// conversaciones "respondido" ya en caché (que si no, nunca se vuelven a
+// sincronizar), se sube este número — eso hace que TODAS pasen una vez más por el
+// backfill de abajo, sin importar que ya hubieran pasado por una versión anterior.
+// V1: la paginación de mensajes que se perdía en silencio. V2: los PDFs adjuntos
+// que se descartaban por completo antes de guardarse.
+const MESSAGES_BACKFILL_VERSION = 2;
 
 // El borrador de IA sigue siendo válido mientras nadie haya hecho una pregunta
 // nueva desde que se generó, así que solo se regenera cuando cambia lastQuestion.
@@ -548,22 +563,21 @@ async function runSyncInner() {
     await savePackEntry(packId, fresh);
   });
 
-  // Antes, fetchPackMessages no pedía paginación y Mercado Libre solo mandaba la
-  // primera página (10 mensajes por default) — en conversaciones largas el resto
-  // del historial se perdía en silencio (ver fetchPackMessages en lib/ml.js, ya
-  // corregido para pedir todas las páginas). Pero eso solo arregla las conversaciones
-  // que se vuelvan a sincronizar; las que ya están "respondido" en caché con el
-  // historial viejo (recortado) nunca se tocan de nuevo. Este lote las rellena UNA
-  // sola vez (marcando `messagesBackfilled`) para no volver a re-sincronizar algo
-  // ya resuelto en cada ciclo para siempre.
+  // Las conversaciones "respondido" en caché nunca se vuelven a sincronizar solas
+  // (el resto del sync las excluye a propósito) — pero a veces una corrección de
+  // fondo (paginación de mensajes, adjuntos que se descartaban, etc.) necesita
+  // releer el historial completo para que también aplique ahí. Este lote las
+  // rellena UNA vez POR VERSIÓN (ver MESSAGES_BACKFILL_VERSION arriba): si ya
+  // pasaron por la versión actual no se vuelven a tocar, pero si sube el número de
+  // versión, todas vuelven a ser candidatas una vez más.
   const messagesBackfillCandidates = Object.values(packs)
-    .filter((p) => p.record.status === 'respondido' && !p.record.messagesBackfilled)
+    .filter((p) => p.record.status === 'respondido' && (p.record.messagesBackfillVersion || 0) < MESSAGES_BACKFILL_VERSION)
     .slice(0, MESSAGES_BACKFILL_BATCH);
   await mapWithConcurrency(messagesBackfillCandidates, 3, async (entry) => {
     const packId = entry.record.packId;
     try {
       const refreshed = await syncPackById(token, packId, cache, entry.record.unreadCount || 0);
-      refreshed.messagesBackfilled = true;
+      refreshed.messagesBackfillVersion = MESSAGES_BACKFILL_VERSION;
       const fresh = await loadPackEntry(packId);
       if (!fresh) return;
       // Solo pisamos si sigue "respondido": si en el rato que tomó esta llamada
