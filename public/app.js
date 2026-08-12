@@ -733,11 +733,22 @@ function avatarHtml(name) {
   return `<div class="avatar ${avatarColorClass(name)}">${escapeHtml(initials(name))}</div>`;
 }
 
-function itemLinksHtml(itemLinks) {
-  if (!itemLinks || !itemLinks.length) return '';
-  return itemLinks
-    .map((l, i) => `<a class="ml-link" href="${l.url}" target="_blank" rel="noopener">Ver publicación${itemLinks.length > 1 ? ` ${i + 1}` : ''} ↗</a>`)
-    .join(' · ');
+// El nombre de la publicación ES el link a Mercado Libre (si lo tenemos) — así no
+// hace falta un "Ver publicación ↗" aparte, se puede dar clic directo al nombre.
+// Si por lo que sea no se bajó el link de algún producto puntual (falló esa
+// consulta al sincronizar), ese título cae a texto plano en vez de romper todo.
+function itemTitlesHtml(r) {
+  const titles = r.itemTitles && r.itemTitles.length ? r.itemTitles : [];
+  if (!titles.length) return 'Producto no identificado';
+  const linksByTitle = new Map((r.itemLinks || []).map((l) => [l.title, l.url]));
+  return titles
+    .map((title) => {
+      const url = linksByTitle.get(title);
+      return url
+        ? `<a class="ml-link" href="${url}" target="_blank" rel="noopener">${escapeHtml(title)}</a>`
+        : escapeHtml(title);
+    })
+    .join(', ');
 }
 
 function fmtDate(iso) {
@@ -896,14 +907,18 @@ function render() {
   renderChatPanel();
 }
 
-// Sube el PDF a Mercado Libre EN CUANTO se elige (no hasta publicar): así, si algo
-// sale mal (archivo inválido, ML lo rechaza, etc.), la persona se entera de una vez
-// en vez de descubrirlo justo al momento de publicar la respuesta. El archivo ya
+// Formatos que Mercado Libre acepta como adjunto en un mensaje de postventa (no es
+// una limitación nuestra — coincide con lo que ya valida server.js del otro lado).
+const ALLOWED_ATTACHMENT_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png']);
+
+// Sube el archivo a Mercado Libre EN CUANTO se elige (no hasta publicar): así, si
+// algo sale mal (archivo inválido, ML lo rechaza, etc.), la persona se entera de una
+// vez en vez de descubrirlo justo al momento de publicar la respuesta. El archivo ya
 // subido queda guardado temporalmente en ML (máx. 48h) esperando a que se publique
 // el mensaje que lo referencia — ver /api/messages/:packId/attachment en server.js.
 async function startAttachmentUpload(packId, file) {
-  if (file.type !== 'application/pdf') {
-    showToast('Por ahora solo se pueden adjuntar archivos PDF.');
+  if (!ALLOWED_ATTACHMENT_TYPES.has(file.type)) {
+    showToast('Solo se pueden adjuntar archivos PDF, JPG o PNG.');
     return;
   }
   if (file.size > 25 * 1024 * 1024) {
@@ -934,32 +949,33 @@ el.attachmentFileInput.addEventListener('change', () => {
   if (file && packId) startAttachmentUpload(packId, file);
 });
 
-// Botón "📎 Adjuntar PDF" (si no hay nada elegido/subiendo todavía) o la
+// Botón "📎 Adjuntar archivo" (si no hay nada elegido/subiendo todavía) o la
 // "tarjetita" del archivo ya subido (con opción de quitarlo) — nunca los dos a la
-// vez, para no dar la impresión de que se pueden adjuntar varios PDFs por mensaje.
+// vez, para no dar la impresión de que se pueden adjuntar varios archivos por mensaje.
 function attachmentControlHtml(packId) {
   const pending = state.pendingAttachments[packId];
   if (!pending) {
-    return `<button type="button" class="btn-secondary attachPdfBtn" data-pack="${packId}">📎 Adjuntar PDF</button>`;
+    return `<button type="button" class="btn-secondary attachFileBtn" data-pack="${packId}">📎 Adjuntar archivo</button>`;
   }
+  const icon = pending.mimeType === 'application/pdf' ? '📄' : '🖼';
   if (pending.uploading) {
-    return `<span class="attachment-chip attachment-chip-pending">📄 Subiendo ${escapeHtml(pending.originalFilename)}...</span>`;
+    return `<span class="attachment-chip attachment-chip-pending">${icon} Subiendo ${escapeHtml(pending.originalFilename)}...</span>`;
   }
   if (pending.error) {
     return `
       <span class="attachment-chip attachment-chip-error">⚠ No se pudo subir "${escapeHtml(pending.originalFilename)}"</span>
-      <button type="button" class="btn-secondary attachPdfBtn" data-pack="${packId}">Reintentar</button>
+      <button type="button" class="btn-secondary attachFileBtn" data-pack="${packId}">Reintentar</button>
     `;
   }
   return `
-    <span class="attachment-chip">📄 ${escapeHtml(pending.originalFilename)}
+    <span class="attachment-chip">${icon} ${escapeHtml(pending.originalFilename)}
       <button type="button" class="attachment-chip-remove removeAttachmentBtn" data-pack="${packId}" aria-label="Quitar adjunto">✕</button>
     </span>
   `;
 }
 
 function draftCardHtml(r) {
-  const orderLine = `Pedido ${escapeHtml(r.orderId || '—')} · ${escapeHtml(r.itemTitles.join(', ') || '—')}${r.itemLinks && r.itemLinks.length ? ` · ${itemLinksHtml(r.itemLinks)}` : ''}`;
+  const orderLine = `Pedido ${escapeHtml(r.orderId || '—')} · ${itemTitlesHtml(r)}`;
 
   if (r.draftAnswer.error) {
     return `
@@ -1100,9 +1116,9 @@ async function handleDraftAction(e) {
     return;
   }
 
-  const attachPdfBtn = e.target.closest('.attachPdfBtn');
-  if (attachPdfBtn) {
-    state.attachTargetPackId = attachPdfBtn.dataset.pack;
+  const attachFileBtn = e.target.closest('.attachFileBtn');
+  if (attachFileBtn) {
+    state.attachTargetPackId = attachFileBtn.dataset.pack;
     el.attachmentFileInput.click();
     return;
   }
@@ -1394,9 +1410,7 @@ function renderChatPanel() {
 
   el.chatAvatar.innerHTML = avatarHtml(r.buyerName);
   el.chatTitle.textContent = r.buyerName;
-  el.chatItem.innerHTML = `Pedido ${escapeHtml(r.orderId || '—')} · ${escapeHtml(r.itemTitles.join(', ') || 'Producto no identificado')}
-    ${r.orderUrl ? ` · <a class="ml-link" href="${r.orderUrl}" target="_blank" rel="noopener">Ver venta en Mercado Libre ↗</a>` : ''}
-    ${itemLinksHtml(r.itemLinks)}`;
+  el.chatItem.innerHTML = `Pedido ${escapeHtml(r.orderId || '—')} · ${itemTitlesHtml(r)}`;
 
   const isFlagged = state.flags.has(r.packId);
   el.chatFlagBtn.textContent = isFlagged ? '★' : '☆';
