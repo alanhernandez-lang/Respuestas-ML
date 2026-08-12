@@ -1339,16 +1339,6 @@ input[type="search"] {
 }
 .shortcuts-list dd { margin: 0; color: var(--text); font-size: 0.87rem; }
 
-/* Vista "compacta" opcional de la lista de conversaciones (ver toggleDensity() en
-   app.js) — para cuando alguien prefiera ver más filas de un vistazo a costa de un
-   poco de aire entre ellas. No oculta ningún dato, solo reduce paddings/tamaños. */
-body.density-compact .conversation-item { padding: 0.45rem 0.9rem; }
-body.density-compact .avatar { width: 30px; height: 30px; font-size: 0.7rem; }
-body.density-compact .conversation-item .row-mid { margin-top: 0.2rem; }
-body.density-compact .conversation-item .preview { margin-top: 0.18rem; }
-body.density-compact .conversation-item .item-order { margin-top: 0.18rem; }
-body.density-compact .log-entry { padding: 0.55rem 1.25rem; }
-
 /* ============ Responsivo ============
    El equipo usa esto sobre todo en laptops chicas (~1280–1366px de ancho, a veces
    con la ventana no maximizada), no en celulares — por eso el corte principal es

@@ -84,7 +84,6 @@ const el = {
   sortMode: document.getElementById('sortMode'),
   flagFilterBtn: document.getElementById('flagFilterBtn'),
   readFilterBtn: document.getElementById('readFilterBtn'),
-  densityToggle: document.getElementById('densityToggle'),
   shortcutsBtn: document.getElementById('shortcutsBtn'),
   shortcutsOverlay: document.getElementById('shortcutsOverlay'),
   shortcutsClose: document.getElementById('shortcutsClose'),
@@ -225,34 +224,12 @@ el.flagFilterBtn.addEventListener('click', () => {
 });
 
 const READ_FILTER_CYCLE = { '': 'unread', unread: 'read', read: '' };
-const READ_FILTER_LABELS = { '': '👁 Todos', unread: '👁 No leídos', read: '✓ Leídos' };
+const READ_FILTER_LABELS = { '': '☰ Todos', unread: '☰ No leídos', read: '☰ Leídos' };
 
 el.readFilterBtn.addEventListener('click', () => {
   state.readFilter = READ_FILTER_CYCLE[state.readFilter];
   render();
 });
-
-// Densidad de la lista: para quien prefiera ver más filas de un vistazo a costa de
-// menos aire entre ellas. Preferencia de comodidad visual, así que se recuerda entre
-// sesiones igual que el tema, y no toca ningún dato.
-function loadDensity() {
-  return localStorage.getItem('ml_density') === 'compact' ? 'compact' : 'cozy';
-}
-
-function applyDensity(mode) {
-  const compact = mode === 'compact';
-  document.body.classList.toggle('density-compact', compact);
-  el.densityToggle.setAttribute('aria-pressed', String(compact));
-  el.densityToggle.title = compact ? 'Vista cómoda de la lista' : 'Vista compacta de la lista';
-}
-
-function toggleDensity() {
-  const next = document.body.classList.contains('density-compact') ? 'cozy' : 'compact';
-  localStorage.setItem('ml_density', next);
-  applyDensity(next);
-}
-
-el.densityToggle.addEventListener('click', toggleDensity);
 
 el.sortMode.addEventListener('change', () => {
   state.sortMode = el.sortMode.value === 'urgencia' ? 'urgencia' : 'reciente';
@@ -1617,7 +1594,6 @@ setInterval(autoSync, AUTO_SYNC_MS);
 state.flags = loadFlags();
 state.sortMode = localStorage.getItem('ml_sortMode') === 'urgencia' ? 'urgencia' : 'reciente';
 el.sortMode.value = state.sortMode;
-applyDensity(loadDensity());
 
 initTheme();
 loadMessages();
