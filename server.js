@@ -527,22 +527,16 @@ const MESSAGES_BACKFILL_VERSION = 2;
 // nueva desde que se generó, así que solo se regenera cuando cambia lastQuestion.
 // `touched` acumula los packIds que de verdad cambiaron este ciclo, para que
 // runSync() solo reescriba esos en Redis (no los ~170 completos cada vez).
-async function attachDrafts(packs, previousCache, token, touched) {
+async function attachDrafts(packs, token, touched) {
   const pendingEntries = Object.values(packs).filter((p) => p.record.status === 'pendiente');
-  const isEntryFresh = (entry) => {
-    const questionDate = entry.record.lastQuestion?.date || null;
-    const previousDraft = previousCache.packs[entry.record.packId]?.record?.draftAnswer;
-    return Boolean(previousDraft && !previousDraft.error && previousDraft.forQuestionDate === questionDate);
-  };
-  const pendingToGenerate = pendingEntries.filter((entry) => !isEntryFresh(entry)).length;
-  if (pendingToGenerate > 0) console.log(`Generando ${pendingToGenerate} borrador(es) IA...`);
+  if (!pendingEntries.length) return;
+
   // Se calcula una sola vez para todo el lote (no por cada pack) — son las mismas
   // respuestas frecuentes para cualquier borrador que se genere en este ciclo de sync.
   // Solo se cuentan las usadas 3+ veces, para filtrar casos raros o con errores de una
   // sola vez que alguien haya editado a mano.
-  const frequentResponses = pendingToGenerate > 0
-    ? computeResponseBank(await loadAnswerLog()).filter((r) => r.count >= 3).slice(0, 15)
-    : [];
+  const frequentResponses = computeResponseBank(await loadAnswerLog()).filter((r) => r.count >= 3).slice(0, 15);
+  let fresh = 0;
   let ok = 0;
   let failed = 0;
   // OJO: este mapWithConcurrency debe correr SIEMPRE para TODOS los pendientes, incluso
@@ -552,10 +546,17 @@ async function attachDrafts(packs, previousCache, token, touched) {
   await mapWithConcurrency(pendingEntries, 3, async (entry) => {
     const record = entry.record;
     const questionDate = record.lastQuestion?.date || null;
-    const previousDraft = previousCache.packs[record.packId]?.record?.draftAnswer;
+    // Se lee el valor MÁS FRESCO de Redis (no una foto tomada al inicio del ciclo) —
+    // un sync completo puede tardar bastante procesando cientos de packs, y si
+    // alguien le daba "Regenerar" o editaba el borrador a mano justo en esa ventana,
+    // comparar contra la foto vieja terminaba pisando ese cambio reciente con el
+    // valor de antes, como si el botón "no hubiera hecho nada".
+    const currentEntry = await loadPackEntry(record.packId);
+    const previousDraft = currentEntry?.record?.draftAnswer;
     const isFresh = previousDraft && !previousDraft.error && previousDraft.forQuestionDate === questionDate;
     if (isFresh) {
       record.draftAnswer = previousDraft;
+      fresh++;
       return;
     }
     try {
@@ -576,7 +577,7 @@ async function attachDrafts(packs, previousCache, token, touched) {
     }
     touched.add(record.packId);
   });
-  if (pendingToGenerate > 0) console.log(`Borradores IA listos: ${ok} ok, ${failed} con error.`);
+  if (ok > 0 || failed > 0) console.log(`Borradores IA: ${ok} generados, ${failed} con error, ${fresh} ya estaban al día.`);
 }
 
 async function runSyncInner() {
@@ -703,7 +704,7 @@ async function runSyncInner() {
     }
   });
 
-  await attachDrafts(packs, cache, token, touched);
+  await attachDrafts(packs, token, touched);
 
   if (touched.size) {
     const toWrite = {};
