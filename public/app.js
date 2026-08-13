@@ -1211,7 +1211,7 @@ async function handleDraftAction(e) {
     } catch (err) {
       showToast(`Error al guardar: ${err.message}`);
       saveEditBtn.disabled = false;
-      saveEditBtn.textContent = 'Guardar';
+      saveEditBtn.textContent = 'Guardar cambios';
     }
     return;
   }
@@ -1481,9 +1481,28 @@ function renderChatPanel() {
 
   el.chatThread.innerHTML = messagesHtml + renderMediation(r.mediation) + renderPastMediation(r);
 
+  // El refresco automático (cada 20s) llama a esta función igual que cualquier otro
+  // cambio — sin esto, si justo se está escribiendo en el textarea de edición, cada
+  // refresco reconstruye el <textarea> desde cero y el cursor/foco se pierde a media
+  // escritura (se siente como si "se descompusiera" el editor). Se guarda selección
+  // y scroll ANTES de reconstruir, y se restauran después en el <textarea> nuevo.
+  const textareaEl = el.chatDraftPanel.querySelector('.draft-edit-textarea');
+  const preservedSelection = textareaEl && document.activeElement === textareaEl
+    ? { selectionStart: textareaEl.selectionStart, selectionEnd: textareaEl.selectionEnd, scrollTop: textareaEl.scrollTop }
+    : null;
+
   const showDraft = r.status === 'pendiente' && r.draftAnswer;
   el.chatDraftPanel.hidden = !showDraft;
   el.chatDraftPanel.innerHTML = showDraft ? draftCardHtml(r) : '';
+
+  if (preservedSelection) {
+    const newTextarea = el.chatDraftPanel.querySelector('.draft-edit-textarea');
+    if (newTextarea) {
+      newTextarea.focus();
+      newTextarea.setSelectionRange(preservedSelection.selectionStart, preservedSelection.selectionEnd);
+      newTextarea.scrollTop = preservedSelection.scrollTop;
+    }
+  }
 }
 
 async function loadMessages() {
