@@ -756,6 +756,29 @@ function fmtDate(iso) {
   return new Date(iso).toLocaleString('es-MX', { dateStyle: 'medium', timeStyle: 'short' });
 }
 
+// Solo fecha (sin hora) — para la fecha de venta no hace falta la precisión de
+// minutos que sí importa en el hilo de mensajes.
+function fmtSaleDate(iso) {
+  if (!iso) return null;
+  return new Date(iso).toLocaleDateString('es-MX', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+// Fecha de venta + badge FULL (fulfillment de Mercado Libre) + estatus de envío
+// (Entregado/Enviado/Acordar con el vendedor/...) — se arma aparte para reusarse en
+// la fila de la lista, el encabezado del chat y la tarjeta de borrador.
+function saleInfoHtml(r) {
+  const bits = [];
+  const dateLabel = fmtSaleDate(r.saleDate);
+  if (dateLabel) bits.push(escapeHtml(dateLabel));
+  if (r.isFull) {
+    bits.push('<span class="badge full-badge" title="Fulfillment: Mercado Libre gestiona el envío">FULL</span>');
+  }
+  if (r.shippingStatusLabel) {
+    bits.push(`<span class="badge shipping-badge">${escapeHtml(r.shippingStatusLabel)}</span>`);
+  }
+  return bits.join(' ');
+}
+
 function fmtTime(iso) {
   if (!iso) return '';
   return new Date(iso).toLocaleString('es-MX', { dateStyle: 'short', timeStyle: 'short' });
@@ -872,7 +895,7 @@ function render() {
             </div>
           </div>
           <div class="row-mid">
-            <span class="badge ${r.status}">${STATUS_ICON[r.status] || ''} ${STATUS_LABELS[r.status] || r.status}</span>${pastMediationBadge}${draftFlagBadge}${unreadHtml}
+            <span class="badge ${r.status}">${STATUS_ICON[r.status] || ''} ${STATUS_LABELS[r.status] || r.status}</span>${r.isFull ? ' <span class="badge full-badge" title="Fulfillment: Mercado Libre gestiona el envío">FULL</span>' : ''}${pastMediationBadge}${draftFlagBadge}${unreadHtml}
           </div>
           <div class="preview">${escapeHtml(lastMessagePreview(r))}</div>
           <div class="item-order">Pedido ${escapeHtml(r.orderId || '—')} · ${escapeHtml(r.itemTitles.join(', ') || '—')}${answeredLine}</div>
@@ -975,7 +998,8 @@ function attachmentControlHtml(packId) {
 }
 
 function draftCardHtml(r) {
-  const orderLine = `Pedido ${escapeHtml(r.orderId || '—')} · ${itemTitlesHtml(r)}`;
+  const draftSaleInfo = saleInfoHtml(r);
+  const orderLine = `Pedido ${escapeHtml(r.orderId || '—')} · ${itemTitlesHtml(r)}${draftSaleInfo ? ` · ${draftSaleInfo}` : ''}`;
 
   if (r.draftAnswer.error) {
     return `
@@ -1410,7 +1434,8 @@ function renderChatPanel() {
 
   el.chatAvatar.innerHTML = avatarHtml(r.buyerName);
   el.chatTitle.textContent = r.buyerName;
-  el.chatItem.innerHTML = `Pedido ${escapeHtml(r.orderId || '—')} · ${itemTitlesHtml(r)}`;
+  const chatSaleInfo = saleInfoHtml(r);
+  el.chatItem.innerHTML = `Pedido ${escapeHtml(r.orderId || '—')} · ${itemTitlesHtml(r)}${chatSaleInfo ? ` · ${chatSaleInfo}` : ''}`;
 
   const isFlagged = state.flags.has(r.packId);
   el.chatFlagBtn.textContent = isFlagged ? '★' : '☆';

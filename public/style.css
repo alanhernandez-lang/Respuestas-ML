@@ -30,6 +30,10 @@
      ícono sobre fondos claros/oscuros, no texto, así que no necesita el mismo escrutinio
      de contraste AA que --pending/--answered/--mediation. */
   --flag: #b45309;
+  /* Badge "FULL" (fulfillment de Mercado Libre) — mismo perfil de contraste que
+     --pending/--mediation (texto saturado sobre fondo muy pálido). */
+  --full: #1d4ed8;
+  --full-bg: #e0e7ff;
   /* Tonos oscurecidos a propósito (vs. la paleta "pastel" original) para que las
      iniciales blancas del avatar cumplan contraste AA (>=4.5:1) sobre cualquiera. */
   --av-1: #1d4ed8;
@@ -73,6 +77,8 @@
     --urgent: #e8b34e;
     --urgent-bg: #3a2f14;
     --flag: #fbbf24;
+    --full: #93b4ff;
+    --full-bg: #1e2a4a;
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow-md: 0 3px 10px rgba(0, 0, 0, 0.35);
     --shadow-lg: 0 10px 32px rgba(0, 0, 0, 0.45);
@@ -102,6 +108,8 @@
   --urgent: #e8b34e;
   --urgent-bg: #3a2f14;
   --flag: #fbbf24;
+  --full: #93b4ff;
+  --full-bg: #1e2a4a;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-md: 0 3px 10px rgba(0, 0, 0, 0.35);
   --shadow-lg: 0 10px 32px rgba(0, 0, 0, 0.45);
@@ -1116,6 +1124,14 @@ input[type="search"] {
    sigue leyéndose como alerta activa a primera vista. */
 .badge.mediacion-past { color: var(--muted); background: var(--surface-2); border: 1px solid var(--border); }
 .badge.mediacion-past::before { display: none; }
+
+/* FULL (fulfillment de Mercado Libre) y el estatus de envío (Entregado/Enviado/
+   Acordar con el vendedor/...) — informativos, no de acción, así que van neutros
+   y sin el puntito de estado. */
+.badge.full-badge { color: var(--full); background: var(--full-bg); font-weight: 700; }
+.badge.full-badge::before { display: none; }
+.badge.shipping-badge { color: var(--muted); background: var(--surface-2); border: 1px solid var(--border); }
+.badge.shipping-badge::before { display: none; }
 
 /* Los tres estados vacíos (sidebar, bitácora, banco) siguen siendo un único <p>
    normal dentro del flujo de su columna flex — a propósito, para no arriesgar

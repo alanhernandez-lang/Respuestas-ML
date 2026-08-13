@@ -8,6 +8,7 @@ const {
   fetchPackMessages,
   fetchPackDetail,
   fetchOrderDetail,
+  fetchShipmentDetail,
   fetchItemDetail,
   fetchClaimDetail,
   fetchClaimMessages,
@@ -26,6 +27,53 @@ const CLAIM_ROLE_LABELS = { mediator: 'Mediador (ML)', respondent: 'Vendedor (t�
 
 function stripHtml(str) {
   return (str || '').replace(/<[^>]+>/g, '');
+}
+
+// Traducción de lo que reporta el envío al mismo texto que ya se usa en el panel
+// de vendedor de Mercado Libre — si llega un estatus que no está aquí, se muestra
+// tal cual (en vez de ocultarlo) para no perder la información.
+const SHIPPING_STATUS_LABELS = {
+  pending: 'Pendiente',
+  handling: 'En preparación',
+  ready_to_ship: 'Listo para enviar',
+  shipped: 'Enviado',
+  delivered: 'Entregado',
+  not_delivered: 'No entregado',
+  cancelled: 'Cancelado',
+};
+
+// A diferencia del resto de resolvePackInfo (buyerId/itemLinks, que ya no cambian
+// una vez conocidos), el estatus de envío SÍ avanza con el tiempo — un pedido
+// "enviado" hoy puede ser "entregado" en unos días. `shippingSettled` marca cuándo
+// ya no hace falta volver a preguntar: cuando llegó a un estado final (entregado/
+// cancelado/no entregado) o cuando de plano no hay envío que dé seguimiento
+// ("acordar con el vendedor"). Mientras no esté settled, resolvePackInfo lo vuelve
+// a consultar en cada sync (barato: un GET a /shipments, sin volver a bajar cada
+// ítem ni al comprador).
+const TERMINAL_SHIPPING_STATUSES = new Set(['delivered', 'cancelled', 'not_delivered']);
+
+// Cuando la venta se acuerda directo con el comprador (sin logística de Mercado
+// Libre), `order.shipping` no trae `id` — ahí ni siquiera existe un envío que
+// consultar, así que se reporta directo como "Acordar con el vendedor" en vez de
+// gastar una llamada a /shipments que fallaría de todos modos.
+async function resolveShippingInfo(token, order) {
+  const shippingId = order.shipping?.id;
+  if (!shippingId) {
+    return { isFull: false, shippingStatus: null, shippingStatusLabel: 'Acordar con el vendedor', shippingSettled: true };
+  }
+  try {
+    const shipment = await fetchShipmentDetail(token, shippingId);
+    const status = shipment.status || null;
+    return {
+      isFull: shipment.logistic_type === 'fulfillment',
+      shippingStatus: status,
+      shippingStatusLabel: status ? (SHIPPING_STATUS_LABELS[status] || status) : null,
+      shippingSettled: TERMINAL_SHIPPING_STATUSES.has(status),
+    };
+  } catch (err) {
+    console.warn('No se pudo consultar el envío', shippingId, err.message);
+    return { isFull: false, shippingStatus: null, shippingStatusLabel: null, shippingSettled: false };
+  }
 }
 
 // Ver el comentario junto a su uso en syncPackById: un reclamo/mediación/devolución
@@ -176,51 +224,85 @@ function buyerDisplayName(buyer) {
 
 async function resolvePackInfo(token, packId, cache) {
   const cached = cache.packs[packId]?.info;
-  // Los packs guardados antes de que existiera `buyerId`/`itemLinks` no los tienen en
-  // caché: se re-consultan una vez más para completarlos, en vez de quedarse sin ellos
-  // para siempre.
-  if (cached && cached.buyerId && cached.itemLinks) return cached;
+  // buyerId/itemLinks (con sus permalinks) ya no cambian una vez conocidos — pero
+  // el estatus de envío sí avanza con el tiempo (ver TERMINAL_SHIPPING_STATUSES), así
+  // que "está completo" y "el envío ya no necesita refrescarse" son dos cosas
+  // distintas: solo cuando las DOS son ciertas nos ahorramos ir a preguntarle a ML.
+  const hasCoreInfo = Boolean(cached && cached.buyerId && cached.itemLinks);
+  const shippingDone = Boolean(cached?.shippingChecked && cached?.shippingSettled);
+  if (hasCoreInfo && shippingDone) return cached;
 
   // Cuando una orden no forma parte de un pack real de Mercado Libre, la API de
   // mensajes usa el order_id como si fuera pack_id y /packs/{id} responde 404.
-  // En ese caso tratamos el id como order_id directamente.
-  let orderId;
-  try {
-    const packDetail = await fetchPackDetail(token, packId);
-    orderId = packDetail.orders?.[0]?.id;
-  } catch (err) {
-    if (err.status === 404) {
-      orderId = packId;
-    } else {
-      throw err;
+  // En ese caso tratamos el id como order_id directamente. Si ya conocíamos el
+  // orderId (solo nos falta refrescar el envío), nos ahorramos volver a preguntar.
+  let orderId = cached?.orderId;
+  if (!orderId) {
+    try {
+      const packDetail = await fetchPackDetail(token, packId);
+      orderId = packDetail.orders?.[0]?.id;
+    } catch (err) {
+      if (err.status === 404) {
+        orderId = packId;
+      } else {
+        throw err;
+      }
     }
   }
 
-  let buyerName = 'Cliente desconocido';
-  let itemTitles = [];
-  let itemLinks = [];
-  let buyerId = null;
-
-  if (orderId) {
-    const order = await fetchOrderDetail(token, orderId);
-    buyerName = buyerDisplayName(order.buyer);
-    itemTitles = (order.order_items || []).map((oi) => oi.item?.title).filter(Boolean);
-    buyerId = order.buyer?.id || null;
-
-    // El permalink real (con su slug de SEO) solo viene en el recurso completo del
-    // ítem, no en el resumen embebido dentro de la orden — por eso se consulta aparte.
-    const itemIds = (order.order_items || []).map((oi) => oi.item?.id).filter(Boolean);
-    itemLinks = (await Promise.all(itemIds.map(async (itemId) => {
-      try {
-        const item = await fetchItemDetail(token, itemId);
-        return { title: item.title, url: item.permalink };
-      } catch {
-        return null;
-      }
-    }))).filter(Boolean);
+  if (!orderId) {
+    return {
+      orderId: null,
+      buyerName: cached?.buyerName || 'Cliente desconocido',
+      itemTitles: cached?.itemTitles || [],
+      itemLinks: cached?.itemLinks || [],
+      buyerId: cached?.buyerId || null,
+      saleDate: cached?.saleDate || null,
+      shippingChecked: true,
+      isFull: false,
+      shippingStatus: null,
+      shippingStatusLabel: null,
+      shippingSettled: true,
+    };
   }
 
-  return { orderId: orderId || null, buyerName, itemTitles, itemLinks, buyerId };
+  const order = await fetchOrderDetail(token, orderId);
+  const shippingInfo = await resolveShippingInfo(token, order);
+
+  if (hasCoreInfo) {
+    // Ya teníamos lo caro (comprador, títulos, permalinks de cada ítem) — solo se
+    // actualiza lo que sí puede haber cambiado (envío), sin volver a bajar cada
+    // ítem ni pedir el detalle del comprador de nuevo.
+    return { ...cached, saleDate: order.date_created || cached.saleDate, shippingChecked: true, ...shippingInfo };
+  }
+
+  // Primera vez que se ve este pack: hay que bajar todo desde cero.
+  const buyerName = buyerDisplayName(order.buyer);
+  const itemTitles = (order.order_items || []).map((oi) => oi.item?.title).filter(Boolean);
+  const buyerId = order.buyer?.id || null;
+
+  // El permalink real (con su slug de SEO) solo viene en el recurso completo del
+  // ítem, no en el resumen embebido dentro de la orden — por eso se consulta aparte.
+  const itemIds = (order.order_items || []).map((oi) => oi.item?.id).filter(Boolean);
+  const itemLinks = (await Promise.all(itemIds.map(async (itemId) => {
+    try {
+      const item = await fetchItemDetail(token, itemId);
+      return { title: item.title, url: item.permalink };
+    } catch {
+      return null;
+    }
+  }))).filter(Boolean);
+
+  return {
+    orderId,
+    buyerName,
+    itemTitles,
+    itemLinks,
+    buyerId,
+    saleDate: order.date_created || null,
+    shippingChecked: true,
+    ...shippingInfo,
+  };
 }
 
 async function syncPackById(token, packId, cache, unreadCount) {
@@ -324,6 +406,11 @@ async function syncPackById(token, packId, cache, unreadCount) {
     buyerId: info.buyerId,
     itemTitles: info.itemTitles,
     itemLinks: info.itemLinks || [],
+    saleDate: info.saleDate,
+    isFull: info.isFull,
+    shippingStatus: info.shippingStatus,
+    shippingStatusLabel: info.shippingStatusLabel,
+    shippingSettled: info.shippingSettled,
     unreadCount,
     status: finalStatus,
     lastQuestion,
@@ -539,7 +626,22 @@ async function runSyncInner() {
       // simplemente no lo toca — se conserva el último dato bueno.
       return;
     }
-    packs[r.packId] = { info: { orderId: r.orderId, buyerName: r.buyerName, buyerId: r.buyerId, itemTitles: r.itemTitles, itemLinks: r.itemLinks }, record: r };
+    packs[r.packId] = {
+      info: {
+        orderId: r.orderId,
+        buyerName: r.buyerName,
+        buyerId: r.buyerId,
+        itemTitles: r.itemTitles,
+        itemLinks: r.itemLinks,
+        saleDate: r.saleDate,
+        isFull: r.isFull,
+        shippingStatus: r.shippingStatus,
+        shippingStatusLabel: r.shippingStatusLabel,
+        shippingSettled: r.shippingSettled,
+        shippingChecked: true,
+      },
+      record: r,
+    };
     touched.add(r.packId);
   });
 
