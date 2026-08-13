@@ -1024,7 +1024,15 @@ app.post(
       }
       const { access_token: token } = await getAccessToken();
       const uploaded = await uploadAttachment(token, req.body, filename || 'adjunto', mimeType, 'MLM');
-      res.json({ filename: uploaded.filename, originalFilename: filename || null, mimeType });
+      // OJO: el campo que devuelve ML para el archivo ya subido se llama "id" (ej.
+      // "210438685_59f0f034....pdf"), NO "filename" — con el nombre equivocado esto
+      // fallaba en silencio: la subida "funcionaba" (sin error visible, con la
+      // tarjetita del archivo mostrándose normal), pero el identificador llegaba
+      // undefined y al publicar el adjunto se descartaba solo, sin avisar a nadie.
+      if (!uploaded.id) {
+        throw new Error('Mercado Libre no devolvió un identificador para el archivo subido');
+      }
+      res.json({ filename: uploaded.id, originalFilename: filename || null, mimeType });
     } catch (err) {
       console.error(err);
       res.status(err.status || 500).json({ error: err.message });
