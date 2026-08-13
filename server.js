@@ -736,6 +736,7 @@ async function getPackEntryOrThrow(packId) {
 async function regenerateDraftInner(packId) {
   const entry = await getPackEntryOrThrow(packId);
   const record = entry.record;
+  const previousText = record.draftAnswer?.text || null;
   const { access_token: token } = await getAccessToken();
   const frequentResponses = computeResponseBank(await loadAnswerLog()).filter((r) => r.count >= 3).slice(0, 15);
   const { text, imagesExcluded } = await generateDraftAnswer({
@@ -745,12 +746,18 @@ async function regenerateDraftInner(packId) {
     orderCreationDate: record.orderCreationDate,
     token,
     frequentResponses,
+    previousDraftText: previousText,
   });
   record.draftAnswer = {
     text,
     generatedAt: new Date().toISOString(),
     forQuestionDate: record.lastQuestion?.date || null,
     imagesExcluded,
+    // Si el texto salió idéntico al anterior, casi siempre es porque la respuesta
+    // correcta es una plantilla aprobada tal cual (factura, cabezal, etc.) — no un
+    // error. El frontend usa esto para avisarlo en vez de dejar que se sienta como
+    // que "Regenerar no hizo nada".
+    unchanged: Boolean(previousText && previousText === text),
   };
   await savePackEntry(packId, entry);
   return record.draftAnswer;

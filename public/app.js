@@ -1263,6 +1263,12 @@ async function handleDraftAction(e) {
       if (!res.ok) throw new Error(data.error || 'Error desconocido');
       state.editingDraftText = null;
       await loadMessages();
+      // Si el texto salió idéntico al anterior, no es que el botón no haya hecho
+      // nada — casi siempre significa que la respuesta correcta es una plantilla
+      // aprobada tal cual (factura, cabezal, etc.), que a propósito no debe variar.
+      if (data.draftAnswer?.unchanged) {
+        showToast('El texto no cambió: esta respuesta usa una plantilla aprobada que debe quedar igual siempre.', 'success');
+      }
     } catch (err) {
       showToast(`Error al regenerar borrador: ${err.message}`);
       regenBtn.disabled = false;
