@@ -1272,11 +1272,22 @@ input[type="search"] {
    superficie real de este panel — ver dataviz skill, references/palette.md. Los
    4 slots están en orden FIJO (Teresita/Frida/Faviola/Getzemany): el color sigue
    a la persona, nunca a su posición en el ranking, así que un filtro que quite a
-   alguien no le repinta el color a las demás. */
+   alguien no le repinta el color a las demás.
+
+   NO TOCAR --series-1..4 sin correr scripts/validate_palette.js del skill de
+   dataviz contra --mode light y --mode dark (ver comentario junto a cada línea
+   de :root de arriba para los tokens de superficie reales de este tema). */
 .chart-toggle-row { padding: 0.65rem 1.25rem; border-bottom: 1px solid var(--border); }
+#chartToggleBtn { transition: background 0.15s ease, border-color 0.15s ease; }
 
 .viz-root {
-  --chart-surface: var(--surface);
+  /* Tono ligeramente distinto al de la página (surface-2 en vez de surface) —
+     así el panel se lee como un widget de dashboard aparte del resto de tiras
+     de la Bitácora, sin necesitar márgenes/bordes propios que rompan el ritmo
+     visual de las demás secciones (live-now, log-filters, log-list). El halo
+     del punto final de cada línea (.chart-series-dot) usa este mismo token, así
+     que siempre calza con el fondo real del panel. */
+  --chart-surface: var(--surface-2);
   --chart-ink: var(--text);
   --chart-ink-muted: var(--muted);
   --chart-grid: var(--border);
@@ -1301,37 +1312,156 @@ input[type="search"] {
 }
 
 .chart-panel {
-  padding: 1rem 1.25rem 1.25rem;
+  padding: 1.15rem 1.25rem 1.35rem;
   border-bottom: 1px solid var(--border);
   background: var(--chart-surface);
 }
-.chart-filters { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 0.9rem; }
+
+.chart-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.85rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.1rem;
+}
+.chart-panel-heading { min-width: 0; }
+.chart-panel-title { margin: 0; font-size: 1.05rem; font-weight: 700; color: var(--chart-ink); }
+.chart-panel-subtitle { margin: 0.2rem 0 0; font-size: 0.82rem; color: var(--chart-ink-muted); }
+
+.chart-filters-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 0.5rem; }
+.chart-filters { display: flex; gap: 0.4rem; flex-wrap: wrap; justify-content: flex-end; }
 .chart-filters .chip-toggle[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+
+/* Selector de rango personalizado — aparece debajo de los chips de preset al
+   elegir "📅 Elegir fechas" (ver renderChart()/el.chartFilters en app.js). */
+.chart-custom-range {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.chart-custom-range input[type="date"] {
+  height: 34px;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.85rem;
+}
+.chart-custom-range-sep { color: var(--muted); }
+.chart-custom-range-apply { padding: 0.4rem 0.85rem; font-size: 0.85rem; }
+
+/* ---- Tarjetas de resumen (una por persona) ---- */
+.chart-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.65rem;
+  margin-bottom: 1.15rem;
+}
+.chart-stat-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.7rem 0.8rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+  animation: chart-stat-in 0.4s ease both;
+}
+.chart-stat-tile:hover { transform: translateY(-1px); box-shadow: var(--shadow-sm); border-color: var(--muted); }
+.chart-stat-tile:nth-child(1) { animation-delay: 0ms; }
+.chart-stat-tile:nth-child(2) { animation-delay: 60ms; }
+.chart-stat-tile:nth-child(3) { animation-delay: 120ms; }
+.chart-stat-tile:nth-child(4) { animation-delay: 180ms; }
+@keyframes chart-stat-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+.chart-stat-head { display: flex; align-items: center; gap: 0.4rem; }
+.chart-stat-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.chart-stat-name { font-size: 0.8rem; font-weight: 600; color: var(--chart-ink-muted); }
+.chart-stat-figures { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; }
+.chart-stat-value { font-size: 1.55rem; font-weight: 800; line-height: 1; color: var(--chart-ink); font-variant-numeric: tabular-nums; }
+.chart-stat-spark { width: 56px; height: 20px; flex-shrink: 0; overflow: visible; }
+.chart-stat-spark path { fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.chart-stat-trend { display: flex; align-items: center; gap: 0.3rem; font-size: 0.74rem; font-weight: 700; }
+.chart-stat-trend-label { color: var(--chart-ink-muted); font-weight: 500; }
+.chart-stat-trend--up { color: var(--answered); }
+.chart-stat-trend--down { color: var(--mediation); }
+.chart-stat-trend--flat { color: var(--chart-ink-muted); }
 
 .chart-body { position: relative; }
 
 .chart-legend {
   display: flex;
-  gap: 1rem;
+  gap: 0.4rem;
   flex-wrap: wrap;
-  margin-bottom: 0.6rem;
+  margin-bottom: 0.7rem;
   font-size: 0.82rem;
 }
-.chart-legend-item { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--chart-ink); }
-.chart-legend-key { display: inline-block; width: 16px; height: 2px; border-radius: 1px; flex-shrink: 0; }
+.chart-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.28rem 0.65rem 0.28rem 0.55rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--chart-ink);
+  font: inherit;
+  cursor: pointer;
+  transition: opacity 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+.chart-legend-item:hover, .chart-legend-item:focus-visible {
+  background: var(--surface); border-color: var(--border); outline: none;
+}
+.chart-legend-key { display: inline-block; width: 18px; height: 3px; border-radius: 2px; flex-shrink: 0; }
+
+/* Pasar el mouse (o el foco, con teclado) por un nombre de la leyenda resalta su
+   línea/área/punto y atenúa las demás — el color de cada quien sigue siendo el
+   mismo de siempre, esto solo sube/baja opacidad y grosor, nunca reasigna
+   colores. data-hover-series lo pone/quita app.js en #chartBody. */
+.chart-body[data-hover-series] .chart-legend-item,
+.chart-body[data-hover-series] .chart-series-line,
+.chart-body[data-hover-series] .chart-series-area,
+.chart-body[data-hover-series] .chart-series-dot {
+  opacity: 0.3;
+}
+.chart-body[data-hover-series="1"] [data-series="1"],
+.chart-body[data-hover-series="2"] [data-series="2"],
+.chart-body[data-hover-series="3"] [data-series="3"],
+.chart-body[data-hover-series="4"] [data-series="4"] {
+  opacity: 1;
+}
+.chart-body[data-hover-series="1"] .chart-series-line[data-series="1"],
+.chart-body[data-hover-series="2"] .chart-series-line[data-series="2"],
+.chart-body[data-hover-series="3"] .chart-series-line[data-series="3"],
+.chart-body[data-hover-series="4"] .chart-series-line[data-series="4"] {
+  stroke-width: 3.25;
+}
 
 .chart-svg-wrap { position: relative; width: 100%; }
-.chart-svg-wrap svg { display: block; width: 100%; height: auto; }
+.chart-svg-wrap svg { display: block; width: 100%; height: auto; overflow: visible; }
 .chart-svg-wrap text { font-family: inherit; }
 
-/* La línea usa el color de la serie; el eje/rejilla y el texto SIEMPRE usan
-   tokens de tinta, nunca el color de una serie (un amarillo/aqua como texto no
-   se lee bien sobre la superficie) — ver marks-and-anatomy.md. */
+/* La línea/área usan el color de la serie; el eje/rejilla y el texto SIEMPRE
+   usan tokens de tinta, nunca el color de una serie (un amarillo/aqua como
+   texto no se lee bien sobre la superficie) — ver marks-and-anatomy.md. */
 .chart-axis-line { stroke: var(--chart-grid); stroke-width: 1; }
 .chart-gridline { stroke: var(--chart-grid); stroke-width: 1; }
 .chart-axis-label { fill: var(--chart-ink-muted); font-size: 11px; }
-.chart-series-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
-.chart-series-dot { stroke: var(--chart-surface); stroke-width: 2; }
+.chart-series-line {
+  fill: none;
+  stroke-width: 2.25;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  transition: opacity 0.15s ease, stroke-width 0.15s ease;
+}
+.chart-series-area { pointer-events: none; opacity: 0; animation: chart-area-in 0.6s ease forwards; animation-delay: 0.1s; }
+@keyframes chart-area-in { to { opacity: 1; } }
+.chart-series-dot { stroke: var(--chart-surface); stroke-width: 2; transition: opacity 0.15s ease; }
+.chart-hover-dot { stroke: var(--chart-surface); stroke-width: 2; pointer-events: none; }
 
 .chart-crosshair { stroke: var(--chart-ink-muted); stroke-width: 1; stroke-dasharray: 3 3; pointer-events: none; }
 .chart-hit-layer { fill: transparent; cursor: crosshair; }
@@ -1339,21 +1469,36 @@ input[type="search"] {
 .chart-tooltip {
   position: absolute;
   pointer-events: none;
-  background: var(--surface-2);
+  background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  box-shadow: var(--shadow-md);
-  padding: 0.5rem 0.65rem;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  padding: 0.65rem 0.8rem;
   font-size: 0.8rem;
-  min-width: 150px;
+  min-width: 174px;
   z-index: 5;
   transition: opacity 0.08s ease;
 }
-.chart-tooltip-date { font-weight: 700; color: var(--chart-ink); margin-bottom: 0.3rem; }
-.chart-tooltip-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.1rem 0; }
-.chart-tooltip-key { display: inline-block; width: 12px; height: 2px; border-radius: 1px; flex-shrink: 0; }
+.chart-tooltip-date { font-weight: 700; color: var(--chart-ink); margin-bottom: 0.45rem; font-size: 0.85rem; }
+.chart-tooltip-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.12rem 0; }
+.chart-tooltip-key { display: inline-block; width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 .chart-tooltip-name { color: var(--chart-ink-muted); flex: 1; }
-.chart-tooltip-value { color: var(--chart-ink); font-weight: 700; }
+.chart-tooltip-value { color: var(--chart-ink); font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
+.chart-tooltip-delta { font-size: 0.7rem; font-weight: 700; }
+.chart-tooltip-delta.is-up { color: var(--answered); }
+.chart-tooltip-delta.is-down { color: var(--mediation); }
+.chart-tooltip-total {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+  padding-top: 0.45rem;
+  border-top: 1px dashed var(--border);
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: var(--chart-ink-muted);
+}
+.chart-tooltip-total span:last-child { color: var(--chart-ink); font-weight: 700; }
 
 .chart-table-toggle { margin-top: 0.85rem; }
 .chart-table-wrap { margin-top: 0.75rem; overflow-x: auto; }
@@ -1361,6 +1506,27 @@ input[type="search"] {
 .chart-table-wrap th, .chart-table-wrap td { text-align: left; padding: 0.4rem 0.7rem; border-bottom: 1px solid var(--border); }
 .chart-table-wrap th { color: var(--muted); font-weight: 600; white-space: nowrap; }
 .chart-table-wrap td { font-variant-numeric: tabular-nums; }
+
+@media (max-width: 760px) {
+  .chart-panel-head { flex-direction: column; align-items: stretch; }
+  .chart-stats { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 480px) {
+  .chart-stats { grid-template-columns: 1fr; }
+}
+
+/* La regla global de prefers-reduced-motion (ver arriba en este archivo) ya
+   anula la DURACIÓN de cualquier animation/transition — pero no toca
+   animation-delay, así que sin esto las tarjetas de resumen y el área bajo la
+   curva quedarían invisibles durante el delay y luego "aparecerían de golpe".
+   El dibujado de la línea (stroke-dashoffset) ni siquiera arranca con
+   reduced-motion — ver animateChartLines() en app.js. */
+@media (prefers-reduced-motion: reduce) {
+  .chart-stat-tile,
+  .chart-series-area {
+    animation-delay: 0ms !important;
+  }
+}
 
 .log-filters {
   display: flex;

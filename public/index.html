@@ -98,14 +98,33 @@
       </div>
 
       <div id="chartPanel" class="chart-panel viz-root" hidden data-palette="#2a78d6,#eb6834,#1baf7a,#eda100">
-        <div class="chart-filters" role="group" aria-label="Rango de fechas">
-          <button type="button" class="chip-toggle" data-range="7">Últimos 7 días</button>
-          <button type="button" class="chip-toggle" data-range="30" aria-pressed="true">Últimos 30 días</button>
-          <button type="button" class="chip-toggle" data-range="90">Últimos 90 días</button>
-          <button type="button" class="chip-toggle" data-range="all">Todo</button>
+        <div class="chart-panel-head">
+          <div class="chart-panel-heading">
+            <h3 class="chart-panel-title">Respuestas publicadas por persona</h3>
+            <p id="chartRangeLabel" class="chart-panel-subtitle">Últimos 30 días</p>
+          </div>
+          <div class="chart-filters-wrap">
+            <div class="chart-filters" role="group" aria-label="Rango de fechas">
+              <button type="button" class="chip-toggle" data-range="7">7 días</button>
+              <button type="button" class="chip-toggle" data-range="30" aria-pressed="true">30 días</button>
+              <button type="button" class="chip-toggle" data-range="90">90 días</button>
+              <button type="button" class="chip-toggle" data-range="all">Todo</button>
+              <button type="button" class="chip-toggle" data-range="custom" aria-pressed="false">📅 Elegir fechas</button>
+            </div>
+            <div id="chartCustomRange" class="chart-custom-range" hidden>
+              <label class="visually-hidden" for="chartRangeFrom">Desde</label>
+              <input type="date" id="chartRangeFrom" />
+              <span class="chart-custom-range-sep">–</span>
+              <label class="visually-hidden" for="chartRangeTo">Hasta</label>
+              <input type="date" id="chartRangeTo" />
+              <button type="button" id="chartCustomRangeApply" class="btn-primary chart-custom-range-apply">Aplicar</button>
+            </div>
+          </div>
         </div>
 
-        <div class="chart-body">
+        <div id="chartStats" class="chart-stats"></div>
+
+        <div id="chartBody" class="chart-body">
           <div id="chartLegend" class="chart-legend"></div>
           <div id="chartSvgWrap" class="chart-svg-wrap"></div>
           <p id="chartEmptyState" class="empty-state" hidden>Nadie de este grupo ha publicado respuestas en este rango.</p>

@@ -79,7 +79,14 @@ const el = {
   logEmptyState: document.getElementById('logEmptyState'),
   chartToggleBtn: document.getElementById('chartToggleBtn'),
   chartPanel: document.getElementById('chartPanel'),
+  chartRangeLabel: document.getElementById('chartRangeLabel'),
   chartFilters: document.querySelector('.chart-filters'),
+  chartCustomRange: document.getElementById('chartCustomRange'),
+  chartRangeFrom: document.getElementById('chartRangeFrom'),
+  chartRangeTo: document.getElementById('chartRangeTo'),
+  chartCustomRangeApply: document.getElementById('chartCustomRangeApply'),
+  chartStats: document.getElementById('chartStats'),
+  chartBody: document.getElementById('chartBody'),
   chartLegend: document.getElementById('chartLegend'),
   chartSvgWrap: document.getElementById('chartSvgWrap'),
   chartEmptyState: document.getElementById('chartEmptyState'),
@@ -661,6 +668,15 @@ const CHART_PEOPLE = [
   { email: 'getzemany.lazo@marvelsa.com', name: 'Getzemany', series: 4 },
 ];
 
+// Si el sistema pide "menos movimiento" nos saltamos la animación de "dibujado"
+// de la línea (ver animateChartLines) — la duración global ya se anula en
+// style.css para cualquier animation/transition, pero acá además evitamos armar
+// el estado inicial (dasharray a toda la longitud) para no dejar la línea "a
+// medio dibujar" ni un instante en la vista.
+const prefersReducedMotion = window.matchMedia
+  ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  : false;
+
 // Clave de día en hora LOCAL (no UTC) — mismo criterio que dayLabel() de arriba,
 // para que "hoy"/"ayer" coincidan entre la bitácora y la gráfica.
 function chartDayKey(dateLike) {
@@ -673,22 +689,65 @@ function formatChartDayLabel(key) {
   return new Date(y, m - 1, d).toLocaleDateString('es-MX', { day: 'numeric', month: 'short' });
 }
 
-// Arma los días del eje X (todos, aunque no haya actividad ese día — para que la
-// línea no salte fechas) y, para cada una de las 4 personas, cuántas respuestas
-// publicó por día. `rangeDays` es un número de días hacia atrás, o 'all'.
-function computeChartData(rangeDays) {
+// Rango personalizado elegido a mano: { custom: true, from: 'YYYY-MM-DD', to: 'YYYY-MM-DD' }
+// — las demás formas de `chartRangeDays` (7/30/90 o 'all') siguen siendo lo que ya
+// manejaban chartRangeLabelText/computeChartData/computeChartTrend.
+function isCustomChartRange(rangeDays) {
+  return Boolean(rangeDays && typeof rangeDays === 'object' && rangeDays.custom);
+}
+
+// A partir de un `rangeDays` (número de días, 'all', o rango personalizado),
+// resuelve el día de inicio real (Date o null si es "Todo") y de fin real (Date,
+// normalmente hoy — pero un rango personalizado puede terminar en el pasado).
+function resolveChartWindow(rangeDays) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  let startDate = null;
-  if (rangeDays !== 'all') {
-    startDate = new Date(today);
-    startDate.setDate(startDate.getDate() - (rangeDays - 1));
+  if (isCustomChartRange(rangeDays)) {
+    const [fy, fm, fd] = rangeDays.from.split('-').map(Number);
+    const [ty, tm, td] = rangeDays.to.split('-').map(Number);
+    let start = new Date(fy, fm - 1, fd);
+    let end = new Date(ty, tm - 1, td);
+    if (end < start) [start, end] = [end, start]; // por si el usuario invierte "desde"/"hasta"
+    return { start, end };
   }
+  if (rangeDays === 'all') return { start: null, end: today };
+  const start = new Date(today);
+  start.setDate(start.getDate() - (rangeDays - 1));
+  return { start, end: today };
+}
+
+function chartRangeLabelText(rangeDays) {
+  if (isCustomChartRange(rangeDays)) {
+    // Usa el rango YA resuelto (con "desde"/"hasta" reordenados si el usuario
+    // los invirtió, ver resolveChartWindow) — mostrar rangeDays.from/to "en
+    // crudo" aquí desincroniza la etiqueta del dato real que sí se grafica
+    // cuando from > to.
+    const { start, end } = resolveChartWindow(rangeDays);
+    return `${formatChartDayLabel(chartDayKey(start))} – ${formatChartDayLabel(chartDayKey(end))}`;
+  }
+  if (rangeDays === 'all') return 'Todo el historial';
+  if (rangeDays === 7) return 'Últimos 7 días';
+  if (rangeDays === 90) return 'Últimos 90 días';
+  return 'Últimos 30 días';
+}
+
+// Arma los días del eje X (todos, aunque no haya actividad ese día — para que la
+// línea no salte fechas) y, para cada una de las 4 personas, cuántas respuestas
+// publicó por día. `rangeDays` es un número de días hacia atrás, 'all', o un
+// rango personalizado (ver isCustomChartRange).
+function computeChartData(rangeDays) {
+  const { start: startDate, end: endDate } = resolveChartWindow(rangeDays);
+  // Fin de ese día completo (23:59:59.999) — un rango personalizado puede
+  // terminar en el pasado, así que no basta con comparar contra "ahora".
+  const endOfEndDate = new Date(endDate);
+  endOfEndDate.setHours(23, 59, 59, 999);
 
   const relevant = state.logEntries.filter((e) => {
     if (!CHART_PEOPLE.some((p) => p.email === e.answeredBy)) return false;
-    if (startDate && new Date(e.date) < startDate) return false;
+    const d = new Date(e.date);
+    if (startDate && d < startDate) return false;
+    if (d > endOfEndDate) return false;
     return true;
   });
 
@@ -708,7 +767,7 @@ function computeChartData(rangeDays) {
 
   const days = [];
   const cursor = new Date(firstDate);
-  while (cursor <= today) {
+  while (cursor <= endDate) {
     days.push(chartDayKey(cursor));
     cursor.setDate(cursor.getDate() + 1);
   }
@@ -727,9 +786,100 @@ function computeChartData(rangeDays) {
   return { days, series };
 }
 
+// Total de respuestas de cada persona dentro de una ventana [start, endExclusivo)
+// — nada más para comparar contra el período anterior en las tarjetas de resumen;
+// no toca ni reemplaza el cálculo día-por-día de computeChartData().
+function sumPersonsInWindow(startDate, endExclusive) {
+  const totals = new Map(CHART_PEOPLE.map((p) => [p.email, 0]));
+  state.logEntries.forEach((e) => {
+    if (!totals.has(e.answeredBy)) return;
+    const d = new Date(e.date);
+    if (d < startDate || d >= endExclusive) return;
+    totals.set(e.answeredBy, totals.get(e.answeredBy) + 1);
+  });
+  return totals;
+}
+
+// Compara el total de cada persona contra el mismo número de días inmediatamente
+// anterior al rango activo (mismo tamaño de ventana). En "Todo" no existe un
+// período anterior de tamaño comparable, así que no se calcula tendencia — mejor
+// omitirla que inventar una base falsa.
+function computeChartTrend(rangeDays) {
+  if (rangeDays === 'all') return null;
+  const { start, end } = resolveChartWindow(rangeDays);
+  // "end" es inclusivo (el último día del rango) — el tamaño de la ventana en
+  // días cuenta ambos extremos, igual para un preset (7/30/90) que para un rango
+  // personalizado de cualquier tamaño.
+  const spanDays = Math.round((end - start) / 86400000) + 1;
+  const previousStart = new Date(start);
+  previousStart.setDate(previousStart.getDate() - spanDays);
+  return sumPersonsInWindow(previousStart, start);
+}
+
 // Geometría del último render — la guarda el hover/tooltip para no tener que
 // recalcular todo en cada movimiento del mouse. Se recalcula en cada renderChart().
 let chartGeometry = null;
+
+// Curva monótona (interpolación de Hermite con tangentes de Fritsch–Butland) en
+// vez de un spline Catmull-Rom genérico: suaviza los quiebres rectos pero NUNCA
+// hace overshoot más allá de los dos puntos que conecta (con conteos chicos
+// —0, 1, 2 respuestas por día— un Catmull-Rom normal sí puede "inflar" un pico
+// falso entre dos ceros). Ver dataviz skill, anti-patterns.md.
+function monotoneLinePath(points) {
+  const n = points.length;
+  if (n === 0) return '';
+  if (n === 1) return `M ${points[0][0].toFixed(2)},${points[0][1].toFixed(2)}`;
+  const xs = points.map((p) => p[0]);
+  const ys = points.map((p) => p[1]);
+  if (n === 2) {
+    return `M ${xs[0].toFixed(2)},${ys[0].toFixed(2)} L ${xs[1].toFixed(2)},${ys[1].toFixed(2)}`;
+  }
+
+  const h = [];
+  const delta = [];
+  for (let i = 0; i < n - 1; i++) {
+    h[i] = xs[i + 1] - xs[i];
+    delta[i] = h[i] === 0 ? 0 : (ys[i + 1] - ys[i]) / h[i];
+  }
+
+  const m = new Array(n);
+  m[0] = delta[0];
+  m[n - 1] = delta[n - 2];
+  for (let i = 1; i < n - 1; i++) {
+    if (delta[i - 1] === 0 || delta[i] === 0 || (delta[i - 1] > 0) !== (delta[i] > 0)) {
+      m[i] = 0;
+    } else {
+      const w1 = 2 * h[i] + h[i - 1];
+      const w2 = h[i] + 2 * h[i - 1];
+      m[i] = (w1 + w2) / (w1 / delta[i - 1] + w2 / delta[i]);
+    }
+  }
+
+  let d = `M ${xs[0].toFixed(2)},${ys[0].toFixed(2)} `;
+  for (let i = 0; i < n - 1; i++) {
+    const cp1x = xs[i] + h[i] / 3;
+    const cp1y = ys[i] + (m[i] * h[i]) / 3;
+    const cp2x = xs[i + 1] - h[i] / 3;
+    const cp2y = ys[i + 1] - (m[i + 1] * h[i]) / 3;
+    d += `C ${cp1x.toFixed(2)},${cp1y.toFixed(2)} ${cp2x.toFixed(2)},${cp2y.toFixed(2)} ${xs[i + 1].toFixed(2)},${ys[i + 1].toFixed(2)} `;
+  }
+  return d.trim();
+}
+
+// Mini-trazo de cada tarjeta de resumen: mismo dato de la serie (values por día
+// de computeChartData), solo que auto-escalado a su propio mínimo/máximo para
+// que se note el vaivén incluso cuando el total del período es chico.
+function buildSparkPath(values) {
+  const w = 56;
+  const h = 20;
+  const pad = 2;
+  const n = values.length;
+  if (!n) return '';
+  const max = Math.max(1, ...values);
+  const x = (i) => (n > 1 ? pad + (i / (n - 1)) * (w - pad * 2) : w / 2);
+  const y = (v) => pad + (h - pad * 2) - (v / max) * (h - pad * 2);
+  return monotoneLinePath(values.map((v, i) => [x(i), y(v)]));
+}
 
 function buildChartSvg(days, series) {
   const width = 760;
@@ -752,6 +902,7 @@ function buildChartSvg(days, series) {
 
   const xForIndex = (i) => marginLeft + (days.length > 1 ? (i / (days.length - 1)) * plotW : plotW / 2);
   const yForValue = (v) => marginTop + plotH - (v / niceMax) * plotH;
+  const baselineY = marginTop + plotH;
 
   const gridlinesHtml = Array.from({ length: yTicks + 1 }, (_, i) => {
     const value = (niceMax / yTicks) * i;
@@ -771,22 +922,54 @@ function buildChartSvg(days, series) {
     return `<text class="chart-axis-label" x="${x.toFixed(1)}" y="${height - 8}" text-anchor="middle">${escapeHtml(formatChartDayLabel(d))}</text>`;
   }).join('');
 
+  // Un degradado por serie para el relleno de área bajo la curva — mismo color
+  // que la línea, muy tenue (~16% arriba, transparente abajo) para dar "volumen"
+  // al día sin competir con la línea ni con la rejilla.
+  const defsHtml = `
+    <defs>
+      ${series.map((s) => `
+        <linearGradient id="chartAreaGrad-${s.series}" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" style="stop-color: var(--series-${s.series}); stop-opacity: 0.16" />
+          <stop offset="100%" style="stop-color: var(--series-${s.series}); stop-opacity: 0" />
+        </linearGradient>
+      `).join('')}
+    </defs>
+  `;
+
+  const areasHtml = series.map((s) => {
+    const points = s.values.map((v, i) => [xForIndex(i), yForValue(v)]);
+    const linePath = monotoneLinePath(points);
+    if (!linePath) return '';
+    const firstX = xForIndex(0).toFixed(2);
+    const lastX = xForIndex(s.values.length - 1).toFixed(2);
+    return `<path class="chart-series-area" data-series="${s.series}" d="${linePath} L ${lastX},${baselineY.toFixed(2)} L ${firstX},${baselineY.toFixed(2)} Z" fill="url(#chartAreaGrad-${s.series})" />`;
+  }).join('');
+
   const linesHtml = series.map((s) => {
-    const points = s.values.map((v, i) => `${xForIndex(i).toFixed(1)},${yForValue(v).toFixed(1)}`).join(' ');
+    const points = s.values.map((v, i) => [xForIndex(i), yForValue(v)]);
+    const d = monotoneLinePath(points);
     const lastIndex = s.values.length - 1;
     const endDot = lastIndex >= 0
-      ? `<circle class="chart-series-dot" cx="${xForIndex(lastIndex).toFixed(1)}" cy="${yForValue(s.values[lastIndex]).toFixed(1)}" r="4" style="fill: var(--series-${s.series})" />`
+      ? `<circle class="chart-series-dot" data-series="${s.series}" cx="${xForIndex(lastIndex).toFixed(1)}" cy="${yForValue(s.values[lastIndex]).toFixed(1)}" r="4" style="fill: var(--series-${s.series})" />`
       : '';
-    return `<polyline class="chart-series-line" points="${points}" style="stroke: var(--series-${s.series})" />${endDot}`;
+    return `<path class="chart-series-line" data-series="${s.series}" d="${d}" style="stroke: var(--series-${s.series})" />${endDot}`;
   }).join('');
+
+  // Puntos que solo se encienden durante el hover (ver showChartTooltip) — la
+  // cruceta "se clava" en la línea de cada persona en vez de dejar nada más una
+  // línea vertical genérica sin referencia a los valores.
+  const hoverDotsHtml = series.map((s) => `<circle class="chart-hover-dot" data-series="${s.series}" r="4" style="fill: var(--series-${s.series}); display:none" />`).join('');
 
   const svgHtml = `
     <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Respuestas publicadas por día, por persona">
+      ${defsHtml}
       <line class="chart-axis-line" x1="${marginLeft}" x2="${marginLeft}" y1="${marginTop}" y2="${marginTop + plotH}" />
       <line class="chart-axis-line" x1="${marginLeft}" x2="${width - marginRight}" y1="${marginTop + plotH}" y2="${marginTop + plotH}" />
       ${gridlinesHtml}
       ${xLabelsHtml}
+      ${areasHtml}
       ${linesHtml}
+      ${hoverDotsHtml}
       <line class="chart-crosshair" id="chartCrosshairLine" x1="0" x2="0" y1="${marginTop}" y2="${marginTop + plotH}" style="display:none" />
       <rect class="chart-hit-layer" x="${marginLeft}" y="${marginTop}" width="${plotW}" height="${plotH}" />
     </svg>
@@ -816,8 +999,108 @@ function renderChartTable(days, series) {
   `;
 }
 
+// Tarjetas de resumen arriba de la gráfica: total del rango activo + variación
+// vs. el período inmediatamente anterior + un mini-trazo, una por persona (mismo
+// orden fijo de CHART_PEOPLE/colores que el resto de la gráfica).
+function renderChartStats(days, series) {
+  if (!days.length) {
+    el.chartStats.innerHTML = '';
+    el.chartStats.hidden = true;
+    return;
+  }
+  el.chartStats.hidden = false;
+  const trendTotals = computeChartTrend(state.chartRangeDays);
+
+  el.chartStats.innerHTML = series.map((s) => {
+    const total = s.values.reduce((sum, v) => sum + v, 0);
+    const sparkD = buildSparkPath(s.values);
+    const sparkHtml = sparkD
+      ? `<svg class="chart-stat-spark" viewBox="0 0 56 20" preserveAspectRatio="none" aria-hidden="true"><path d="${sparkD}" style="stroke: var(--series-${s.series})" /></svg>`
+      : '';
+
+    let trendHtml = '';
+    if (trendTotals) {
+      const previous = trendTotals.get(s.email) || 0;
+      const delta = total - previous;
+      let trendClass = 'chart-stat-trend--flat';
+      let arrow = '•';
+      let deltaText = 'sin cambio';
+      if (delta > 0) { trendClass = 'chart-stat-trend--up'; arrow = '▲'; deltaText = `+${delta}`; }
+      else if (delta < 0) { trendClass = 'chart-stat-trend--down'; arrow = '▼'; deltaText = `${delta}`; }
+      trendHtml = `
+        <div class="chart-stat-trend ${trendClass}">
+          <span aria-hidden="true">${arrow}</span>
+          <span>${escapeHtml(deltaText)}</span>
+          <span class="chart-stat-trend-label">vs. período anterior</span>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="chart-stat-tile">
+        <div class="chart-stat-head">
+          <span class="chart-stat-dot" style="background: var(--series-${s.series})"></span>
+          <span class="chart-stat-name">${escapeHtml(s.name)}</span>
+        </div>
+        <div class="chart-stat-figures">
+          <span class="chart-stat-value">${total}</span>
+          ${sparkHtml}
+        </div>
+        ${trendHtml}
+      </div>
+    `;
+  }).join('');
+}
+
+// Dibuja cada línea de izquierda a derecha (stroke-dashoffset) en vez de
+// aparecer de golpe. Se salta la animación entera con prefers-reduced-motion en
+// vez de solo acortarla, para no dejar un delay de "aparece de repente" pegado a
+// una transición de 0.01ms.
+function animateChartLines() {
+  const svg = el.chartSvgWrap.querySelector('svg');
+  if (!svg) return;
+  const lines = svg.querySelectorAll('.chart-series-line');
+  if (prefersReducedMotion) return;
+  lines.forEach((line) => {
+    const length = line.getTotalLength();
+    // Un rango de un solo día (ej. "desde" y "hasta" el mismo día en el
+    // selector personalizado) produce un path de un solo punto ("M x,y", sin
+    // segmento) — length es 0, y animar "0 a 0" nunca dispara transitionend,
+    // así que el cleanup de abajo no correría y el estilo inline de transición
+    // quedaría pegado para siempre en esa línea. Nada que dibujar, nada que
+    // animar.
+    if (!length) return;
+    line.style.strokeDasharray = `${length}`;
+    line.style.strokeDashoffset = `${length}`;
+    // Fuerza el reflow antes de animar — si no, el navegador colapsa el cambio
+    // de dashoffset "de 0 a 0" y la línea aparece de golpe sin transición.
+    line.getBoundingClientRect();
+    line.style.transition = 'stroke-dashoffset 0.7s ease';
+    line.style.strokeDashoffset = '0';
+    // El estilo inline de arriba (solo stroke-dashoffset) le gana por completo
+    // a la transición de opacity/stroke-width del hover de la leyenda que trae
+    // la hoja de estilos (.chart-series-line en style.css) mientras exista —
+    // sin este cleanup, resaltar a alguien en la leyenda dejaría de animarse
+    // suave después de la primera carga.
+    line.addEventListener('transitionend', () => {
+      line.style.transition = '';
+      line.style.strokeDasharray = '';
+      line.style.strokeDashoffset = '';
+    }, { once: true });
+  });
+}
+
 function renderChart() {
   if (!state.chartOpen) return;
+
+  // Por si el cambio de rango se dispara mientras el mouse/foco seguía sobre un
+  // nombre de la leyenda del render anterior: el navegador no garantiza que
+  // mouseout/focusout disparen cuando el elemento resaltado se destruye vía
+  // innerHTML (ver renderChart más abajo) — sin este reset podía quedar una
+  // serie resaltada/las demás atenuadas "pegado" de un rango que ya no se ve.
+  delete el.chartBody.dataset.hoverSeries;
+
+  el.chartRangeLabel.textContent = chartRangeLabelText(state.chartRangeDays);
 
   const { days, series } = computeChartData(state.chartRangeDays);
   const hasData = days.length > 0;
@@ -829,15 +1112,23 @@ function renderChart() {
     el.chartSvgWrap.innerHTML = '';
     el.chartLegend.innerHTML = '';
     chartGeometry = null;
+    // Mismo motivo que el reset de abajo (rama con datos): el tooltip vive
+    // como hijo de chartSvgWrap, así que el innerHTML de arriba ya se lo llevó
+    // entre las patas — sin este reset, ensureChartTooltip() seguiría
+    // apuntando a un nodo desconectado si se vuelve a esta rama otra vez.
+    chartTooltipEl = null;
+    renderChartStats([], []);
     renderChartTable([], []);
     return;
   }
 
   el.chartLegend.innerHTML = series.map((s) => `
-    <span class="chart-legend-item">
+    <button type="button" class="chart-legend-item" data-series="${s.series}">
       <span class="chart-legend-key" style="background: var(--series-${s.series})"></span>${escapeHtml(s.name)}
-    </span>
+    </button>
   `).join('');
+
+  renderChartStats(days, series);
 
   const geometry = buildChartSvg(days, series);
   el.chartSvgWrap.innerHTML = geometry.svgHtml;
@@ -847,6 +1138,8 @@ function renderChart() {
   // ensureChartTooltip() seguiría reusando ese nodo desconectado y el tooltip
   // dejaría de aparecer después del primer cambio de rango.
   chartTooltipEl = null;
+
+  animateChartLines();
 
   if (state.chartTableView) renderChartTable(days, series);
 }
@@ -864,19 +1157,35 @@ function ensureChartTooltip() {
 
 function showChartTooltip(index, pointerX, pointerY) {
   if (!chartGeometry) return;
-  const { days, series, xForIndex } = chartGeometry;
+  const { days, series, xForIndex, yForValue } = chartGeometry;
   const tooltip = ensureChartTooltip();
   const wrapRect = el.chartSvgWrap.getBoundingClientRect();
+  const dayTotal = series.reduce((sum, s) => sum + s.values[index], 0);
 
   tooltip.innerHTML = `
     <div class="chart-tooltip-date">${escapeHtml(formatChartDayLabel(days[index]))}</div>
-    ${series.map((s) => `
-      <div class="chart-tooltip-row">
-        <span class="chart-tooltip-key" style="background: var(--series-${s.series})"></span>
-        <span class="chart-tooltip-name">${escapeHtml(s.name)}</span>
-        <span class="chart-tooltip-value">${s.values[index]}</span>
-      </div>
-    `).join('')}
+    ${series.map((s) => {
+      const value = s.values[index];
+      // Tendencia día-contra-día de esta persona (mismo dato de la serie, nada
+      // nuevo) — se omite en el primer día del rango, donde no hay "anterior".
+      const prev = index > 0 ? s.values[index - 1] : null;
+      const delta = prev == null ? 0 : value - prev;
+      const deltaHtml = delta
+        ? `<span class="chart-tooltip-delta ${delta > 0 ? 'is-up' : 'is-down'}">${delta > 0 ? '▲' : '▼'}${Math.abs(delta)}</span>`
+        : '';
+      return `
+        <div class="chart-tooltip-row">
+          <span class="chart-tooltip-key" style="background: var(--series-${s.series})"></span>
+          <span class="chart-tooltip-name">${escapeHtml(s.name)}</span>
+          <span class="chart-tooltip-value">${value}</span>
+          ${deltaHtml}
+        </div>
+      `;
+    }).join('')}
+    <div class="chart-tooltip-total">
+      <span>Total del día</span>
+      <span>${dayTotal}</span>
+    </div>
   `;
   tooltip.hidden = false;
 
@@ -884,7 +1193,7 @@ function showChartTooltip(index, pointerX, pointerY) {
   // lado si se saldría por el borde derecho.
   let left = pointerX - wrapRect.left + 14;
   const top = Math.max(0, pointerY - wrapRect.top - 20);
-  if (left + 170 > wrapRect.width) left = pointerX - wrapRect.left - 170 - 14;
+  if (left + 190 > wrapRect.width) left = pointerX - wrapRect.left - 190 - 14;
   tooltip.style.left = `${left}px`;
   tooltip.style.top = `${top}px`;
 
@@ -896,12 +1205,25 @@ function showChartTooltip(index, pointerX, pointerY) {
     crosshair.setAttribute('x2', x);
     crosshair.style.display = '';
   }
+  // "Clava" un punto por serie sobre la línea en el día del hover, además de la
+  // cruceta vertical — ver hoverDotsHtml en buildChartSvg().
+  if (svg) {
+    series.forEach((s) => {
+      const dot = svg.querySelector(`.chart-hover-dot[data-series="${s.series}"]`);
+      if (!dot) return;
+      dot.setAttribute('cx', xForIndex(index).toFixed(1));
+      dot.setAttribute('cy', yForValue(s.values[index]).toFixed(1));
+      dot.style.display = '';
+    });
+  }
 }
 
 function hideChartTooltip() {
   if (chartTooltipEl) chartTooltipEl.hidden = true;
-  const crosshair = el.chartSvgWrap.querySelector('#chartCrosshairLine');
+  const svg = el.chartSvgWrap.querySelector('svg');
+  const crosshair = svg?.querySelector('#chartCrosshairLine');
   if (crosshair) crosshair.style.display = 'none';
+  svg?.querySelectorAll('.chart-hover-dot').forEach((dot) => { dot.style.display = 'none'; });
 }
 
 function handleChartPointerMove(e) {
@@ -923,6 +1245,22 @@ function handleChartPointerMove(e) {
 el.chartSvgWrap.addEventListener('pointermove', handleChartPointerMove);
 el.chartSvgWrap.addEventListener('pointerleave', hideChartTooltip);
 
+// Pasar el mouse (o el foco, con teclado) sobre un nombre de la leyenda resalta
+// su línea/área y atenúa las demás — data-hover-series en #chartBody, leído
+// desde CSS (ver ".chart-body[data-hover-series]" en style.css). Los listeners
+// van en el contenedor, no en cada botón, porque renderChart() reconstruye la
+// leyenda entera (innerHTML) cada vez que cambia el rango.
+function setChartHoverSeries(target, seriesNum) {
+  const item = target.closest ? target.closest('.chart-legend-item') : null;
+  if (!item) return;
+  if (seriesNum) el.chartBody.dataset.hoverSeries = item.dataset.series;
+  else delete el.chartBody.dataset.hoverSeries;
+}
+el.chartLegend.addEventListener('mouseover', (e) => setChartHoverSeries(e.target, true));
+el.chartLegend.addEventListener('mouseout', (e) => setChartHoverSeries(e.target, false));
+el.chartLegend.addEventListener('focusin', (e) => setChartHoverSeries(e.target, true));
+el.chartLegend.addEventListener('focusout', (e) => setChartHoverSeries(e.target, false));
+
 el.chartToggleBtn.addEventListener('click', () => {
   state.chartOpen = !state.chartOpen;
   el.chartPanel.hidden = !state.chartOpen;
@@ -933,13 +1271,66 @@ el.chartToggleBtn.addEventListener('click', () => {
   if (state.chartOpen) renderChart();
 });
 
+// No se puede elegir una fecha futura — no hay respuestas que mostrar ahí.
+const chartTodayStr = chartDayKey(new Date());
+el.chartRangeFrom.max = chartTodayStr;
+el.chartRangeTo.max = chartTodayStr;
+
 el.chartFilters.addEventListener('click', (e) => {
   const btn = e.target.closest('[data-range]');
   if (!btn) return;
   const { range } = btn.dataset;
+
+  if (range === 'custom') {
+    // Solo abre/cierra el selector de fechas — no cambia el rango activo hasta
+    // que se le dé clic a "Aplicar", así no se rompe lo que ya se estaba viendo.
+    const willShow = el.chartCustomRange.hidden;
+    el.chartCustomRange.hidden = !willShow;
+    if (willShow) {
+      // Sincroniza los campos con el rango ACTIVO cada vez que se abre el
+      // selector, no solo la primera vez que estaban en blanco — si no, tras
+      // aplicar un rango personalizado, cambiar a un preset (7/30/90/Todo) y
+      // volver a abrir el selector, quedaban pegadas las fechas del rango
+      // personalizado anterior (sin relación con el preset que en verdad se
+      // está viendo), y "Aplicar" sin tocar nada reaplicaría ese rango viejo.
+      if (isCustomChartRange(state.chartRangeDays)) {
+        el.chartRangeFrom.value = state.chartRangeDays.from;
+        el.chartRangeTo.value = state.chartRangeDays.to;
+      } else {
+        // Precarga con el rango activo actual (o los últimos 30 días si no hay
+        // un equivalente en días, ej. si ya estaba en "Todo"), para no arrancar
+        // con los campos en blanco.
+        const { start, end } = resolveChartWindow(typeof state.chartRangeDays === 'number' ? state.chartRangeDays : 30);
+        let fallbackStart = start;
+        if (!fallbackStart) {
+          fallbackStart = new Date(end);
+          fallbackStart.setDate(fallbackStart.getDate() - 29);
+        }
+        el.chartRangeFrom.value = chartDayKey(fallbackStart);
+        el.chartRangeTo.value = chartDayKey(end);
+      }
+    }
+    return;
+  }
+
   state.chartRangeDays = range === 'all' ? 'all' : Number(range);
+  el.chartCustomRange.hidden = true;
   el.chartFilters.querySelectorAll('[data-range]').forEach((b) => {
     b.setAttribute('aria-pressed', String(b === btn));
+  });
+  renderChart();
+});
+
+el.chartCustomRangeApply.addEventListener('click', () => {
+  const from = el.chartRangeFrom.value;
+  const to = el.chartRangeTo.value;
+  if (!from || !to) {
+    showToast('Elige las dos fechas (desde y hasta) antes de aplicar.');
+    return;
+  }
+  state.chartRangeDays = { custom: true, from, to };
+  el.chartFilters.querySelectorAll('[data-range]').forEach((b) => {
+    b.setAttribute('aria-pressed', String(b.dataset.range === 'custom'));
   });
   renderChart();
 });
