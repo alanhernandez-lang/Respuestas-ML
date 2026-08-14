@@ -38,6 +38,10 @@ const state = {
   // packId al que se le va a asociar el próximo archivo que se elija en
   // el.attachmentFileInput (compartido entre todas las tarjetas, como el lightbox).
   attachTargetPackId: null,
+  // Gráfica de respuestas por persona (pestaña Bitácora) — ver renderChart().
+  chartOpen: false,
+  chartRangeDays: 30, // número de días hacia atrás, o 'all'
+  chartTableView: false,
 };
 
 const el = {
@@ -73,6 +77,14 @@ const el = {
   logFilters: document.getElementById('logFilters'),
   logList: document.getElementById('logList'),
   logEmptyState: document.getElementById('logEmptyState'),
+  chartToggleBtn: document.getElementById('chartToggleBtn'),
+  chartPanel: document.getElementById('chartPanel'),
+  chartFilters: document.querySelector('.chart-filters'),
+  chartLegend: document.getElementById('chartLegend'),
+  chartSvgWrap: document.getElementById('chartSvgWrap'),
+  chartEmptyState: document.getElementById('chartEmptyState'),
+  chartTableToggleBtn: document.getElementById('chartTableToggleBtn'),
+  chartTableWrap: document.getElementById('chartTableWrap'),
   bankSearch: document.getElementById('bankSearch'),
   bankList: document.getElementById('bankList'),
   bankEmptyState: document.getElementById('bankEmptyState'),
@@ -632,10 +644,316 @@ async function refreshLog() {
     const data = await res.json();
     state.logEntries = data.entries || [];
     renderLog();
+    renderChart();
   } catch {
     showToast('No se pudo cargar la bitácora');
   }
 }
+
+// ============ Gráfica de "respuestas por día" (Bitácora) ============
+// Solo estas 4 personas van en la gráfica, a pedido explícito — el color de cada
+// una es FIJO en este orden (paleta categórica validada, ver dataviz skill), y
+// nunca cambia según quién tenga más o menos respuestas en un rango dado.
+const CHART_PEOPLE = [
+  { email: 'teresita.zamora@marvelsa.com', name: 'Teresita', series: 1 },
+  { email: 'frida.ruiz@marvelsa.com', name: 'Frida', series: 2 },
+  { email: 'faviola.aguilar@mdhsports.com', name: 'Faviola', series: 3 },
+  { email: 'getzemany.lazo@marvelsa.com', name: 'Getzemany', series: 4 },
+];
+
+// Clave de día en hora LOCAL (no UTC) — mismo criterio que dayLabel() de arriba,
+// para que "hoy"/"ayer" coincidan entre la bitácora y la gráfica.
+function chartDayKey(dateLike) {
+  const d = dateLike instanceof Date ? dateLike : new Date(dateLike);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function formatChartDayLabel(key) {
+  const [y, m, d] = key.split('-').map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString('es-MX', { day: 'numeric', month: 'short' });
+}
+
+// Arma los días del eje X (todos, aunque no haya actividad ese día — para que la
+// línea no salte fechas) y, para cada una de las 4 personas, cuántas respuestas
+// publicó por día. `rangeDays` es un número de días hacia atrás, o 'all'.
+function computeChartData(rangeDays) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  let startDate = null;
+  if (rangeDays !== 'all') {
+    startDate = new Date(today);
+    startDate.setDate(startDate.getDate() - (rangeDays - 1));
+  }
+
+  const relevant = state.logEntries.filter((e) => {
+    if (!CHART_PEOPLE.some((p) => p.email === e.answeredBy)) return false;
+    if (startDate && new Date(e.date) < startDate) return false;
+    return true;
+  });
+
+  if (!relevant.length) return { days: [], series: [] };
+
+  let firstDate = startDate;
+  if (!firstDate) {
+    // "Todo": arranca en el día del primer dato real que haya para este grupo,
+    // no desde el inicio de los tiempos.
+    let earliest = new Date(relevant[0].date);
+    relevant.forEach((e) => {
+      const d = new Date(e.date);
+      if (d < earliest) earliest = d;
+    });
+    firstDate = new Date(earliest.getFullYear(), earliest.getMonth(), earliest.getDate());
+  }
+
+  const days = [];
+  const cursor = new Date(firstDate);
+  while (cursor <= today) {
+    days.push(chartDayKey(cursor));
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  const countsByPersonDay = new Map();
+  relevant.forEach((e) => {
+    const key = `${e.answeredBy}|${chartDayKey(e.date)}`;
+    countsByPersonDay.set(key, (countsByPersonDay.get(key) || 0) + 1);
+  });
+
+  const series = CHART_PEOPLE.map((p) => ({
+    ...p,
+    values: days.map((d) => countsByPersonDay.get(`${p.email}|${d}`) || 0),
+  }));
+
+  return { days, series };
+}
+
+// Geometría del último render — la guarda el hover/tooltip para no tener que
+// recalcular todo en cada movimiento del mouse. Se recalcula en cada renderChart().
+let chartGeometry = null;
+
+function buildChartSvg(days, series) {
+  const width = 760;
+  const height = 260;
+  const marginLeft = 34;
+  const marginRight = 12;
+  const marginTop = 14;
+  const marginBottom = 26;
+  const plotW = width - marginLeft - marginRight;
+  const plotH = height - marginTop - marginBottom;
+
+  const maxValue = Math.max(1, ...series.flatMap((s) => s.values));
+  // Redondea el techo del eje Y a un número "limpio" (1/2/5 × 10^n) en vez de un
+  // valor arbitrario, para que los ticks se lean bien (0/5/10, no 0/3.7/7.4).
+  const magnitude = Math.pow(10, Math.floor(Math.log10(maxValue)));
+  const norm = maxValue / magnitude;
+  const step = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+  const niceMax = step * magnitude;
+  const yTicks = 4;
+
+  const xForIndex = (i) => marginLeft + (days.length > 1 ? (i / (days.length - 1)) * plotW : plotW / 2);
+  const yForValue = (v) => marginTop + plotH - (v / niceMax) * plotH;
+
+  const gridlinesHtml = Array.from({ length: yTicks + 1 }, (_, i) => {
+    const value = (niceMax / yTicks) * i;
+    const y = yForValue(value);
+    return `
+      <line class="chart-gridline" x1="${marginLeft}" x2="${width - marginRight}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" />
+      <text class="chart-axis-label" x="${marginLeft - 8}" y="${(y + 3).toFixed(1)}" text-anchor="end">${Math.round(value)}</text>
+    `;
+  }).join('');
+
+  // Como mucho ~7 etiquetas en el eje X, sin importar cuántos días haya en el
+  // rango — si no, con "Todo" (varios meses) se amontonan encima unas de otras.
+  const labelEvery = Math.max(1, Math.ceil(days.length / 7));
+  const xLabelsHtml = days.map((d, i) => {
+    if (i % labelEvery !== 0 && i !== days.length - 1) return '';
+    const x = xForIndex(i);
+    return `<text class="chart-axis-label" x="${x.toFixed(1)}" y="${height - 8}" text-anchor="middle">${escapeHtml(formatChartDayLabel(d))}</text>`;
+  }).join('');
+
+  const linesHtml = series.map((s) => {
+    const points = s.values.map((v, i) => `${xForIndex(i).toFixed(1)},${yForValue(v).toFixed(1)}`).join(' ');
+    const lastIndex = s.values.length - 1;
+    const endDot = lastIndex >= 0
+      ? `<circle class="chart-series-dot" cx="${xForIndex(lastIndex).toFixed(1)}" cy="${yForValue(s.values[lastIndex]).toFixed(1)}" r="4" style="fill: var(--series-${s.series})" />`
+      : '';
+    return `<polyline class="chart-series-line" points="${points}" style="stroke: var(--series-${s.series})" />${endDot}`;
+  }).join('');
+
+  const svgHtml = `
+    <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Respuestas publicadas por día, por persona">
+      <line class="chart-axis-line" x1="${marginLeft}" x2="${marginLeft}" y1="${marginTop}" y2="${marginTop + plotH}" />
+      <line class="chart-axis-line" x1="${marginLeft}" x2="${width - marginRight}" y1="${marginTop + plotH}" y2="${marginTop + plotH}" />
+      ${gridlinesHtml}
+      ${xLabelsHtml}
+      ${linesHtml}
+      <line class="chart-crosshair" id="chartCrosshairLine" x1="0" x2="0" y1="${marginTop}" y2="${marginTop + plotH}" style="display:none" />
+      <rect class="chart-hit-layer" x="${marginLeft}" y="${marginTop}" width="${plotW}" height="${plotH}" />
+    </svg>
+  `;
+
+  return { svgHtml, width, height, marginLeft, marginTop, plotW, plotH, xForIndex, yForValue };
+}
+
+function renderChartTable(days, series) {
+  if (!days.length) {
+    el.chartTableWrap.innerHTML = '<p class="empty-state">Nadie de este grupo ha publicado respuestas en este rango.</p>';
+    return;
+  }
+  const rows = days.map((d, i) => `
+    <tr>
+      <td>${escapeHtml(formatChartDayLabel(d))}</td>
+      ${series.map((s) => `<td>${s.values[i]}</td>`).join('')}
+    </tr>
+  `).join('');
+  el.chartTableWrap.innerHTML = `
+    <table>
+      <thead>
+        <tr><th>Día</th>${series.map((s) => `<th>${escapeHtml(s.name)}</th>`).join('')}</tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+function renderChart() {
+  if (!state.chartOpen) return;
+
+  const { days, series } = computeChartData(state.chartRangeDays);
+  const hasData = days.length > 0;
+  el.chartEmptyState.hidden = hasData;
+  el.chartSvgWrap.hidden = !hasData;
+  el.chartLegend.hidden = !hasData;
+
+  if (!hasData) {
+    el.chartSvgWrap.innerHTML = '';
+    el.chartLegend.innerHTML = '';
+    chartGeometry = null;
+    renderChartTable([], []);
+    return;
+  }
+
+  el.chartLegend.innerHTML = series.map((s) => `
+    <span class="chart-legend-item">
+      <span class="chart-legend-key" style="background: var(--series-${s.series})"></span>${escapeHtml(s.name)}
+    </span>
+  `).join('');
+
+  const geometry = buildChartSvg(days, series);
+  el.chartSvgWrap.innerHTML = geometry.svgHtml;
+  chartGeometry = { ...geometry, days, series };
+  // El innerHTML de arriba se lleva entre las patas cualquier tooltip que ya
+  // existiera (queda huérfano, fuera del documento) — sin este reset,
+  // ensureChartTooltip() seguiría reusando ese nodo desconectado y el tooltip
+  // dejaría de aparecer después del primer cambio de rango.
+  chartTooltipEl = null;
+
+  if (state.chartTableView) renderChartTable(days, series);
+}
+
+let chartTooltipEl = null;
+function ensureChartTooltip() {
+  if (!chartTooltipEl) {
+    chartTooltipEl = document.createElement('div');
+    chartTooltipEl.className = 'chart-tooltip';
+    chartTooltipEl.hidden = true;
+    el.chartSvgWrap.appendChild(chartTooltipEl);
+  }
+  return chartTooltipEl;
+}
+
+function showChartTooltip(index, pointerX, pointerY) {
+  if (!chartGeometry) return;
+  const { days, series, xForIndex } = chartGeometry;
+  const tooltip = ensureChartTooltip();
+  const wrapRect = el.chartSvgWrap.getBoundingClientRect();
+
+  tooltip.innerHTML = `
+    <div class="chart-tooltip-date">${escapeHtml(formatChartDayLabel(days[index]))}</div>
+    ${series.map((s) => `
+      <div class="chart-tooltip-row">
+        <span class="chart-tooltip-key" style="background: var(--series-${s.series})"></span>
+        <span class="chart-tooltip-name">${escapeHtml(s.name)}</span>
+        <span class="chart-tooltip-value">${s.values[index]}</span>
+      </div>
+    `).join('')}
+  `;
+  tooltip.hidden = false;
+
+  // Posición relativa al contenedor, no a la pantalla — y se acomoda del otro
+  // lado si se saldría por el borde derecho.
+  let left = pointerX - wrapRect.left + 14;
+  const top = Math.max(0, pointerY - wrapRect.top - 20);
+  if (left + 170 > wrapRect.width) left = pointerX - wrapRect.left - 170 - 14;
+  tooltip.style.left = `${left}px`;
+  tooltip.style.top = `${top}px`;
+
+  const svg = el.chartSvgWrap.querySelector('svg');
+  const crosshair = svg?.querySelector('#chartCrosshairLine');
+  if (crosshair) {
+    const x = xForIndex(index).toFixed(1);
+    crosshair.setAttribute('x1', x);
+    crosshair.setAttribute('x2', x);
+    crosshair.style.display = '';
+  }
+}
+
+function hideChartTooltip() {
+  if (chartTooltipEl) chartTooltipEl.hidden = true;
+  const crosshair = el.chartSvgWrap.querySelector('#chartCrosshairLine');
+  if (crosshair) crosshair.style.display = 'none';
+}
+
+function handleChartPointerMove(e) {
+  if (!chartGeometry) return;
+  const svg = el.chartSvgWrap.querySelector('svg');
+  if (!svg) return;
+  const rect = svg.getBoundingClientRect();
+  if (!rect.width) return;
+  const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+  const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+  const scaleX = chartGeometry.width / rect.width;
+  const localX = (clientX - rect.left) * scaleX;
+  const { marginLeft, plotW, days } = chartGeometry;
+  const ratio = Math.min(1, Math.max(0, (localX - marginLeft) / plotW));
+  const index = days.length > 1 ? Math.round(ratio * (days.length - 1)) : 0;
+  showChartTooltip(index, clientX, clientY);
+}
+
+el.chartSvgWrap.addEventListener('pointermove', handleChartPointerMove);
+el.chartSvgWrap.addEventListener('pointerleave', hideChartTooltip);
+
+el.chartToggleBtn.addEventListener('click', () => {
+  state.chartOpen = !state.chartOpen;
+  el.chartPanel.hidden = !state.chartOpen;
+  el.chartToggleBtn.setAttribute('aria-expanded', String(state.chartOpen));
+  el.chartToggleBtn.textContent = state.chartOpen
+    ? '📊 Ocultar gráfica de respuestas por persona'
+    : '📊 Ver gráfica de respuestas por persona';
+  if (state.chartOpen) renderChart();
+});
+
+el.chartFilters.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-range]');
+  if (!btn) return;
+  const { range } = btn.dataset;
+  state.chartRangeDays = range === 'all' ? 'all' : Number(range);
+  el.chartFilters.querySelectorAll('[data-range]').forEach((b) => {
+    b.setAttribute('aria-pressed', String(b === btn));
+  });
+  renderChart();
+});
+
+el.chartTableToggleBtn.addEventListener('click', () => {
+  state.chartTableView = !state.chartTableView;
+  el.chartTableWrap.hidden = !state.chartTableView;
+  el.chartTableToggleBtn.setAttribute('aria-expanded', String(state.chartTableView));
+  el.chartTableToggleBtn.textContent = state.chartTableView ? 'Ocultar tabla' : 'Ver como tabla';
+  if (state.chartTableView) {
+    const { days, series } = computeChartData(state.chartRangeDays);
+    renderChartTable(days, series);
+  }
+});
 
 function dayLabel(iso) {
   const d = new Date(iso);

@@ -90,6 +90,33 @@
         <h3>Activos ahora</h3>
         <div id="liveNowList"></div>
       </div>
+
+      <div class="chart-toggle-row">
+        <button id="chartToggleBtn" type="button" class="btn-secondary" aria-expanded="false" aria-controls="chartPanel">
+          📊 Ver gráfica de respuestas por persona
+        </button>
+      </div>
+
+      <div id="chartPanel" class="chart-panel viz-root" hidden data-palette="#2a78d6,#eb6834,#1baf7a,#eda100">
+        <div class="chart-filters" role="group" aria-label="Rango de fechas">
+          <button type="button" class="chip-toggle" data-range="7">Últimos 7 días</button>
+          <button type="button" class="chip-toggle" data-range="30" aria-pressed="true">Últimos 30 días</button>
+          <button type="button" class="chip-toggle" data-range="90">Últimos 90 días</button>
+          <button type="button" class="chip-toggle" data-range="all">Todo</button>
+        </div>
+
+        <div class="chart-body">
+          <div id="chartLegend" class="chart-legend"></div>
+          <div id="chartSvgWrap" class="chart-svg-wrap"></div>
+          <p id="chartEmptyState" class="empty-state" hidden>Nadie de este grupo ha publicado respuestas en este rango.</p>
+        </div>
+
+        <button type="button" id="chartTableToggleBtn" class="btn-secondary chart-table-toggle" aria-expanded="false" aria-controls="chartTableWrap">
+          Ver como tabla
+        </button>
+        <div id="chartTableWrap" class="chart-table-wrap" hidden></div>
+      </div>
+
       <div id="logFilters" class="log-filters"></div>
       <div id="logList" class="log-list"></div>
       <p id="logEmptyState" class="empty-state" hidden><span class="empty-state-icon" aria-hidden="true">🗒</span>Todavía no hay respuestas publicadas en la bitácora.</p>

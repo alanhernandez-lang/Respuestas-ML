@@ -1267,6 +1267,101 @@ input[type="search"] {
 .live-now-row .avatar { width: 28px; height: 28px; font-size: 0.68rem; }
 .live-now-empty { color: var(--muted); font-size: 0.88rem; margin: 0; }
 
+/* ============ Gráfica de respuestas por persona (Bitácora) ============
+   Paleta categórica validada (contraste + separación para daltonismo) contra la
+   superficie real de este panel — ver dataviz skill, references/palette.md. Los
+   4 slots están en orden FIJO (Teresita/Frida/Faviola/Getzemany): el color sigue
+   a la persona, nunca a su posición en el ranking, así que un filtro que quite a
+   alguien no le repinta el color a las demás. */
+.chart-toggle-row { padding: 0.65rem 1.25rem; border-bottom: 1px solid var(--border); }
+
+.viz-root {
+  --chart-surface: var(--surface);
+  --chart-ink: var(--text);
+  --chart-ink-muted: var(--muted);
+  --chart-grid: var(--border);
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .viz-root {
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+}
+
+.chart-panel {
+  padding: 1rem 1.25rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--chart-surface);
+}
+.chart-filters { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 0.9rem; }
+.chart-filters .chip-toggle[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+
+.chart-body { position: relative; }
+
+.chart-legend {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.6rem;
+  font-size: 0.82rem;
+}
+.chart-legend-item { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--chart-ink); }
+.chart-legend-key { display: inline-block; width: 16px; height: 2px; border-radius: 1px; flex-shrink: 0; }
+
+.chart-svg-wrap { position: relative; width: 100%; }
+.chart-svg-wrap svg { display: block; width: 100%; height: auto; }
+.chart-svg-wrap text { font-family: inherit; }
+
+/* La línea usa el color de la serie; el eje/rejilla y el texto SIEMPRE usan
+   tokens de tinta, nunca el color de una serie (un amarillo/aqua como texto no
+   se lee bien sobre la superficie) — ver marks-and-anatomy.md. */
+.chart-axis-line { stroke: var(--chart-grid); stroke-width: 1; }
+.chart-gridline { stroke: var(--chart-grid); stroke-width: 1; }
+.chart-axis-label { fill: var(--chart-ink-muted); font-size: 11px; }
+.chart-series-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart-series-dot { stroke: var(--chart-surface); stroke-width: 2; }
+
+.chart-crosshair { stroke: var(--chart-ink-muted); stroke-width: 1; stroke-dasharray: 3 3; pointer-events: none; }
+.chart-hit-layer { fill: transparent; cursor: crosshair; }
+
+.chart-tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+  padding: 0.5rem 0.65rem;
+  font-size: 0.8rem;
+  min-width: 150px;
+  z-index: 5;
+  transition: opacity 0.08s ease;
+}
+.chart-tooltip-date { font-weight: 700; color: var(--chart-ink); margin-bottom: 0.3rem; }
+.chart-tooltip-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.1rem 0; }
+.chart-tooltip-key { display: inline-block; width: 12px; height: 2px; border-radius: 1px; flex-shrink: 0; }
+.chart-tooltip-name { color: var(--chart-ink-muted); flex: 1; }
+.chart-tooltip-value { color: var(--chart-ink); font-weight: 700; }
+
+.chart-table-toggle { margin-top: 0.85rem; }
+.chart-table-wrap { margin-top: 0.75rem; overflow-x: auto; }
+.chart-table-wrap table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.chart-table-wrap th, .chart-table-wrap td { text-align: left; padding: 0.4rem 0.7rem; border-bottom: 1px solid var(--border); }
+.chart-table-wrap th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+.chart-table-wrap td { font-variant-numeric: tabular-nums; }
+
 .log-filters {
   display: flex;
   gap: 0.4rem;
