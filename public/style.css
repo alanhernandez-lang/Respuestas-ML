@@ -1315,6 +1315,15 @@ input[type="search"] {
   padding: 1.15rem 1.25rem 1.35rem;
   border-bottom: 1px solid var(--border);
   background: var(--chart-surface);
+  /* #viewLog tiene altura FIJA (flex:1; min-height:0, acotada al viewport) y
+     .log-view recorta lo que no quepa (overflow:hidden) — sin esto, entre más
+     contenido se agregara arriba de la gráfica (tarjetas de resumen, fila de
+     fecha personalizada), menos espacio le quedaba a la gráfica misma dentro de
+     esa altura fija, y en vez de acomodarse se recortaba. Con su propio scroll
+     acotado, el panel deja de competir por espacio con el resto de la Bitácora
+     (Activos ahora / lista de la bitácora de abajo), que siguen intactos. */
+  max-height: min(72vh, 680px);
+  overflow-y: auto;
 }
 
 .chart-panel-head {
