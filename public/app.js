@@ -1585,7 +1585,9 @@ function render() {
       const draftFlagBadge = r.status === 'pendiente' && r.draftAnswer
         ? (r.draftAnswer.error
           ? ' <span class="badge draft-error" title="El borrador de IA falló para esta conversación">⚠ borrador con error</span>'
-          : ' <span class="badge draft-ready" title="Ya hay un borrador de IA listo para revisar y publicar">✨ listo para revisar</span>')
+          : (r.draftAnswer.flags && r.draftAnswer.flags.length
+            ? ' <span class="badge draft-error" title="El borrador incluye un teléfono o link que no está en ninguna plantilla aprobada — revísalo antes de publicar">⚠ revisar dato sospechoso</span>'
+            : ' <span class="badge draft-ready" title="Ya hay un borrador de IA listo para revisar y publicar">✨ listo para revisar</span>'))
         : '';
       const unreadHtml = r.unreadCount > 1
         ? `<span class="unread-pill" title="Mensajes nuevos sin leer en Mercado Libre">${r.unreadCount} sin leer</span>`
@@ -1746,6 +1748,16 @@ function draftCardHtml(r) {
   const imagesExcludedHtml = r.draftAnswer.imagesExcluded
     ? '<div class="collab-alert">⚠ Este borrador se generó SIN analizar las fotos del hilo (Gemini las bloqueó por seguridad) — revísalas tú mismo antes de publicar.</div>'
     : '';
+  // Aviso de la validación determinística de lib/agent.js (validateDraftText): la IA
+  // escribió un teléfono o un link que no está en ninguna plantilla aprobada — muy
+  // probablemente inventado. Revisar SIEMPRE antes de publicar.
+  const flagMessages = {
+    telefono_no_verificado: 'incluye un teléfono que no está en ninguna plantilla aprobada — probablemente inventado, NO lo publiques sin verificar.',
+    link_no_autorizado: 'incluye un link que no es de marvelsa.com ni de Mercado Libre — probablemente inventado, NO lo publiques sin verificar.',
+  };
+  const draftFlagsHtml = (r.draftAnswer.flags || []).length
+    ? `<div class="draft-flag-alert">${r.draftAnswer.flags.map((f) => `⚠ Este borrador ${escapeHtml(flagMessages[f] || 'tiene un dato que hay que revisar antes de publicar.')}`).join('<br>')}</div>`
+    : '';
   const bankBtnHtml = `<button class="btn-secondary bankPickerBtn" data-pack="${r.packId}" aria-expanded="${state.bankPickerOpenFor === r.packId}">📚 Banco</button>`;
   const attachHtml = attachmentControlHtml(r.packId);
 
@@ -1764,6 +1776,7 @@ function draftCardHtml(r) {
 
       ${collabAlertHtml}
       ${imagesExcludedHtml}
+      ${draftFlagsHtml}
 
       <div class="draft-suggestion">
         <div class="draft-suggestion-head">

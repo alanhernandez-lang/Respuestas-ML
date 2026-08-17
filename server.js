@@ -560,7 +560,7 @@ async function attachDrafts(packs, token, touched) {
       return;
     }
     try {
-      const { text, imagesExcluded } = await generateDraftAnswer({
+      const { text, imagesExcluded, flags } = await generateDraftAnswer({
         buyerName: record.buyerName,
         itemTitles: record.itemTitles,
         messages: record.messages,
@@ -568,7 +568,10 @@ async function attachDrafts(packs, token, touched) {
         token,
         frequentResponses,
       });
-      record.draftAnswer = { text, generatedAt: new Date().toISOString(), forQuestionDate: questionDate, imagesExcluded };
+      record.draftAnswer = { text, generatedAt: new Date().toISOString(), forQuestionDate: questionDate, imagesExcluded, flags };
+      if (flags && flags.length) {
+        console.warn(`Borrador IA del pack ${record.packId} marcado para revisar (${flags.join(', ')})`);
+      }
       ok++;
     } catch (err) {
       console.warn('Error generando borrador IA para pack', record.packId, err.message);
@@ -739,7 +742,7 @@ async function regenerateDraftInner(packId) {
   const previousText = record.draftAnswer?.text || null;
   const { access_token: token } = await getAccessToken();
   const frequentResponses = computeResponseBank(await loadAnswerLog()).filter((r) => r.count >= 3).slice(0, 15);
-  const { text, imagesExcluded } = await generateDraftAnswer({
+  const { text, imagesExcluded, flags } = await generateDraftAnswer({
     buyerName: record.buyerName,
     itemTitles: record.itemTitles,
     messages: record.messages,
@@ -748,11 +751,15 @@ async function regenerateDraftInner(packId) {
     frequentResponses,
     previousDraftText: previousText,
   });
+  if (flags && flags.length) {
+    console.warn(`Borrador IA del pack ${packId} marcado para revisar (${flags.join(', ')})`);
+  }
   record.draftAnswer = {
     text,
     generatedAt: new Date().toISOString(),
     forQuestionDate: record.lastQuestion?.date || null,
     imagesExcluded,
+    flags,
     // Si el texto salió idéntico al anterior, casi siempre es porque la respuesta
     // correcta es una plantilla aprobada tal cual (factura, cabezal, etc.) — no un
     // error. El frontend usa esto para avisarlo en vez de dejar que se sienta como

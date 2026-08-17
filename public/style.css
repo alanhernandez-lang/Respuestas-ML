@@ -1229,6 +1229,20 @@ input[type="search"] {
   margin-bottom: 0.85rem;
 }
 
+/* Aviso de validateDraftText (lib/agent.js): la IA escribió un teléfono o link que no
+   está en ninguna plantilla aprobada. Más severo que .collab-alert (que solo avisa de
+   coordinación entre personas), por eso usa el mismo tono que el badge "draft-error". */
+.draft-flag-alert {
+  background: var(--mediation-bg);
+  color: var(--mediation);
+  border: 1px solid color-mix(in srgb, var(--mediation) 35%, transparent);
+  border-radius: var(--radius-md);
+  padding: 0.6rem 0.85rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 0.85rem;
+}
+
 .log-view {
   display: flex;
   flex-direction: column;
