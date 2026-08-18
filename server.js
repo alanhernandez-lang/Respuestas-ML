@@ -1,6 +1,7 @@
 require('dotenv').config();
 const path = require('path');
 const express = require('express');
+const compression = require('compression');
 const cookieParser = require('cookie-parser');
 const {
   getAccessToken,
@@ -876,6 +877,12 @@ function publishAnswer(packId, answeredBy, attachments) {
 }
 
 const app = express();
+// El front-end sondea /api/messages (todo el catálogo de conversaciones, con su
+// historial completo) cada 20s desde cada persona que tenga la pestaña abierta — sin
+// comprimir, eso fue lo que agotó el límite gratuito de "Fast Origin Transfer" de
+// Vercel (10 GB) en unos días y pausó el sitio entero. gzip/brotli en JSON repetitivo
+// como este normalmente recorta 70-90% del peso transferido.
+app.use(compression());
 app.use(cookieParser());
 app.use(express.json());
 
@@ -1095,7 +1102,12 @@ app.get('/api/attachments/:filename', async (req, res) => {
     const siteId = req.query.siteId || 'MLM';
     const { base64, mimeType } = await fetchAttachment(token, req.params.filename, siteId);
     res.set('Content-Type', mimeType || 'image/jpeg');
-    res.set('Cache-Control', 'private, max-age=86400');
+    // El contenido de un adjunto de ML nunca cambia para el mismo filename/id, así que
+    // se puede cachear en la CDN de Vercel (antes era "private", lo que obligaba a
+    // pedirlo de nuevo al servidor cada vez que CUALQUIER persona del equipo lo veía,
+    // aunque ya lo hubiera visto alguien más antes) — esto quita de encima al server
+    // (y de "Fast Origin Transfer") las vistas repetidas de la misma foto/PDF.
+    res.set('Cache-Control', 'public, max-age=86400, immutable');
     res.send(Buffer.from(base64, 'base64'));
   } catch (err) {
     console.error(err);

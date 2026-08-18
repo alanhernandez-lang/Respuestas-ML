@@ -2367,7 +2367,12 @@ el.liveNowList.addEventListener('keydown', activateRowOnEnterOrSpace('.live-now-
 
 window.addEventListener('beforeunload', stopPresenceHeartbeat);
 
-const AUTO_REFRESH_MS = 20000;
+// Antes eran 20s: cada persona con la pestaña abierta jala el catálogo COMPLETO de
+// conversaciones (con su historial) del servidor. Con varias personas todo el día,
+// eso fue lo que agotó el límite gratuito de ancho de banda de Vercel y pausó el
+// sitio. 45s sigue siendo "casi al instante" para este uso, pero corta las peticiones
+// (y el gasto de banda) más de la mitad.
+const AUTO_REFRESH_MS = 45000;
 const PRESENCE_POLL_MS = 8000;
 const AUTO_SYNC_MS = 120000;
 setInterval(loadMessages, AUTO_REFRESH_MS);
