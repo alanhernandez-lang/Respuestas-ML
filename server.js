@@ -877,6 +877,11 @@ function publishAnswer(packId, answeredBy, attachments) {
 }
 
 const app = express();
+// Necesario para que req.secure refleje la verdad detrás de un proxy/balanceador
+// (Vercel, Render, etc. reciben la conexión HTTPS y la reenvían por HTTP interno con
+// el header X-Forwarded-Proto) — si no, Express siempre ve la conexión interna como
+// no-https y req.secure sale falso aunque el usuario sí esté en https.
+app.set('trust proxy', 1);
 // El front-end sondea /api/messages (todo el catálogo de conversaciones, con su
 // historial completo) cada 20s desde cada persona que tenga la pestaña abierta — sin
 // comprimir, eso fue lo que agotó el límite gratuito de "Fast Origin Transfer" de
@@ -913,9 +918,10 @@ app.post('/api/auth/login', async (req, res) => {
     const normalizedEmail = await verifyCredentials(email, password);
     res.cookie(SESSION_COOKIE, createSessionToken(normalizedEmail), {
       httpOnly: true,
-      // Vercel siempre sirve por https; en local (npm start) no hay https, así que la
-      // cookie "secure" se desactiva ahí o el navegador la descartaría por completo.
-      secure: Boolean(process.env.VERCEL),
+      // req.secure (no un env var atado a un hosting específico como VERCEL) para que
+      // esto funcione igual en Vercel, Render o cualquier otro lado detrás de https;
+      // en local (npm start, sin https) se desactiva sola, que es lo correcto.
+      secure: req.secure,
       sameSite: 'lax',
       maxAge: 30 * 24 * 60 * 60 * 1000,
     });

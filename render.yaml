@@ -1,0 +1,32 @@
+# Blueprint de Render (render.com/docs/blueprint-spec) — permite crear el servicio
+# con un solo clic ("New +" → "Blueprint", eligiendo este repo) en vez de configurar
+# cada campo a mano. Las variables marcadas `sync: false` son secretos: Render pide
+# pegarlas a mano al crear el servicio, nunca se guardan en este archivo/repo.
+services:
+  - type: web
+    name: respuestas-ml
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: ML_CLIENT_ID
+        sync: false
+      - key: ML_CLIENT_SECRET
+        sync: false
+      - key: ML_REFRESH_TOKEN
+        sync: false
+      - key: ML_SELLER_ID
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
