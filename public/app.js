@@ -1971,6 +1971,11 @@ async function handleDraftAction(e) {
       showToast(`Error al publicar: ${err.message}`);
       publishBtn.disabled = false;
       publishBtn.textContent = 'Publicar';
+      // Un 403 de Mercado Libre (conversación bloqueada por mediación, etc.) ya deja
+      // el pack actualizado en el servidor — se recarga para que se vea el estado
+      // real de una vez, en vez de que la tarjeta se quede mostrando el borrador
+      // viejo hasta el siguiente sondeo automático.
+      await loadMessages();
     }
     return;
   }

@@ -827,7 +827,35 @@ async function publishAnswerInner(packId, answeredBy, attachments) {
   // para referenciarse aquí. Si viene vacío, se manda el mensaje sin adjuntos igual
   // que siempre.
   const attachmentFilenames = (attachments || []).map((a) => a.filename).filter(Boolean);
-  await sendPackMessage(token, packId, SELLER_ID, record.buyerId, text, attachmentFilenames);
+  try {
+    await sendPackMessage(token, packId, SELLER_ID, record.buyerId, text, attachmentFilenames);
+  } catch (err) {
+    // Un 403 aquí casi siempre significa que Mercado Libre bloqueó la conversación
+    // justo AHORA (típicamente porque entró a mediación) — nuestro caché puede seguir
+    // mostrándola como "pendiente" hasta el próximo sync automático (hasta 2 min),
+    // dejando a la persona con un borrador que ya no se puede enviar y un error crudo
+    // sin explicación. Se refresca este pack puntual de inmediato para que la UI
+    // refleje el estado real sin esperar, y se cambia el mensaje de error por uno
+    // que sí explica qué pasó.
+    if (err.message.includes('ML API 403')) {
+      try {
+        const refreshed = await syncPackById(token, packId, { packs: { [packId]: entry } }, record.unreadCount || 0);
+        const fresh = await loadPackEntry(packId);
+        if (fresh) {
+          fresh.record = refreshed;
+          await savePackEntry(packId, fresh);
+        }
+      } catch (syncErr) {
+        console.warn('No se pudo refrescar el pack tras un 403 al publicar', packId, syncErr.message);
+      }
+      const blockedErr = new Error(
+        'Mercado Libre no permitió enviar el mensaje (403) — lo más probable es que esta conversación acabe de entrar a mediación o algún otro estado que ya no admite respuestas normales. Ya se actualizó el estado de esta conversación; revisa cómo se ve ahora.',
+      );
+      blockedErr.status = 409;
+      throw blockedErr;
+    }
+    throw err;
+  }
 
   // Marcamos la conversación como leída en Mercado Libre: por defecto nuestra app
   // sincroniza con mark_as_read=false (para no marcar nada leído solo por consultar),
