@@ -708,6 +708,19 @@ async function runSyncInner() {
     }
   });
 
+  // Se guarda lo ya traído de Mercado Libre ANTES de meterse a generar borradores de
+  // IA: attachDrafts puede tardar mucho (o colgarse por completo) si Gemini está
+  // lento/caído/con una conexión mala de por medio — sin este guardado adelantado,
+  // un ciclo entero de mensajes nuevos se quedaba sin persistir mientras tanto (se
+  // vio en vivo corriendo la app en local con internet lento: la sincronización
+  // parecía "atorada" y nunca avanzaba, aunque los mensajes sí se habían traído).
+  if (touched.size) {
+    const toWrite = {};
+    touched.forEach((id) => { toWrite[id] = packs[id]; });
+    await savePacksBulk(toWrite);
+    await saveMeta({ syncedAt: new Date().toISOString() });
+  }
+
   await attachDrafts(packs, token, touched);
 
   if (touched.size) {
