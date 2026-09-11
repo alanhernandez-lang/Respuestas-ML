@@ -20,7 +20,13 @@ const {
   markPackMessagesRead,
   mapWithConcurrency,
 } = require('./lib/ml');
-const { generateDraftAnswer } = require('./lib/agent');
+const {
+  generateDraftAnswer,
+  extractRefacturaData,
+  extractEnvioAcordadoData,
+  REFACTURA_FIELD_LABELS,
+  ENVIO_ACORDADO_FIELD_LABELS,
+} = require('./lib/agent');
 const { redis, withLock } = require('./lib/redis');
 const { legacyUpstashClient } = require('./lib/legacyUpstash');
 const { SESSION_COOKIE, verifyCredentials, createSessionToken, verifySessionToken } = require('./lib/auth');
@@ -901,6 +907,14 @@ async function runSyncInner() {
   }
   const syncedAt = new Date().toISOString();
   await saveMeta({ syncedAt });
+
+  // Corre DESPUÉS de que todo lo de arriba ya se guardó (savePacksBulk) — lee su
+  // propia copia fresca de Redis en vez de reusar `packs`/`touched` de este ciclo,
+  // para no arriesgarse a que el guardado en bloque de arriba pise con datos viejos
+  // lo que esto vaya escribiendo (envía mensajes de verdad, no puede permitirse esa
+  // condición de carrera). Ver comentario junto a su definición.
+  await sendAutomationReminders().catch((err) => console.error('[automation] error inesperado mandando recordatorios:', err.message));
+
   return { syncedAt, totalPacks: Object.keys(packs).length, errors };
 }
 
@@ -1069,7 +1083,19 @@ app.use(express.json());
 // Rutas que deben quedar accesibles SIN sesión: la propia página de login, el
 // endpoint que valida usuario/contraseña, y el cron externo (que se autentica con
 // su propio CRON_SECRET, no con una sesión de usuario).
-const PUBLIC_PATHS = new Set(['/login.html', '/api/auth/login', '/api/cron/sync', '/api/cron/backfill-history', '/api/cron/regenerate-pending-drafts']);
+const PUBLIC_PATHS = new Set([
+  '/login.html',
+  '/api/auth/login',
+  '/api/cron/sync',
+  '/api/cron/backfill-history',
+  '/api/cron/regenerate-pending-drafts',
+  // Automatización n8n de refacturas/envíos acordados (ver
+  // docs/odoo-refacturas-envios-automation-plan.md) — se autentica con CRON_SECRET,
+  // mismo patrón que el cron externo, no con una sesión de usuario.
+  '/api/automation/refacturas-pendientes',
+  '/api/automation/envios-acordados-pendientes',
+  '/api/automation/marcar-planificado',
+]);
 
 function requireAuth(req, res, next) {
   if (PUBLIC_PATHS.has(req.path)) return next();
@@ -1448,6 +1474,252 @@ app.get('/api/cron/regenerate-pending-drafts', async (req, res) => {
   }
   res.json({ started: true }); // puede tardar varios minutos con muchos pendientes — se revisa en logs
   runRegeneratePendingDraftsInner().catch((err) => console.error('[regen-pendientes] Error general:', err));
+});
+
+// ---------------------------------------------------------------------------------
+// Automatización n8n: refacturas y envíos acordados con el comprador (aprobado por
+// el gerente de Alan con alcance reducido — ver
+// docs/odoo-refacturas-envios-automation-plan.md, sección 3). n8n hace polling de
+// estos endpoints, crea la "planificación" en Odoo (una Actividad sobre la
+// cotización, para no depender de nombres de campo personalizados que todavía no
+// están confirmados con quien administra Odoo), y avisa de vuelta con
+// /marcar-planificado para que el mismo pack no se vuelva a ofrecer en la próxima
+// corrida. Las validaciones humanas de Crédito y Cobranza / Tráfico NO se tocan —
+// esto solo reemplaza el paso mecánico de capturar los datos en Odoo.
+//
+// AUTOMATION_PLANNED_KEY vive en Redis (no en el propio record del pack) para que
+// "ya se mandó a Odoo" sobreviva a un re-sync normal del pack sin más lógica.
+const AUTOMATION_PLANNED_KEY = 'app:automation:planned';
+
+async function isAlreadyPlanned(categoria, packId) {
+  return Boolean(await redis.hget(AUTOMATION_PLANNED_KEY, `${categoria}:${packId}`));
+}
+
+async function markPlanned(categoria, packId, extra) {
+  await redis.hset(AUTOMATION_PLANNED_KEY, {
+    [`${categoria}:${packId}`]: { plannedAt: new Date().toISOString(), ...extra },
+  });
+}
+
+// Prefiltro barato antes de gastar una llamada a Gemini por pack: sin esto, cada
+// corrida de n8n tendría que analizar los ~1500 packs del caché en vez de solo los
+// que de verdad tienen una plantilla de este tipo de por medio. Se basa en el texto
+// de las plantillas ya aprobadas (ver RESPONSE_TEMPLATES en lib/agent.js) — si esas
+// plantillas cambian de redacción, hay que revisar estos patrones también.
+const REFACTURA_ASK_PATTERNS = [/uso de cfdi/i, /r[eé]gimen fiscal/i, /raz[oó]n social/i];
+const ENVIO_ACORDADO_ASK_PATTERNS = [/env[ií]o gratis/i, /dirección completa \(calle/i];
+
+function vendorAskedFor(messages, patterns) {
+  return (messages || []).some((m) => m.sender === 'vendedor' && patterns.some((p) => p.test(m.text || '')));
+}
+
+// ---------------------------------------------------------------------------------
+// Recordatorio automático de datos faltantes (refactura / envío acordado) — decisión
+// explícita de Alan (2026-09-10): a diferencia de la planificación en Odoo (que es
+// interna, nadie del lado del cliente la ve), ESTO SÍ le manda un mensaje directo al
+// cliente en Mercado Libre sin que nadie del equipo lo revise antes. Se acepta ese
+// riesgo porque el texto es 100% mecánico — una plantilla ya aprobada (o la lista
+// exacta de campos que faltan, tomada tal cual la escribió el cliente) — nunca texto
+// libre inventado por la IA. La única parte que usa IA es decidir QUÉ falta, no QUÉ
+// decir; si esa detección se equivoca, el peor caso es un recordatorio de más pidiendo
+// un dato que el cliente ya había dado.
+//
+// Se dispara desde el propio ciclo de sync (cada 2 minutos), no desde n8n: no
+// necesita Odoo para nada, así que no tiene sentido esperar al poll de n8n (cada 10
+// minutos) para algo que la app ya puede resolver por su cuenta.
+const AUTOMATION_REMINDED_KEY = 'app:automation:reminded';
+
+// Solo manda el recordatorio una vez por cada mensaje nuevo del cliente (mismo
+// criterio de "frescura" que ya usa el borrador de IA vía forQuestionDate) — si el
+// cliente vuelve a escribir (aunque siga incompleto), sí se le manda un recordatorio
+// actualizado; mientras no escriba de nuevo, no se le insiste con el mismo mensaje.
+async function alreadyRemindedForQuestion(categoria, packId, questionDate) {
+  const stored = await redis.hget(AUTOMATION_REMINDED_KEY, `${categoria}:${packId}`);
+  return Boolean(stored) && stored.questionDate === questionDate;
+}
+
+async function markReminded(categoria, packId, questionDate) {
+  await redis.hset(AUTOMATION_REMINDED_KEY, {
+    [`${categoria}:${packId}`]: { questionDate, remindedAt: new Date().toISOString() },
+  });
+}
+
+function buildRefacturaReminderText(missing) {
+  const bullets = missing.map((key) => `• ${REFACTURA_FIELD_LABELS[key]}`).join('\n');
+  return `Gracias por la información. Para poder emitir su factura aún nos falta que nos comparta:\n${bullets}\n\nEn cuanto recibamos los datos completos, procedemos con la emisión.`;
+}
+
+// La plantilla aprobada "Mensaje recordatorio de datos pendientes" (ver
+// RESPONSE_TEMPLATES en lib/agent.js) no lista campos específicos — se reutiliza
+// TAL CUAL, en vez de inventar una versión con lista dinámica que nadie aprobó.
+const ENVIO_ACORDADO_REMINDER_TEXT = 'Hola 👋 Quedo pendiente de los datos completos para poder activar tu envío gratis 🎉 Envíamelos por favor en el formato solicitado para continuar con tu envío.';
+
+// Mismo mecanismo de envío que publishAnswerInner (buyerId al vuelo si falta,
+// mandar, marcar leído, reflejar en el caché y en la bitácora), pero sin depender de
+// que exista un draftAnswer y sin sumar al conteo de respuestas por persona
+// (bumpAnswerCount) — nadie del equipo respondió esto, no le corresponde a nadie.
+async function sendAutomatedMessage(packId, text, label) {
+  const entry = await getPackEntryOrThrow(packId);
+  const record = entry.record;
+  const { access_token: token } = await getAccessToken();
+
+  if (!record.buyerId && record.orderId) {
+    try {
+      const order = await fetchOrderDetail(token, record.orderId);
+      record.buyerId = order.buyer?.id || null;
+      if (entry.info) entry.info.buyerId = record.buyerId;
+    } catch {
+      // sigue sin buyerId, cae al error de abajo
+    }
+  }
+  if (!record.buyerId) {
+    throw new Error('No se pudo identificar al comprador de esta conversación');
+  }
+
+  await sendPackMessage(token, packId, SELLER_ID, record.buyerId, text, []);
+  try {
+    await markPackMessagesRead(token, packId, SELLER_ID);
+  } catch (err) {
+    console.warn('No se pudo marcar como leído el pack', packId, err.message);
+  }
+
+  const now = new Date().toISOString();
+  record.messages.push({ sender: 'vendedor', text, date: now, hasAttachment: false, attachments: [] });
+  record.lastAnswer = { sender: 'vendedor', text, date: now, hasAttachment: false };
+  record.status = 'respondido';
+  record.draftAnswer = null;
+  record.answeredBy = label;
+  await savePackEntry(packId, entry);
+  await appendAnswerLog({
+    packId,
+    buyerName: record.buyerName,
+    itemTitles: record.itemTitles,
+    answeredBy: label,
+    wasEdited: false,
+    text,
+    question: record.lastQuestion?.text || null,
+    date: now,
+  });
+}
+
+async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, extractFn, buildText, label }) {
+  if (!vendorAskedFor(record.messages, askPatterns)) return;
+  if (await isAlreadyPlanned(categoria, record.packId)) return; // ya completo y planificado — nada que recordar
+  const questionDate = record.lastQuestion?.date || null;
+  if (!questionDate || (await alreadyRemindedForQuestion(categoria, record.packId, questionDate))) return;
+
+  const { complete, missing } = await extractFn(record.messages, process.env.GEMINI_API_KEY);
+  const totalFields = Object.keys(fieldLabels).length;
+  // Ni completo (no hay nada que recordar) ni en cero (el cliente todavía no
+  // contestó nada — insistir antes de que responda algo sería puro spam):
+  // recordamos solo el caso de en medio, datos parciales.
+  if (complete || missing.length === 0 || missing.length >= totalFields) return;
+
+  try {
+    await withLock(`lock:pack:${record.packId}`, 30000, () => sendAutomatedMessage(record.packId, buildText(missing), label));
+    await markReminded(categoria, record.packId, questionDate);
+  } catch (err) {
+    console.warn(`[automation] no se pudo mandar recordatorio (${categoria}) del pack`, record.packId, err.message);
+  }
+}
+
+async function sendAutomationReminders() {
+  const cache = await loadCache();
+  const candidates = Object.values(cache.packs)
+    .map((p) => p.record)
+    .filter((r) => r && r.status === 'pendiente');
+
+  await mapWithConcurrency(candidates, 3, async (record) => {
+    await remindOneCategory(record, {
+      categoria: 'refactura',
+      askPatterns: REFACTURA_ASK_PATTERNS,
+      fieldLabels: REFACTURA_FIELD_LABELS,
+      extractFn: extractRefacturaData,
+      buildText: buildRefacturaReminderText,
+      label: 'Automatización (datos de refactura faltantes)',
+    });
+    await remindOneCategory(record, {
+      categoria: 'envio_acordado',
+      askPatterns: ENVIO_ACORDADO_ASK_PATTERNS,
+      fieldLabels: ENVIO_ACORDADO_FIELD_LABELS,
+      extractFn: extractEnvioAcordadoData,
+      buildText: () => ENVIO_ACORDADO_REMINDER_TEXT,
+      label: 'Automatización (datos de envío faltantes)',
+    });
+  });
+}
+
+function checkAutomationSecret(req, res) {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    res.status(401).json({ error: 'No autorizado' });
+    return false;
+  }
+  return true;
+}
+
+async function findPendingForCategory({ categoria, askPatterns, extractFn }) {
+  const cache = await loadCache();
+  const candidates = Object.values(cache.packs)
+    .map((p) => p.record)
+    .filter((r) => r && vendorAskedFor(r.messages, askPatterns));
+
+  const results = [];
+  await mapWithConcurrency(candidates, 3, async (record) => {
+    if (await isAlreadyPlanned(categoria, record.packId)) return;
+    const { complete, data } = await extractFn(record.messages, process.env.GEMINI_API_KEY);
+    if (!complete) return;
+    results.push({
+      packId: record.packId,
+      orderId: record.orderId,
+      buyerName: record.buyerName,
+      itemTitles: record.itemTitles,
+      datos: data,
+    });
+  });
+  return results;
+}
+
+app.get('/api/automation/refacturas-pendientes', async (req, res) => {
+  if (!checkAutomationSecret(req, res)) return;
+  try {
+    const pendientes = await findPendingForCategory({
+      categoria: 'refactura',
+      askPatterns: REFACTURA_ASK_PATTERNS,
+      extractFn: extractRefacturaData,
+    });
+    res.json({ pendientes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/automation/envios-acordados-pendientes', async (req, res) => {
+  if (!checkAutomationSecret(req, res)) return;
+  try {
+    const pendientes = await findPendingForCategory({
+      categoria: 'envio_acordado',
+      askPatterns: ENVIO_ACORDADO_ASK_PATTERNS,
+      extractFn: extractEnvioAcordadoData,
+    });
+    res.json({ pendientes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/automation/marcar-planificado', async (req, res) => {
+  if (!checkAutomationSecret(req, res)) return;
+  try {
+    const { packId, categoria, odooActivityId } = req.body || {};
+    if (!packId || !categoria) {
+      return res.status(400).json({ error: 'Falta packId o categoria' });
+    }
+    await markPlanned(categoria, packId, odooActivityId ? { odooActivityId } : undefined);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // 2026-09-04: migración única de Upstash al Redis de Coolify (ver lib/redis.js,
