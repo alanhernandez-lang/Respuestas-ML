@@ -1,7 +1,6 @@
 require('dotenv').config();
 const path = require('path');
 const express = require('express');
-const compression = require('compression');
 const cookieParser = require('cookie-parser');
 const {
   getAccessToken,
@@ -9,6 +8,7 @@ const {
   fetchPackMessages,
   fetchPackDetail,
   fetchOrderDetail,
+  fetchAllSellerOrders,
   fetchShipmentDetail,
   fetchItemDetail,
   fetchClaimDetail,
@@ -20,9 +20,30 @@ const {
   markPackMessagesRead,
   mapWithConcurrency,
 } = require('./lib/ml');
-const { generateDraftAnswer } = require('./lib/agent');
+const {
+  generateDraftAnswer,
+  extractRefacturaData,
+  extractEnvioAcordadoData,
+  REFACTURA_FIELD_LABELS,
+  ENVIO_ACORDADO_FIELD_LABELS,
+} = require('./lib/agent');
 const { redis, withLock } = require('./lib/redis');
+const { legacyUpstashClient } = require('./lib/legacyUpstash');
 const { SESSION_COOKIE, verifyCredentials, createSessionToken, verifySessionToken } = require('./lib/auth');
+
+// 2026-08-29: reintroducido tras un ciclo real de caídas en producción — Upstash
+// alcanzó su límite de solicitudes ("max requests limit exceeded") y cada llamada a
+// Redis sin try/catch alrededor (login, sync, etc.) tronaba como promesa/excepción
+// sin capturar, matando el proceso entero una y otra vez apenas Coolify lo volvía a
+// levantar. Esto no arregla que Redis siga rechazando comandos (eso requiere subir
+// el límite/plan de Upstash o esperar a que se reinicie), pero al menos deja el
+// proceso vivo y respondiendo, en vez de reiniciarse sin parar.
+process.on('unhandledRejection', (reason) => {
+  console.error('[fatal] Promesa rechazada sin capturar:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[fatal] Excepción sin capturar (proceso sigue vivo):', err);
+});
 
 const CLAIM_ROLE_LABELS = { mediator: 'Mediador (ML)', respondent: 'Vendedor (tú)', complainant: 'Cliente' };
 
@@ -196,6 +217,70 @@ async function loadAnswerLog() {
   return (raw || []).map(parseMaybeJson).filter(Boolean);
 }
 
+// Conteo acumulado de respuestas por persona/día — separado de ANSWER_LOG_KEY a
+// propósito. Ese log se recorta a las últimas ANSWER_LOG_MAX (1000) para no crecer
+// sin límite (piensa en el banco de respuestas, que solo necesita texto reciente),
+// pero con el volumen actual del equipo esas 1000 entradas se llenan en menos de
+// un día entre todas las personas — así que la gráfica de "respuestas por persona"
+// y el contador junto a cada nombre en la Bitácora, que SÍ dependían de ese mismo
+// log recortado, se quedaban "atorados": cada respuesta nueva de la persona más
+// activa tira una entrada vieja SUYA para hacerle lugar, y el total no se mueve
+// aunque siga contestando (caso real: Getzemany, 2026-09-01, "desde ayer tengo
+// 804 y hoy ya conteste y no cambia nada"). Este hash nunca se recorta: una
+// respuesta más solo hace HINCRBY, así que el contador siempre sube y el
+// histórico completo por día queda disponible para "todo el historial".
+const ANSWER_COUNTS_KEY = 'app:answercounts';
+
+// Mismo criterio de "día" para todo mundo sin importar en qué huso horario corra
+// el servidor: México ya no tiene horario de verano (desde 2022), así que
+// America/Mexico_City es un offset fijo (UTC-6) — coincide con el día que ve en
+// pantalla el equipo, que trabaja desde ahí. formato en-CA da directo YYYY-MM-DD.
+const MEXICO_DAY_FORMATTER = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'America/Mexico_City',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+function mexicoDayKey(dateIso) {
+  return MEXICO_DAY_FORMATTER.format(new Date(dateIso));
+}
+
+async function bumpAnswerCount(email, dateIso) {
+  if (!email) return; // el backfill histórico no sabe quién respondió — no hay nada que sumar
+  await redis.hincrby(ANSWER_COUNTS_KEY, `${mexicoDayKey(dateIso)}|${email}`, 1);
+}
+
+async function loadAnswerCounts() {
+  return (await redis.hgetall(ANSWER_COUNTS_KEY)) || {};
+}
+
+// Arranque en caliente, una sola vez: si ANSWER_COUNTS_KEY todavía no existe
+// (primera vez que corre este código, o el hash se perdió en algún incidente de
+// Redis como el de agosto), lo reconstruye a partir de lo que SÍ hay en
+// app:answerlog. Eso solo cubre las últimas ANSWER_LOG_MAX respuestas —no es un
+// historial completo—, pero evita que el contador arranque en 0 justo cuando
+// alguien esté viendo la gráfica. Una vez poblado (por esto o por una respuesta
+// real vía bumpAnswerCount), no se vuelve a tocar: el chequeo "¿ya tiene algo?"
+// hace que llamarlo de nuevo en cada arranque sea inofensivo.
+async function seedAnswerCountsIfEmpty() {
+  try {
+    await withLock('lock:answercounts:seed', 60000, async () => {
+      const existing = await redis.hgetall(ANSWER_COUNTS_KEY);
+      if (existing && Object.keys(existing).length > 0) return;
+      const entries = await loadAnswerLog();
+      let seeded = 0;
+      for (const e of entries) {
+        if (!e.answeredBy || !e.date) continue;
+        await redis.hincrby(ANSWER_COUNTS_KEY, `${mexicoDayKey(e.date)}|${e.answeredBy}`, 1);
+        seeded++;
+      }
+      console.log(`[answercounts] sembrado inicial: ${seeded} respuestas recuperadas de app:answerlog`);
+    });
+  } catch (err) {
+    if (err.status !== 409) console.error('[answercounts] error sembrando contador inicial:', err.message);
+  }
+}
+
 // Agrupa el historial de respuestas por texto EXACTO (recortando espacios): así el
 // banco de respuestas no repite la misma respuesta usada 10 veces como 10 renglones
 // distintos. `questions` guarda hasta 5 preguntas distintas que motivaron esa misma
@@ -361,11 +446,35 @@ async function syncPackById(token, packId, cache, unreadCount) {
   const mediation = isBlocked
     ? await resolveMediation(token, messagesResp.conversation_status?.claim_ids)
     : null;
-  const status = isBlocked
+  // 2026-08-31: "blocked" sin claim_id resultó NO ser confiable como señal de
+  // mediación genuina — se probó primero un margen de antigüedad (asumiendo que solo
+  // lo viejo-sin-reclamo era una ventana cerrada por tiempo), pero en producción esto
+  // seguía marcando cientos de conversaciones recientes-pero-sin-reclamo como
+  // mediación (378 de 722, verificado en vivo). Confirmado con /post-purchase/v1/claims
+  // directo: sin claimId, casi nunca hay un reclamo real detrás, sin importar la
+  // antigüedad.
+  //
+  // Ni siquiera tener claimId bastó: comparado contra el panel real de Mercado
+  // Libre (43 reclamos y mediaciones activos), la app mostraba 344 — 314 de esos
+  // 344 ya tenían mediation.status "closed" (reclamo YA resuelto, la conversación
+  // seguía marcada "blocked" por el lado de ML aunque el reclamo en sí ya cerró).
+  // Se exige además que el reclamo siga "opened" — no basta con que exista.
+  const isGenuineMediation = isBlocked && Boolean(mediation?.claimId) && mediation?.status === 'opened';
+  const naturalStatus = isGenuineMediation
     ? 'mediacion'
     : (lastAnswer && lastQuestion && new Date(lastAnswer.date) > new Date(lastQuestion.date)
       ? 'respondido'
       : 'pendiente');
+  // 2026-08-31: si ML bloqueó la conversación pero todavía no calificó como
+  // mediación genuina arriba (sin claimId confirmado, típicamente un reclamo
+  // recién abierto cuyo ID aún no propaga), tampoco debe verse como "pendiente"
+  // normal — publicar una respuesta por el chat no sirve de nada mientras siga
+  // bloqueada, y confunde al equipo mostrando un botón "Publicar" que va a fallar.
+  // Caso real: pedido de Laura Iveth Herrera Parra, bloqueado sin número de caso
+  // todavía, se veía como "pendiente" con un borrador listo para publicar.
+  const status = (naturalStatus === 'pendiente' && isBlocked && !isGenuineMediation)
+    ? 'respondido'
+    : naturalStatus;
 
   // Mientras la conversación está bloqueada por mediación ya bajamos el detalle
   // completo del reclamo (vía resolveMediation) — lo guardamos aparte para que, en
@@ -377,7 +486,7 @@ async function syncPackById(token, packId, cache, unreadCount) {
 
   let pastMediation = previousRecord?.pastMediation || null;
   let pastMediationChecked = Boolean(previousRecord?.pastMediationChecked);
-  if (isBlocked) {
+  if (isGenuineMediation) {
     // Está mediando otra vez ahora mismo: en cuanto se resuelva hay que volver a
     // revisar (una sola vez, gratis, desde lastActiveMediation de abajo) — si no
     // reseteáramos esto, una venta que ya se había revisado sin reclamo previo se
@@ -499,6 +608,61 @@ async function checkPastMediation(token, record) {
   }
 }
 
+// 2026-08-31: checkPastMediation (arriba) solo corre UNA vez en la vida de cada
+// pack — sirve para rellenar el historial, no para vigilar reclamos nuevos. Hueco
+// real encontrado: una vez que un pack llega a "respondido", el sync normal deja de
+// tocarlo (solo se re-revisa si el cliente escribe un mensaje nuevo); si el cliente
+// abre un reclamo/mediación DIRECTO en Mercado Libre sin escribir nada en el chat,
+// la app nunca se entera. Confirmado en vivo: el panel real de ML mostraba 44
+// reclamos y mediaciones activos, la app solo 24 — los que faltaban eran justo
+// estos, reclamos abiertos sobre packs ya "respondido" que nunca se volvieron a
+// revisar. Esta función sí se repite periódicamente (ver lastMediationWatchAt).
+async function checkNewMediation(token, record) {
+  if (!record.orderId) {
+    record.lastMediationWatchAt = new Date().toISOString();
+    return;
+  }
+  try {
+    const resp = await fetchClaimsByOrder(token, record.orderId);
+    const claims = Array.isArray(resp) ? resp : (resp?.results || resp?.data || []);
+    const [mostRecent] = claims
+      .slice()
+      .sort((a, b) => new Date(b.last_updated || b.date_created || 0) - new Date(a.last_updated || a.date_created || 0));
+    if (mostRecent && mostRecent.status === 'opened') {
+      // Mismo criterio que en syncPackById: solo cuenta como mediación real si el
+      // detalle completo confirma que sigue abierto — el resumen del buscador a
+      // veces no coincide con /claims/{id}.
+      try {
+        const detail = await fetchClaimDetail(token, mostRecent.id);
+        if (detail.status === 'opened') {
+          record.mediation = {
+            claimId: mostRecent.id,
+            type: detail.type || mostRecent.type || null,
+            status: detail.status,
+            stage: detail.stage || mostRecent.stage || null,
+            resolution: detail.resolution || null,
+          };
+          record.lastActiveMediation = { ...record.mediation };
+          record.status = 'mediacion';
+        }
+      } catch (err) {
+        console.warn('No se pudo confirmar el detalle del reclamo nuevo del pack', record.packId, err.message);
+      }
+    }
+  } catch (err) {
+    console.warn('No se pudo revisar reclamo nuevo del pack', record.packId, err.message);
+  }
+  record.lastMediationWatchAt = new Date().toISOString();
+}
+
+// Cuántos packs "respondido" se revisan por ciclo buscando un reclamo nuevo (ver
+// checkNewMediation) — a diferencia de PAST_MEDIATION_CHECK_BATCH (un backlog que se
+// agota una sola vez), este lote se repite para siempre: cualquier venta ya
+// respondida puede escalar a un reclamo en cualquier momento. Con ~1000+
+// "respondido" y 50 por ciclo (cada 2 min), toda la cartera queda revisada cada
+// ~40 minutos.
+const MEDIATION_WATCH_BATCH = 50;
+
 // Cuántas conversaciones "viejas" (ya no reportadas como no leídas por ML) se
 // revisan de nuevo en cada ciclo — ver comentario en runSyncInner().
 const STALE_REFRESH_BATCH = 80;
@@ -568,6 +732,7 @@ async function attachDrafts(packs, token, touched) {
         orderCreationDate: record.orderCreationDate,
         token,
         frequentResponses,
+        isFull: record.isFull,
       });
       record.draftAnswer = { text, generatedAt: new Date().toISOString(), forQuestionDate: questionDate, imagesExcluded, flags };
       if (flags && flags.length) {
@@ -678,6 +843,31 @@ async function runSyncInner() {
     await savePackEntry(packId, fresh);
   });
 
+  // Ver comentario junto a checkNewMediation/MEDIATION_WATCH_BATCH arriba: a
+  // diferencia del lote de arriba (una sola vez en la vida del pack), este se repite
+  // para siempre — ordenado por el que lleva más tiempo sin revisarse, para que con
+  // el tiempo toda la cartera de "respondido" quede cubierta por igual.
+  const mediationWatchCandidates = Object.values(packs)
+    .filter((p) => p.record.status === 'respondido')
+    .sort((a, b) => new Date(a.record.lastMediationWatchAt || 0) - new Date(b.record.lastMediationWatchAt || 0))
+    .slice(0, MEDIATION_WATCH_BATCH);
+  await mapWithConcurrency(mediationWatchCandidates, 3, async (entry) => {
+    const packId = entry.record.packId;
+    await checkNewMediation(token, entry.record);
+    const fresh = await loadPackEntry(packId);
+    if (!fresh) return;
+    // Si mientras tanto alguien le contestó de nuevo (o dejó de estar "respondido"
+    // por cualquier otra razón), no le pisamos ese cambio más reciente con esto.
+    if (fresh.record.status !== 'respondido') return;
+    Object.assign(fresh.record, {
+      mediation: entry.record.mediation,
+      lastActiveMediation: entry.record.lastActiveMediation,
+      status: entry.record.status,
+      lastMediationWatchAt: entry.record.lastMediationWatchAt,
+    });
+    await savePackEntry(packId, fresh);
+  });
+
   // Las conversaciones "respondido" en caché nunca se vuelven a sincronizar solas
   // (el resto del sync las excluye a propósito) — pero a veces una corrección de
   // fondo (paginación de mensajes, adjuntos que se descartaban, etc.) necesita
@@ -708,19 +898,6 @@ async function runSyncInner() {
     }
   });
 
-  // Se guarda lo ya traído de Mercado Libre ANTES de meterse a generar borradores de
-  // IA: attachDrafts puede tardar mucho (o colgarse por completo) si Gemini está
-  // lento/caído/con una conexión mala de por medio — sin este guardado adelantado,
-  // un ciclo entero de mensajes nuevos se quedaba sin persistir mientras tanto (se
-  // vio en vivo corriendo la app en local con internet lento: la sincronización
-  // parecía "atorada" y nunca avanzaba, aunque los mensajes sí se habían traído).
-  if (touched.size) {
-    const toWrite = {};
-    touched.forEach((id) => { toWrite[id] = packs[id]; });
-    await savePacksBulk(toWrite);
-    await saveMeta({ syncedAt: new Date().toISOString() });
-  }
-
   await attachDrafts(packs, token, touched);
 
   if (touched.size) {
@@ -730,6 +907,14 @@ async function runSyncInner() {
   }
   const syncedAt = new Date().toISOString();
   await saveMeta({ syncedAt });
+
+  // Corre DESPUÉS de que todo lo de arriba ya se guardó (savePacksBulk) — lee su
+  // propia copia fresca de Redis en vez de reusar `packs`/`touched` de este ciclo,
+  // para no arriesgarse a que el guardado en bloque de arriba pise con datos viejos
+  // lo que esto vaya escribiendo (envía mensajes de verdad, no puede permitirse esa
+  // condición de carrera). Ver comentario junto a su definición.
+  await sendAutomationReminders().catch((err) => console.error('[automation] error inesperado mandando recordatorios:', err.message));
+
   return { syncedAt, totalPacks: Object.keys(packs).length, errors };
 }
 
@@ -764,6 +949,7 @@ async function regenerateDraftInner(packId) {
     token,
     frequentResponses,
     previousDraftText: previousText,
+    isFull: record.isFull,
   });
   if (flags && flags.length) {
     console.warn(`Borrador IA del pack ${packId} marcado para revisar (${flags.join(', ')})`);
@@ -840,35 +1026,7 @@ async function publishAnswerInner(packId, answeredBy, attachments) {
   // para referenciarse aquí. Si viene vacío, se manda el mensaje sin adjuntos igual
   // que siempre.
   const attachmentFilenames = (attachments || []).map((a) => a.filename).filter(Boolean);
-  try {
-    await sendPackMessage(token, packId, SELLER_ID, record.buyerId, text, attachmentFilenames);
-  } catch (err) {
-    // Un 403 aquí casi siempre significa que Mercado Libre bloqueó la conversación
-    // justo AHORA (típicamente porque entró a mediación) — nuestro caché puede seguir
-    // mostrándola como "pendiente" hasta el próximo sync automático (hasta 2 min),
-    // dejando a la persona con un borrador que ya no se puede enviar y un error crudo
-    // sin explicación. Se refresca este pack puntual de inmediato para que la UI
-    // refleje el estado real sin esperar, y se cambia el mensaje de error por uno
-    // que sí explica qué pasó.
-    if (err.message.includes('ML API 403')) {
-      try {
-        const refreshed = await syncPackById(token, packId, { packs: { [packId]: entry } }, record.unreadCount || 0);
-        const fresh = await loadPackEntry(packId);
-        if (fresh) {
-          fresh.record = refreshed;
-          await savePackEntry(packId, fresh);
-        }
-      } catch (syncErr) {
-        console.warn('No se pudo refrescar el pack tras un 403 al publicar', packId, syncErr.message);
-      }
-      const blockedErr = new Error(
-        'Mercado Libre no permitió enviar el mensaje (403) — lo más probable es que esta conversación acabe de entrar a mediación o algún otro estado que ya no admite respuestas normales. Ya se actualizó el estado de esta conversación; revisa cómo se ve ahora.',
-      );
-      blockedErr.status = 409;
-      throw blockedErr;
-    }
-    throw err;
-  }
+  await sendPackMessage(token, packId, SELLER_ID, record.buyerId, text, attachmentFilenames);
 
   // Marcamos la conversación como leída en Mercado Libre: por defecto nuestra app
   // sincroniza con mark_as_read=false (para no marcar nada leído solo por consultar),
@@ -910,6 +1068,7 @@ async function publishAnswerInner(packId, answeredBy, attachments) {
     question: record.lastQuestion?.text || null,
     date: now,
   });
+  await bumpAnswerCount(answeredBy, now);
   return record;
 }
 
@@ -918,24 +1077,25 @@ function publishAnswer(packId, answeredBy, attachments) {
 }
 
 const app = express();
-// Necesario para que req.secure refleje la verdad detrás de un proxy/balanceador
-// (Vercel, Render, etc. reciben la conexión HTTPS y la reenvían por HTTP interno con
-// el header X-Forwarded-Proto) — si no, Express siempre ve la conexión interna como
-// no-https y req.secure sale falso aunque el usuario sí esté en https.
-app.set('trust proxy', 1);
-// El front-end sondea /api/messages (todo el catálogo de conversaciones, con su
-// historial completo) cada 20s desde cada persona que tenga la pestaña abierta — sin
-// comprimir, eso fue lo que agotó el límite gratuito de "Fast Origin Transfer" de
-// Vercel (10 GB) en unos días y pausó el sitio entero. gzip/brotli en JSON repetitivo
-// como este normalmente recorta 70-90% del peso transferido.
-app.use(compression());
 app.use(cookieParser());
 app.use(express.json());
 
 // Rutas que deben quedar accesibles SIN sesión: la propia página de login, el
 // endpoint que valida usuario/contraseña, y el cron externo (que se autentica con
 // su propio CRON_SECRET, no con una sesión de usuario).
-const PUBLIC_PATHS = new Set(['/login.html', '/api/auth/login', '/api/cron/sync']);
+const PUBLIC_PATHS = new Set([
+  '/login.html',
+  '/api/auth/login',
+  '/api/cron/sync',
+  '/api/cron/backfill-history',
+  '/api/cron/regenerate-pending-drafts',
+  // Automatización n8n de refacturas/envíos acordados (ver
+  // docs/odoo-refacturas-envios-automation-plan.md) — se autentica con CRON_SECRET,
+  // mismo patrón que el cron externo, no con una sesión de usuario.
+  '/api/automation/refacturas-pendientes',
+  '/api/automation/envios-acordados-pendientes',
+  '/api/automation/marcar-planificado',
+]);
 
 function requireAuth(req, res, next) {
   if (PUBLIC_PATHS.has(req.path)) return next();
@@ -959,10 +1119,9 @@ app.post('/api/auth/login', async (req, res) => {
     const normalizedEmail = await verifyCredentials(email, password);
     res.cookie(SESSION_COOKIE, createSessionToken(normalizedEmail), {
       httpOnly: true,
-      // req.secure (no un env var atado a un hosting específico como VERCEL) para que
-      // esto funcione igual en Vercel, Render o cualquier otro lado detrás de https;
-      // en local (npm start, sin https) se desactiva sola, que es lo correcto.
-      secure: req.secure,
+      // Vercel siempre sirve por https; en local (npm start) no hay https, así que la
+      // cookie "secure" se desactiva ahí o el navegador la descartaría por completo.
+      secure: Boolean(process.env.VERCEL),
       sameSite: 'lax',
       maxAge: 30 * 24 * 60 * 60 * 1000,
     });
@@ -1029,6 +1188,16 @@ app.post('/api/sync', async (req, res) => {
     await saveLastSyncError(err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Botón "🔄 Regenerar pendientes" del header — misma acción que
+// /api/cron/regenerate-pending-drafts, pero con sesión de usuario en vez de
+// CRON_SECRET: así cualquiera del equipo ya logueado la puede disparar desde la
+// propia app, sin necesitar terminal ni conocer ningún secreto (2026-09-03, a
+// petición de Alan después de no poder correr el curl con el secreto a mano).
+app.post('/api/admin/regenerate-pending-drafts', async (req, res) => {
+  res.json({ started: true }); // puede tardar varios minutos con muchos pendientes — se revisa en logs
+  runRegeneratePendingDraftsInner().catch((err) => console.error('[regen-pendientes] Error general:', err));
 });
 
 app.post('/api/messages/:packId/regenerate-draft', async (req, res) => {
@@ -1125,6 +1294,14 @@ app.get('/api/log', async (req, res) => {
   res.json({ entries });
 });
 
+// Contador acumulado por persona/día (ver ANSWER_COUNTS_KEY) — a diferencia de
+// /api/log, esto nunca pierde historial, así que es lo que alimenta la gráfica
+// de "respuestas por persona" y el total junto a cada nombre en la Bitácora.
+app.get('/api/answer-counts', async (req, res) => {
+  const counts = await loadAnswerCounts();
+  res.json({ counts });
+});
+
 app.get('/api/response-bank', async (req, res) => {
   const entries = await loadAnswerLog();
   res.json({ bank: computeResponseBank(entries) });
@@ -1149,12 +1326,7 @@ app.get('/api/attachments/:filename', async (req, res) => {
     const siteId = req.query.siteId || 'MLM';
     const { base64, mimeType } = await fetchAttachment(token, req.params.filename, siteId);
     res.set('Content-Type', mimeType || 'image/jpeg');
-    // El contenido de un adjunto de ML nunca cambia para el mismo filename/id, así que
-    // se puede cachear en la CDN de Vercel (antes era "private", lo que obligaba a
-    // pedirlo de nuevo al servidor cada vez que CUALQUIER persona del equipo lo veía,
-    // aunque ya lo hubiera visto alguien más antes) — esto quita de encima al server
-    // (y de "Fast Origin Transfer") las vistas repetidas de la misma foto/PDF.
-    res.set('Cache-Control', 'public, max-age=86400, immutable');
+    res.set('Cache-Control', 'private, max-age=86400');
     res.send(Buffer.from(base64, 'base64'));
   } catch (err) {
     console.error(err);
@@ -1186,14 +1358,468 @@ app.get('/api/cron/sync', async (req, res) => {
   }
 });
 
-const port = process.env.PORT || 3000;
+// 2026-08-29: backfill de una sola vez — cuando Redis se quedó sin cupo y hubo que
+// empezar con una base nueva y vacía, el sync normal (fetchUnreadPacks) solo trae de
+// vuelta lo que Mercado Libre reporta como "no leído", así que las conversaciones ya
+// respondidas (~1189 en el momento del incidente) se quedan fuera del caché para
+// siempre a menos que se traigan aparte. Esta ruta recorre TODAS las ventas del
+// vendedor (no solo lo pendiente) y reconstruye tanto el caché de packs como, para
+// las ya respondidas, entradas de Bitácora — con `answeredBy`/`wasEdited` en null
+// porque eso nunca lo guardó Mercado Libre, solo nuestra app.
+async function runHistoryBackfillInner() {
+  const { access_token: token } = await getAccessToken();
+  const orders = await fetchAllSellerOrders(token, SELLER_ID);
+  const packIds = [...new Set(orders.map((o) => o.pack_id || o.id))];
+  console.log(`[backfill] ${orders.length} órdenes, ${packIds.length} packs únicos a revisar`);
 
-// En Vercel el módulo se importa como función serverless (@vercel/node), sin
-// llamar a listen(); localmente (npm start) sí necesitamos el servidor real.
-if (require.main === module) {
-  app.listen(port, () => {
-    console.log(`Mensajes ML disponibles en http://localhost:${port}`);
+  const cache = await loadCache();
+  let done = 0;
+  let errors = 0;
+  let logged = 0;
+  await mapWithConcurrency(packIds, 5, async (packId) => {
+    try {
+      const record = await syncPackById(token, packId, cache, 0);
+      await savePackEntry(packId, {
+        info: {
+          orderId: record.orderId,
+          buyerName: record.buyerName,
+          buyerId: record.buyerId,
+          itemTitles: record.itemTitles,
+          itemLinks: record.itemLinks,
+          saleDate: record.saleDate,
+          isFull: record.isFull,
+          shippingStatus: record.shippingStatus,
+          shippingStatusLabel: record.shippingStatusLabel,
+          shippingSettled: record.shippingSettled,
+          shippingChecked: true,
+        },
+        record,
+      });
+
+      if (record.status === 'respondido') {
+        const msgs = record.messages || [];
+        for (let i = 0; i < msgs.length - 1; i++) {
+          if (msgs[i].sender === 'cliente' && msgs[i + 1].sender === 'vendedor') {
+            await appendAnswerLog({
+              packId,
+              buyerName: record.buyerName,
+              itemTitles: record.itemTitles,
+              answeredBy: null,
+              wasEdited: false,
+              text: msgs[i + 1].text,
+              question: msgs[i].text,
+              date: msgs[i + 1].date,
+            });
+            logged++;
+          }
+        }
+      }
+      done++;
+      if (done % 50 === 0) console.log(`[backfill] progreso: ${done}/${packIds.length}`);
+    } catch (err) {
+      errors++;
+      console.warn('[backfill] error en pack', packId, err.message);
+    }
+  });
+  console.log(`[backfill] TERMINADO: ${done} ok, ${errors} con error, ${logged} entradas de bitácora reconstruidas`);
+}
+
+function runHistoryBackfill() {
+  return withLock('lock:backfill:history', 3600000, runHistoryBackfillInner);
+}
+
+app.get('/api/cron/backfill-history', async (req, res) => {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  // No se espera a que termine (puede tardar bastante con cientos/miles de packs) —
+  // se dispara en segundo plano y se revisa el avance en los logs.
+  res.json({ started: true });
+  runHistoryBackfill().catch((err) => console.error('[backfill] Error general:', err));
+});
+
+// 2026-09-01: uso puntual — al mejorar el prompt del agente de IA (mejor comprensión
+// de la conversación completa, razonamiento activado en Flash), los borradores YA
+// generados se quedan con el texto de la versión anterior: el sync normal los trata
+// como "frescos" (mismo forQuestionDate, sin error) y nunca los vuelve a tocar, así
+// que sin esto solo las conversaciones NUEVAS verían la mejora. Esta ruta fuerza un
+// regenerateDraftInner (que sí ignora el estado "fresco") sobre cada pack pendiente
+// actual, para que el equipo vea el borrador mejorado de inmediato en vez de esperar
+// a que cada cliente vuelva a escribir.
+async function runRegeneratePendingDraftsInner() {
+  const cache = await loadCache();
+  const pending = Object.values(cache.packs)
+    .map((p) => p.record)
+    .filter((r) => r.status === 'pendiente');
+  console.log(`[regen-pendientes] ${pending.length} borradores pendientes a regenerar`);
+  let ok = 0;
+  let failed = 0;
+  await mapWithConcurrency(pending, 3, async (record) => {
+    try {
+      await regenerateDraftInner(record.packId);
+      ok++;
+    } catch (err) {
+      failed++;
+      console.warn('[regen-pendientes] error en pack', record.packId, err.message);
+    }
+  });
+  console.log(`[regen-pendientes] TERMINADO: ${ok} ok, ${failed} con error`);
+}
+
+app.get('/api/cron/regenerate-pending-drafts', async (req, res) => {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  res.json({ started: true }); // puede tardar varios minutos con muchos pendientes — se revisa en logs
+  runRegeneratePendingDraftsInner().catch((err) => console.error('[regen-pendientes] Error general:', err));
+});
+
+// ---------------------------------------------------------------------------------
+// Automatización n8n: refacturas y envíos acordados con el comprador (aprobado por
+// el gerente de Alan con alcance reducido — ver
+// docs/odoo-refacturas-envios-automation-plan.md, sección 3). n8n hace polling de
+// estos endpoints, crea la "planificación" en Odoo (una Actividad sobre la
+// cotización, para no depender de nombres de campo personalizados que todavía no
+// están confirmados con quien administra Odoo), y avisa de vuelta con
+// /marcar-planificado para que el mismo pack no se vuelva a ofrecer en la próxima
+// corrida. Las validaciones humanas de Crédito y Cobranza / Tráfico NO se tocan —
+// esto solo reemplaza el paso mecánico de capturar los datos en Odoo.
+//
+// AUTOMATION_PLANNED_KEY vive en Redis (no en el propio record del pack) para que
+// "ya se mandó a Odoo" sobreviva a un re-sync normal del pack sin más lógica.
+const AUTOMATION_PLANNED_KEY = 'app:automation:planned';
+
+async function isAlreadyPlanned(categoria, packId) {
+  return Boolean(await redis.hget(AUTOMATION_PLANNED_KEY, `${categoria}:${packId}`));
+}
+
+async function markPlanned(categoria, packId, extra) {
+  await redis.hset(AUTOMATION_PLANNED_KEY, {
+    [`${categoria}:${packId}`]: { plannedAt: new Date().toISOString(), ...extra },
   });
 }
+
+// Prefiltro barato antes de gastar una llamada a Gemini por pack: sin esto, cada
+// corrida de n8n tendría que analizar los ~1500 packs del caché en vez de solo los
+// que de verdad tienen una plantilla de este tipo de por medio. Se basa en el texto
+// de las plantillas ya aprobadas (ver RESPONSE_TEMPLATES en lib/agent.js) — si esas
+// plantillas cambian de redacción, hay que revisar estos patrones también.
+const REFACTURA_ASK_PATTERNS = [/uso de cfdi/i, /r[eé]gimen fiscal/i, /raz[oó]n social/i];
+const ENVIO_ACORDADO_ASK_PATTERNS = [/env[ií]o gratis/i, /dirección completa \(calle/i];
+
+function vendorAskedFor(messages, patterns) {
+  return (messages || []).some((m) => m.sender === 'vendedor' && patterns.some((p) => p.test(m.text || '')));
+}
+
+// ---------------------------------------------------------------------------------
+// Recordatorio automático de datos faltantes (refactura / envío acordado) — decisión
+// explícita de Alan (2026-09-10): a diferencia de la planificación en Odoo (que es
+// interna, nadie del lado del cliente la ve), ESTO SÍ le manda un mensaje directo al
+// cliente en Mercado Libre sin que nadie del equipo lo revise antes. Se acepta ese
+// riesgo porque el texto es 100% mecánico — una plantilla ya aprobada (o la lista
+// exacta de campos que faltan, tomada tal cual la escribió el cliente) — nunca texto
+// libre inventado por la IA. La única parte que usa IA es decidir QUÉ falta, no QUÉ
+// decir; si esa detección se equivoca, el peor caso es un recordatorio de más pidiendo
+// un dato que el cliente ya había dado.
+//
+// Se dispara desde el propio ciclo de sync (cada 2 minutos), no desde n8n: no
+// necesita Odoo para nada, así que no tiene sentido esperar al poll de n8n (cada 10
+// minutos) para algo que la app ya puede resolver por su cuenta.
+const AUTOMATION_REMINDED_KEY = 'app:automation:reminded';
+
+// Solo manda el recordatorio una vez por cada mensaje nuevo del cliente (mismo
+// criterio de "frescura" que ya usa el borrador de IA vía forQuestionDate) — si el
+// cliente vuelve a escribir (aunque siga incompleto), sí se le manda un recordatorio
+// actualizado; mientras no escriba de nuevo, no se le insiste con el mismo mensaje.
+async function alreadyRemindedForQuestion(categoria, packId, questionDate) {
+  const stored = await redis.hget(AUTOMATION_REMINDED_KEY, `${categoria}:${packId}`);
+  return Boolean(stored) && stored.questionDate === questionDate;
+}
+
+async function markReminded(categoria, packId, questionDate) {
+  await redis.hset(AUTOMATION_REMINDED_KEY, {
+    [`${categoria}:${packId}`]: { questionDate, remindedAt: new Date().toISOString() },
+  });
+}
+
+function buildRefacturaReminderText(missing) {
+  const bullets = missing.map((key) => `• ${REFACTURA_FIELD_LABELS[key]}`).join('\n');
+  return `Gracias por la información. Para poder emitir su factura aún nos falta que nos comparta:\n${bullets}\n\nEn cuanto recibamos los datos completos, procedemos con la emisión.`;
+}
+
+// La plantilla aprobada "Mensaje recordatorio de datos pendientes" (ver
+// RESPONSE_TEMPLATES en lib/agent.js) no lista campos específicos — se reutiliza
+// TAL CUAL, en vez de inventar una versión con lista dinámica que nadie aprobó.
+const ENVIO_ACORDADO_REMINDER_TEXT = 'Hola 👋 Quedo pendiente de los datos completos para poder activar tu envío gratis 🎉 Envíamelos por favor en el formato solicitado para continuar con tu envío.';
+
+// Mismo mecanismo de envío que publishAnswerInner (buyerId al vuelo si falta,
+// mandar, marcar leído, reflejar en el caché y en la bitácora), pero sin depender de
+// que exista un draftAnswer y sin sumar al conteo de respuestas por persona
+// (bumpAnswerCount) — nadie del equipo respondió esto, no le corresponde a nadie.
+async function sendAutomatedMessage(packId, text, label) {
+  const entry = await getPackEntryOrThrow(packId);
+  const record = entry.record;
+  const { access_token: token } = await getAccessToken();
+
+  if (!record.buyerId && record.orderId) {
+    try {
+      const order = await fetchOrderDetail(token, record.orderId);
+      record.buyerId = order.buyer?.id || null;
+      if (entry.info) entry.info.buyerId = record.buyerId;
+    } catch {
+      // sigue sin buyerId, cae al error de abajo
+    }
+  }
+  if (!record.buyerId) {
+    throw new Error('No se pudo identificar al comprador de esta conversación');
+  }
+
+  await sendPackMessage(token, packId, SELLER_ID, record.buyerId, text, []);
+  try {
+    await markPackMessagesRead(token, packId, SELLER_ID);
+  } catch (err) {
+    console.warn('No se pudo marcar como leído el pack', packId, err.message);
+  }
+
+  const now = new Date().toISOString();
+  record.messages.push({ sender: 'vendedor', text, date: now, hasAttachment: false, attachments: [] });
+  record.lastAnswer = { sender: 'vendedor', text, date: now, hasAttachment: false };
+  record.status = 'respondido';
+  record.draftAnswer = null;
+  record.answeredBy = label;
+  await savePackEntry(packId, entry);
+  await appendAnswerLog({
+    packId,
+    buyerName: record.buyerName,
+    itemTitles: record.itemTitles,
+    answeredBy: label,
+    wasEdited: false,
+    text,
+    question: record.lastQuestion?.text || null,
+    date: now,
+  });
+}
+
+async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, extractFn, buildText, label }) {
+  if (!vendorAskedFor(record.messages, askPatterns)) return;
+  if (await isAlreadyPlanned(categoria, record.packId)) return; // ya completo y planificado — nada que recordar
+  const questionDate = record.lastQuestion?.date || null;
+  if (!questionDate || (await alreadyRemindedForQuestion(categoria, record.packId, questionDate))) return;
+
+  const { complete, missing } = await extractFn(record.messages, process.env.GEMINI_API_KEY);
+  const totalFields = Object.keys(fieldLabels).length;
+  // Ni completo (no hay nada que recordar) ni en cero (el cliente todavía no
+  // contestó nada — insistir antes de que responda algo sería puro spam):
+  // recordamos solo el caso de en medio, datos parciales.
+  if (complete || missing.length === 0 || missing.length >= totalFields) return;
+
+  try {
+    await withLock(`lock:pack:${record.packId}`, 30000, () => sendAutomatedMessage(record.packId, buildText(missing), label));
+    await markReminded(categoria, record.packId, questionDate);
+  } catch (err) {
+    console.warn(`[automation] no se pudo mandar recordatorio (${categoria}) del pack`, record.packId, err.message);
+  }
+}
+
+// Apagado por default a propósito: esto manda mensajes reales al cliente en
+// Mercado Libre SIN revisión humana (ver comentario de AUTOMATION_REMINDED_KEY
+// arriba). No hay forma de confirmar desde el código si Coolify ya desplegó un
+// commit dado, así que en vez de asumir que "recién subido" significa "todavía no
+// corre en producción", que el propio deploy quede inofensivo hasta que alguien
+// prenda AUTOMATION_REMINDERS_ENABLED=true a propósito en las variables de entorno.
+async function sendAutomationReminders() {
+  if (process.env.AUTOMATION_REMINDERS_ENABLED !== 'true') return;
+  const cache = await loadCache();
+  const candidates = Object.values(cache.packs)
+    .map((p) => p.record)
+    .filter((r) => r && r.status === 'pendiente');
+
+  await mapWithConcurrency(candidates, 3, async (record) => {
+    await remindOneCategory(record, {
+      categoria: 'refactura',
+      askPatterns: REFACTURA_ASK_PATTERNS,
+      fieldLabels: REFACTURA_FIELD_LABELS,
+      extractFn: extractRefacturaData,
+      buildText: buildRefacturaReminderText,
+      label: 'Automatización (datos de refactura faltantes)',
+    });
+    await remindOneCategory(record, {
+      categoria: 'envio_acordado',
+      askPatterns: ENVIO_ACORDADO_ASK_PATTERNS,
+      fieldLabels: ENVIO_ACORDADO_FIELD_LABELS,
+      extractFn: extractEnvioAcordadoData,
+      buildText: () => ENVIO_ACORDADO_REMINDER_TEXT,
+      label: 'Automatización (datos de envío faltantes)',
+    });
+  });
+}
+
+function checkAutomationSecret(req, res) {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    res.status(401).json({ error: 'No autorizado' });
+    return false;
+  }
+  return true;
+}
+
+async function findPendingForCategory({ categoria, askPatterns, extractFn }) {
+  const cache = await loadCache();
+  const candidates = Object.values(cache.packs)
+    .map((p) => p.record)
+    .filter((r) => r && vendorAskedFor(r.messages, askPatterns));
+
+  const results = [];
+  await mapWithConcurrency(candidates, 3, async (record) => {
+    if (await isAlreadyPlanned(categoria, record.packId)) return;
+    const { complete, data } = await extractFn(record.messages, process.env.GEMINI_API_KEY);
+    if (!complete) return;
+    results.push({
+      packId: record.packId,
+      orderId: record.orderId,
+      buyerName: record.buyerName,
+      itemTitles: record.itemTitles,
+      datos: data,
+    });
+  });
+  return results;
+}
+
+app.get('/api/automation/refacturas-pendientes', async (req, res) => {
+  if (!checkAutomationSecret(req, res)) return;
+  try {
+    const pendientes = await findPendingForCategory({
+      categoria: 'refactura',
+      askPatterns: REFACTURA_ASK_PATTERNS,
+      extractFn: extractRefacturaData,
+    });
+    res.json({ pendientes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/automation/envios-acordados-pendientes', async (req, res) => {
+  if (!checkAutomationSecret(req, res)) return;
+  try {
+    const pendientes = await findPendingForCategory({
+      categoria: 'envio_acordado',
+      askPatterns: ENVIO_ACORDADO_ASK_PATTERNS,
+      extractFn: extractEnvioAcordadoData,
+    });
+    res.json({ pendientes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/automation/marcar-planificado', async (req, res) => {
+  if (!checkAutomationSecret(req, res)) return;
+  try {
+    const { packId, categoria, odooActivityId } = req.body || {};
+    if (!packId || !categoria) {
+      return res.status(400).json({ error: 'Falta packId o categoria' });
+    }
+    await markPlanned(categoria, packId, odooActivityId ? { odooActivityId } : undefined);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2026-09-04: migración única de Upstash al Redis de Coolify (ver lib/redis.js,
+// lib/legacyUpstash.js y REDIS_URL) — Upstash llegó al 90% de su cupo gratuito de
+// comandos/mes en solo 3 días. Se dispara sola al arrancar, protegida por lock +
+// un chequeo de "¿ya hay datos?" (si app:users ya tiene algo en el Redis nuevo,
+// asumimos que ya se migró y no se toca nada) — así que correr esto de más nunca
+// duplica ni pisa datos ya migrados. Nunca lanza el error hacia afuera: si algo
+// falla, el servidor arranca de todos modos (mejor arrancar con lo que haya que no
+// arrancar en absoluto), pero avisa fuerte en los logs para revisarlo a mano.
+async function migrateFromUpstashIfEmpty() {
+  try {
+    await withLock('lock:migrate:upstash-to-coolify', 300000, async () => {
+      const existingUsers = await redis.hgetall('app:users');
+      if (existingUsers && Object.keys(existingUsers).length > 0) {
+        console.log('[migrate] el Redis de Coolify ya tiene datos — se omite la migración de Upstash');
+        return;
+      }
+      const legacy = legacyUpstashClient();
+      if (!legacy) {
+        console.warn('[migrate] no hay credenciales de Upstash (KV_REST_API_URL/TOKEN) — se omite la migración');
+        return;
+      }
+      console.log('[migrate] iniciando migración de Upstash al Redis de Coolify...');
+
+      // Claves de un solo valor — se copian tal cual (@upstash/redis ya las
+      // deserializa igual que nuestro wrapper nuevo, ver lib/redis.js encode()).
+      for (const key of ['ml:token', 'ml:cache:meta', 'app:lastSyncError']) {
+        const value = await legacy.get(key);
+        if (value != null) await redis.set(key, value);
+      }
+
+      // Hashes chicos: HGETALL directo no arriesga el límite de tamaño de request
+      // de Upstash (a diferencia de ml:cache:packs, mucho más grande — ver abajo).
+      // app:users es el más crítico de los tres: sin él nadie puede iniciar sesión.
+      for (const key of ['app:users', 'app:answercounts']) {
+        const value = await legacy.hgetall(key);
+        if (value && Object.keys(value).length) await redis.hset(key, value);
+      }
+
+      // app:answerlog es una lista — se lee completa (tope ya acotado a 1000) y se
+      // vuelve a insertar con RPUSH en el mismo orden de lectura, para conservar el
+      // orden original (se escribió con LPUSH: el índice 0 ya es "más nuevo primero").
+      const logEntries = await legacy.lrange('app:answerlog', 0, -1);
+      for (const entry of logEntries) await redis.rpush('app:answerlog', entry);
+
+      // ml:cache:packs puede ser grande — se lee con HSCAN en lotes chicos (mismo
+      // motivo que los scripts de corrección de datos de esta temporada: un HGETALL
+      // de golpe ya nos hizo violar el límite de tamaño de request de Upstash antes).
+      let cursor = '0';
+      let migratedPacks = 0;
+      do {
+        const [nextCursor, raw] = await legacy.hscan('ml:cache:packs', cursor, { count: 50 });
+        cursor = nextCursor;
+        // El SDK de Upstash devuelve los pares como array plano [campo, valor, ...]
+        // (igual que la respuesta nativa de Redis) — se agrupan en un objeto.
+        const chunk = {};
+        if (Array.isArray(raw)) {
+          for (let i = 0; i < raw.length; i += 2) chunk[raw[i]] = raw[i + 1];
+        } else if (raw) {
+          Object.assign(chunk, raw);
+        }
+        if (Object.keys(chunk).length) {
+          await redis.hset('ml:cache:packs', chunk);
+          migratedPacks += Object.keys(chunk).length;
+        }
+      } while (cursor !== '0');
+
+      console.log(`[migrate] TERMINADO: ${migratedPacks} packs, ${logEntries.length} entradas de bitácora, usuarios y contadores copiados`);
+    });
+  } catch (err) {
+    if (err.status !== 409) console.error('[migrate] error inesperado migrando de Upstash:', err.message);
+  }
+}
+
+// Se espera a que la migración termine ANTES de aceptar tráfico (app.listen): sin
+// esto, alguien podría intentar iniciar sesión o el sync podría correr contra un
+// Redis nuevo todavía vacío justo en la ventana entre el arranque y que termine de
+// copiarse todo.
+async function startServer() {
+  await migrateFromUpstashIfEmpty();
+  seedAnswerCountsIfEmpty().catch((err) => console.error('[answercounts] error inesperado sembrando:', err.message));
+
+  const port = process.env.PORT || 3000;
+  // En Vercel el módulo se importa como función serverless (@vercel/node), sin
+  // llamar a listen(); localmente (npm start) sí necesitamos el servidor real.
+  if (require.main === module) {
+    app.listen(port, () => {
+      console.log(`Mensajes ML disponibles en http://localhost:${port}`);
+    });
+  }
+}
+
+startServer().catch((err) => console.error('Error fatal al arrancar el servidor:', err));
 
 module.exports = app;

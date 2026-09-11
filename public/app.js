@@ -8,6 +8,12 @@ const state = {
   presenceInterval: null,
   statusFilter: '',
   logEntries: [],
+  // Conteo acumulado por persona/día, clave "YYYY-MM-DD|email" → cantidad — viene
+  // de /api/answer-counts (ver ANSWER_COUNTS_KEY en el server), NUNCA se recorta.
+  // A diferencia de logEntries (las últimas 1000 respuestas de TODO el equipo,
+  // pensadas para el banco de respuestas), esto es lo que alimenta la gráfica de
+  // "respuestas por persona" y los contadores junto a cada nombre en la Bitácora.
+  answerCounts: {},
   logFilterEmail: '',
   bank: [],
   // Preferencias de uso diario que sí importa recordar entre sesiones, pero que no
@@ -47,6 +53,7 @@ const state = {
 const el = {
   search: document.getElementById('search'),
   syncBtn: document.getElementById('syncBtn'),
+  regenPendingBtn: document.getElementById('regenPendingBtn'),
   syncInfo: document.getElementById('syncInfo'),
   userEmail: document.getElementById('userEmail'),
   statusCounts: document.getElementById('statusCounts'),
@@ -646,10 +653,17 @@ el.bankList.addEventListener('click', async (e) => {
 
 async function refreshLog() {
   try {
-    const res = await fetch('/api/log');
-    if (!res.ok) return;
-    const data = await res.json();
+    const [logRes, countsRes] = await Promise.all([fetch('/api/log'), fetch('/api/answer-counts')]);
+    if (!logRes.ok) return;
+    const data = await logRes.json();
     state.logEntries = data.entries || [];
+    // /api/answer-counts es el conteo acumulado por persona/día (nunca se recorta,
+    // ver ANSWER_COUNTS_KEY en el server) — si por lo que sea falla, seguimos con
+    // lo que ya había en state.answerCounts en vez de tumbar toda la bitácora.
+    if (countsRes.ok) {
+      const countsData = await countsRes.json();
+      state.answerCounts = countsData.counts || {};
+    }
     renderLog();
     renderChart();
   } catch {
@@ -687,6 +701,15 @@ function chartDayKey(dateLike) {
 function formatChartDayLabel(key) {
   const [y, m, d] = key.split('-').map(Number);
   return new Date(y, m - 1, d).toLocaleDateString('es-MX', { day: 'numeric', month: 'short' });
+}
+
+// Misma idea que formatChartDayLabel pero devolviendo el Date en sí (medianoche
+// local) — las claves de state.answerCounts vienen como "YYYY-MM-DD|email" y el
+// día ya lo calculó el server en hora de México (ver mexicoDayKey), así que aquí
+// solo hace falta parsear el string, no convertir husos horarios de nuevo.
+function chartDayKeyToDate(key) {
+  const [y, m, d] = key.split('-').map(Number);
+  return new Date(y, m - 1, d);
 }
 
 // Rango personalizado elegido a mano: { custom: true, from: 'YYYY-MM-DD', to: 'YYYY-MM-DD' }
@@ -735,34 +758,35 @@ function chartRangeLabelText(rangeDays) {
 // Arma los días del eje X (todos, aunque no haya actividad ese día — para que la
 // línea no salte fechas) y, para cada una de las 4 personas, cuántas respuestas
 // publicó por día. `rangeDays` es un número de días hacia atrás, 'all', o un
-// rango personalizado (ver isCustomChartRange).
+// rango personalizado (ver isCustomChartRange). Lee de state.answerCounts (el
+// contador que NUNCA se recorta) en vez de state.logEntries (las últimas 1000
+// respuestas de todo el equipo) — con eso, "todo el historial" muestra de
+// verdad todo el historial, no solo el último día u dos de mucho volumen.
 function computeChartData(rangeDays) {
   const { start: startDate, end: endDate } = resolveChartWindow(rangeDays);
-  // Fin de ese día completo (23:59:59.999) — un rango personalizado puede
-  // terminar en el pasado, así que no basta con comparar contra "ahora".
-  const endOfEndDate = new Date(endDate);
-  endOfEndDate.setHours(23, 59, 59, 999);
+  const counts = state.answerCounts || {};
 
-  const relevant = state.logEntries.filter((e) => {
-    if (!CHART_PEOPLE.some((p) => p.email === e.answeredBy)) return false;
-    const d = new Date(e.date);
+  const relevantKeys = Object.keys(counts).filter((key) => {
+    const [day, email] = key.split('|');
+    if (!CHART_PEOPLE.some((p) => p.email === email)) return false;
+    const d = chartDayKeyToDate(day);
     if (startDate && d < startDate) return false;
-    if (d > endOfEndDate) return false;
+    if (d > endDate) return false;
     return true;
   });
 
-  if (!relevant.length) return { days: [], series: [] };
+  if (!relevantKeys.length) return { days: [], series: [] };
 
   let firstDate = startDate;
   if (!firstDate) {
     // "Todo": arranca en el día del primer dato real que haya para este grupo,
     // no desde el inicio de los tiempos.
-    let earliest = new Date(relevant[0].date);
-    relevant.forEach((e) => {
-      const d = new Date(e.date);
-      if (d < earliest) earliest = d;
+    let earliest = null;
+    relevantKeys.forEach((key) => {
+      const d = chartDayKeyToDate(key.split('|')[0]);
+      if (!earliest || d < earliest) earliest = d;
     });
-    firstDate = new Date(earliest.getFullYear(), earliest.getMonth(), earliest.getDate());
+    firstDate = earliest;
   }
 
   const days = [];
@@ -772,15 +796,13 @@ function computeChartData(rangeDays) {
     cursor.setDate(cursor.getDate() + 1);
   }
 
-  const countsByPersonDay = new Map();
-  relevant.forEach((e) => {
-    const key = `${e.answeredBy}|${chartDayKey(e.date)}`;
-    countsByPersonDay.set(key, (countsByPersonDay.get(key) || 0) + 1);
-  });
-
   const series = CHART_PEOPLE.map((p) => ({
     ...p,
-    values: days.map((d) => countsByPersonDay.get(`${p.email}|${d}`) || 0),
+    // Number(...) por si acaso: viene de un HGETALL y no queremos depender de si
+    // el cliente de Redis lo deserializa a número o lo deja como string — sumar
+    // strings concatena en vez de sumar, y ahí sí volveríamos a tener un contador
+    // que "no cambia" (o que cambia mal) sin que se note por qué.
+    values: days.map((d) => Number(counts[`${d}|${p.email}`]) || 0),
   }));
 
   return { days, series };
@@ -788,14 +810,16 @@ function computeChartData(rangeDays) {
 
 // Total de respuestas de cada persona dentro de una ventana [start, endExclusivo)
 // — nada más para comparar contra el período anterior en las tarjetas de resumen;
-// no toca ni reemplaza el cálculo día-por-día de computeChartData().
+// no toca ni reemplaza el cálculo día-por-día de computeChartData(). Igual que
+// ahí, lee de state.answerCounts para no perder historial viejo.
 function sumPersonsInWindow(startDate, endExclusive) {
   const totals = new Map(CHART_PEOPLE.map((p) => [p.email, 0]));
-  state.logEntries.forEach((e) => {
-    if (!totals.has(e.answeredBy)) return;
-    const d = new Date(e.date);
+  Object.entries(state.answerCounts || {}).forEach(([key, count]) => {
+    const [day, email] = key.split('|');
+    if (!totals.has(email)) return;
+    const d = chartDayKeyToDate(day);
     if (d < startDate || d >= endExclusive) return;
-    totals.set(e.answeredBy, totals.get(e.answeredBy) + 1);
+    totals.set(email, totals.get(email) + (Number(count) || 0));
   });
   return totals;
 }
@@ -1358,12 +1382,33 @@ function dayLabel(iso) {
 }
 
 function renderLog() {
-  const uniqueEmails = [...new Set(state.logEntries.map((e) => e.answeredBy).filter(Boolean))];
+  // El número junto a cada nombre viene de state.answerCounts (acumulado, nunca
+  // se recorta) y no de contar cuántas entradas de state.logEntries tiene esa
+  // persona: ese feed solo guarda las últimas 1000 respuestas de TODO el equipo,
+  // así que con el volumen actual se llena en menos de un día — contando ahí, el
+  // número de la persona más activa se queda "atorado" (cada respuesta nueva le
+  // tira una vieja de encima para hacerle lugar) aunque siga contestando. Ver
+  // ANSWER_COUNTS_KEY en el server para el caso real que destapó esto.
+  const totalsByPerson = new Map();
+  Object.entries(state.answerCounts || {}).forEach(([key, count]) => {
+    const email = key.split('|')[1];
+    totalsByPerson.set(email, (totalsByPerson.get(email) || 0) + (Number(count) || 0));
+  });
+  const grandTotal = [...totalsByPerson.values()].reduce((sum, n) => sum + n, 0);
+
+  // Unión de quien aparece en el feed reciente y quien tiene contador acumulado,
+  // para no perder de la lista de filtros a alguien activo cuyas respuestas más
+  // recientes por casualidad ya no entran en el feed recortado.
+  const uniqueEmails = [...new Set([
+    ...state.logEntries.map((e) => e.answeredBy).filter(Boolean),
+    ...totalsByPerson.keys(),
+  ])];
+
   const filterChip = (email, label, count) => `
     <button class="badge all${state.logFilterEmail === email ? ' active' : ''}" aria-selected="${state.logFilterEmail === email}" data-email="${escapeHtml(email)}">${escapeHtml(label)} (${count})</button>
   `;
-  el.logFilters.innerHTML = filterChip('', 'Todas', state.logEntries.length)
-    + uniqueEmails.map((email) => filterChip(email, shortName(email), state.logEntries.filter((e) => e.answeredBy === email).length)).join('');
+  el.logFilters.innerHTML = filterChip('', 'Todas', grandTotal)
+    + uniqueEmails.map((email) => filterChip(email, shortName(email), totalsByPerson.get(email) || 0)).join('');
 
   const entries = state.logEntries.filter((e) => !state.logFilterEmail || e.answeredBy === state.logFilterEmail);
   el.logEmptyState.hidden = entries.length > 0;
@@ -1971,11 +2016,6 @@ async function handleDraftAction(e) {
       showToast(`Error al publicar: ${err.message}`);
       publishBtn.disabled = false;
       publishBtn.textContent = 'Publicar';
-      // Un 403 de Mercado Libre (conversación bloqueada por mediación, etc.) ya deja
-      // el pack actualizado en el servidor — se recarga para que se vea el estado
-      // real de una vez, en vez de que la tarjeta se quede mostrando el borrador
-      // viejo hasta el siguiente sondeo automático.
-      await loadMessages();
     }
     return;
   }
@@ -2299,8 +2339,43 @@ async function autoSync() {
   }
 }
 
+// Regenera el borrador de TODAS las conversaciones pendientes con el prompt más
+// reciente del agente de IA — para cuando se mejora el prompt (ej. la base de
+// conocimiento técnico o el razonamiento de Flash) y los pendientes ya generados
+// se quedaron con el texto de la versión anterior (el sync normal los deja como
+// "frescos" y nunca los toca de nuevo). Corre en segundo plano en el servidor: el
+// botón se libera de inmediato y los borradores se van actualizando solos en los
+// próximos minutos conforme avanza el sync automático.
+async function regeneratePendingDrafts() {
+  const pendingCount = state.records.filter((r) => r.status === 'pendiente').length;
+  if (!pendingCount) {
+    showToast('No hay borradores pendientes que regenerar', 'success');
+    return;
+  }
+  const confirmed = confirm(
+    `Esto vuelve a generar el borrador de las ${pendingCount} conversaciones pendientes con el ` +
+    'prompt más reciente del agente de IA. Puede tardar varios minutos en terminar. ¿Continuar?',
+  );
+  if (!confirmed) return;
+
+  el.regenPendingBtn.disabled = true;
+  el.regenPendingBtn.textContent = 'Regenerando...';
+  try {
+    const res = await fetch('/api/admin/regenerate-pending-drafts', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Error desconocido');
+    showToast(`Regenerando ${pendingCount} borradores pendientes en segundo plano — se van actualizando solos.`, 'success');
+  } catch (err) {
+    showToast(`Error al regenerar pendientes: ${err.message}`);
+  } finally {
+    el.regenPendingBtn.disabled = false;
+    el.regenPendingBtn.textContent = '🔄 Regenerar pendientes';
+  }
+}
+
 el.search.addEventListener('input', render);
 el.syncBtn.addEventListener('click', sync);
+el.regenPendingBtn.addEventListener('click', regeneratePendingDrafts);
 
 // Filas clicables que son <div role="button"> (no <button>/<a> nativos): el navegador
 // no les da activación por teclado gratis, así que Enter/Espacio se manejan a mano
@@ -2372,12 +2447,7 @@ el.liveNowList.addEventListener('keydown', activateRowOnEnterOrSpace('.live-now-
 
 window.addEventListener('beforeunload', stopPresenceHeartbeat);
 
-// Antes eran 20s: cada persona con la pestaña abierta jala el catálogo COMPLETO de
-// conversaciones (con su historial) del servidor. Con varias personas todo el día,
-// eso fue lo que agotó el límite gratuito de ancho de banda de Vercel y pausó el
-// sitio. 45s sigue siendo "casi al instante" para este uso, pero corta las peticiones
-// (y el gasto de banda) más de la mitad.
-const AUTO_REFRESH_MS = 45000;
+const AUTO_REFRESH_MS = 20000;
 const PRESENCE_POLL_MS = 8000;
 const AUTO_SYNC_MS = 120000;
 setInterval(loadMessages, AUTO_REFRESH_MS);
