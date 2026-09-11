@@ -1623,7 +1623,14 @@ async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, 
   }
 }
 
+// Apagado por default a propósito: esto manda mensajes reales al cliente en
+// Mercado Libre SIN revisión humana (ver comentario de AUTOMATION_REMINDED_KEY
+// arriba). No hay forma de confirmar desde el código si Coolify ya desplegó un
+// commit dado, así que en vez de asumir que "recién subido" significa "todavía no
+// corre en producción", que el propio deploy quede inofensivo hasta que alguien
+// prenda AUTOMATION_REMINDERS_ENABLED=true a propósito en las variables de entorno.
 async function sendAutomationReminders() {
+  if (process.env.AUTOMATION_REMINDERS_ENABLED !== 'true') return;
   const cache = await loadCache();
   const candidates = Object.values(cache.packs)
     .map((p) => p.record)
