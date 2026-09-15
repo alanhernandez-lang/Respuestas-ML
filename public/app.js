@@ -1470,15 +1470,21 @@ function isEnvioAcordado(r) {
   return r.shippingStatusLabel === 'Acordar con el vendedor';
 }
 
+// Estas dos categorías son listas de "trabajo pendiente" (para la automatización de
+// Odoo, entre otras cosas) — nunca deben mostrar casos ya respondidos, y tampoco los
+// que estén en mediación (esos se manejan por el flujo de reclamos, no respondiendo
+// el chat normal; mezclar los dos confunde qué necesita acción y por dónde). Por eso
+// el conteo y el filtro exigen status === 'pendiente' a propósito, no solo la
+// categoría — ver también matchesCategory en render().
 function categoryCountsHtml(records) {
-  const refacturas = records.filter((r) => r.isRefacturaCandidate).length;
-  const envios = records.filter(isEnvioAcordado).length;
+  const refacturas = records.filter((r) => r.isRefacturaCandidate && r.status === 'pendiente').length;
+  const envios = records.filter((r) => isEnvioAcordado(r) && r.status === 'pendiente').length;
   const chip = (cat, label) => `
     <button class="badge ${cat || 'all'}" aria-selected="${state.categoryFilter === cat}" data-category="${cat}">${label}</button>
   `;
   return chip('', 'Todas las categorías')
-    + chip('refactura', `🧾 ${refacturas} refactura${refacturas === 1 ? '' : 's'}`)
-    + chip('envio_acordado', `📦 ${envios} envío${envios === 1 ? '' : 's'} acordado${envios === 1 ? '' : 's'}`);
+    + chip('refactura', `🧾 ${refacturas} refactura${refacturas === 1 ? '' : 's'} pendiente${refacturas === 1 ? '' : 's'}`)
+    + chip('envio_acordado', `📦 ${envios} envío${envios === 1 ? '' : 's'} acordado${envios === 1 ? '' : 's'} pendiente${envios === 1 ? '' : 's'}`);
 }
 
 function timeAgo(iso) {
@@ -1598,8 +1604,11 @@ function render() {
       || r.itemTitles.join(' ').toLowerCase().includes(q)
       || (r.lastQuestion?.text || '').toLowerCase().includes(q);
     const matchesStatus = !state.statusFilter || r.status === state.statusFilter;
+    // Solo pendientes por responder — nunca respondidos ni en mediación (ver
+    // comentario junto a categoryCountsHtml).
     const matchesCategory = !state.categoryFilter
-      || (state.categoryFilter === 'refactura' ? r.isRefacturaCandidate : isEnvioAcordado(r));
+      || (r.status === 'pendiente'
+        && (state.categoryFilter === 'refactura' ? r.isRefacturaCandidate : isEnvioAcordado(r)));
     const matchesFlag = !state.showFlaggedOnly || state.flags.has(r.packId);
     // "No leídos"/"Leídos" es el concepto de Mercado Libre (¿hay mensajes sin abrir
     // en ML?), no el estado pendiente/mediación/respondido de esta app — por eso se
@@ -2435,7 +2444,12 @@ el.categoryCounts.addEventListener('click', (e) => {
   // Clic sobre el filtro ya activo = quitarlo (mismo criterio que un toggle), en vez
   // de quedar atorado sin forma visual de volver a "todas las categorías" salvo
   // clicando exactamente el chip "Todas" — con esto cualquiera de los tres sirve.
-  state.categoryFilter = state.categoryFilter === btn.dataset.category ? '' : btn.dataset.category;
+  const activating = state.categoryFilter !== btn.dataset.category && btn.dataset.category;
+  state.categoryFilter = activating ? btn.dataset.category : '';
+  // Estas categorías ya fuerzan "pendiente" en el filtrado (matchesCategory), así que
+  // si el filtro de estado quedara en "Respondido" o "Mediación" se vería una lista
+  // vacía sin explicación — se alinea el chip de estado para que no confunda.
+  if (activating) state.statusFilter = 'pendiente';
   render();
 });
 
