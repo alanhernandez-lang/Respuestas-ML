@@ -34,6 +34,14 @@
      --pending/--mediation (texto saturado sobre fondo muy pálido). */
   --full: #1d4ed8;
   --full-bg: #e0e7ff;
+  /* Categorías de automatización (refacturas / envíos acordados con el comprador,
+     ver categoryCountsHtml en app.js) — mismo perfil de contraste que el resto
+     (texto saturado sobre fondo muy pálido), en tonos que no chocan con los tres
+     colores de estado (naranja/verde/rojo) ni con FULL (azul). */
+  --refactura: #8526c9;
+  --refactura-bg: #f3e5ff;
+  --acordado: #0d7a70;
+  --acordado-bg: #dbf5f1;
   /* Tonos oscurecidos a propósito (vs. la paleta "pastel" original) para que las
      iniciales blancas del avatar cumplan contraste AA (>=4.5:1) sobre cualquiera. */
   --av-1: #1d4ed8;
@@ -79,6 +87,10 @@
     --flag: #fbbf24;
     --full: #93b4ff;
     --full-bg: #1e2a4a;
+    --refactura: #d8a8ff;
+    --refactura-bg: #2f1a42;
+    --acordado: #5eead4;
+    --acordado-bg: #12332e;
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow-md: 0 3px 10px rgba(0, 0, 0, 0.35);
     --shadow-lg: 0 10px 32px rgba(0, 0, 0, 0.45);
@@ -110,6 +122,10 @@
   --flag: #fbbf24;
   --full: #93b4ff;
   --full-bg: #1e2a4a;
+  --refactura: #d8a8ff;
+  --refactura-bg: #2f1a42;
+  --acordado: #5eead4;
+  --acordado-bg: #12332e;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-md: 0 3px 10px rgba(0, 0, 0, 0.35);
   --shadow-lg: 0 10px 32px rgba(0, 0, 0, 0.45);
@@ -1132,6 +1148,13 @@ input[type="search"] {
 .badge.full-badge::before { display: none; }
 .badge.shipping-badge { color: var(--muted); background: var(--surface-2); border: 1px solid var(--border); }
 .badge.shipping-badge::before { display: none; }
+
+/* Categorías de automatización (filtro de la barra lateral, ver categoryCountsHtml
+   en app.js) — llevan su propio ícono (🧾/📦) en vez del puntito genérico, mismo
+   criterio que full-badge/shipping-badge de arriba. */
+.badge.refactura { color: var(--refactura); background: var(--refactura-bg); }
+.badge.envio_acordado { color: var(--acordado); background: var(--acordado-bg); }
+.badge.refactura::before, .badge.envio_acordado::before { display: none; }
 
 /* Los tres estados vacíos (sidebar, bitácora, banco) siguen siendo un único <p>
    normal dentro del flujo de su columna flex — a propósito, para no arriesgar

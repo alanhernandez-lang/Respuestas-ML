@@ -7,6 +7,11 @@ const state = {
   viewers: {},
   presenceInterval: null,
   statusFilter: '',
+  // '' (todas) / 'refactura' / 'envio_acordado' — filtro independiente del de estado
+  // (pendiente/mediación/respondido): una refactura o un envío acordado puede estar
+  // en cualquiera de esos tres estados, así que se combina con él en vez de
+  // reemplazarlo (ver matchesCategory en render()).
+  categoryFilter: '',
   logEntries: [],
   // Conteo acumulado por persona/día, clave "YYYY-MM-DD|email" → cantidad — viene
   // de /api/answer-counts (ver ANSWER_COUNTS_KEY en el server), NUNCA se recorta.
@@ -57,6 +62,7 @@ const el = {
   syncInfo: document.getElementById('syncInfo'),
   userEmail: document.getElementById('userEmail'),
   statusCounts: document.getElementById('statusCounts'),
+  categoryCounts: document.getElementById('categoryCounts'),
   conversationList: document.getElementById('conversationList'),
   empty: document.getElementById('emptyState'),
   chatEmpty: document.getElementById('chatEmpty'),
@@ -1453,6 +1459,28 @@ function statusCountsHtml(records) {
     + chip('respondido', 'respondido', `${STATUS_ICON.respondido} ${counts.respondido} respondido${counts.respondido === 1 ? '' : 's'}`);
 }
 
+// Filtro aparte de "categoría" (refacturas / envíos acordados) — no reemplaza al de
+// estado, se combina con él (una refactura puede estar pendiente, respondida o en
+// mediación). "Envío acordado" reutiliza shippingStatusLabel, que ya viene de la API
+// de envíos de ML (dato exacto, no una suposición); "Refactura" viene de
+// isRefacturaCandidate, calculado en el servidor (ver vendorAskedFor/
+// REFACTURA_ASK_PATTERNS en server.js) porque no hay un campo estructurado
+// equivalente para eso.
+function isEnvioAcordado(r) {
+  return r.shippingStatusLabel === 'Acordar con el vendedor';
+}
+
+function categoryCountsHtml(records) {
+  const refacturas = records.filter((r) => r.isRefacturaCandidate).length;
+  const envios = records.filter(isEnvioAcordado).length;
+  const chip = (cat, label) => `
+    <button class="badge ${cat || 'all'}" aria-selected="${state.categoryFilter === cat}" data-category="${cat}">${label}</button>
+  `;
+  return chip('', 'Todas las categorías')
+    + chip('refactura', `🧾 ${refacturas} refactura${refacturas === 1 ? '' : 's'}`)
+    + chip('envio_acordado', `📦 ${envios} envío${envios === 1 ? '' : 's'} acordado${envios === 1 ? '' : 's'}`);
+}
+
 function timeAgo(iso) {
   if (!iso) return '';
   const diffMs = Date.now() - new Date(iso).getTime();
@@ -1570,13 +1598,15 @@ function render() {
       || r.itemTitles.join(' ').toLowerCase().includes(q)
       || (r.lastQuestion?.text || '').toLowerCase().includes(q);
     const matchesStatus = !state.statusFilter || r.status === state.statusFilter;
+    const matchesCategory = !state.categoryFilter
+      || (state.categoryFilter === 'refactura' ? r.isRefacturaCandidate : isEnvioAcordado(r));
     const matchesFlag = !state.showFlaggedOnly || state.flags.has(r.packId);
     // "No leídos"/"Leídos" es el concepto de Mercado Libre (¿hay mensajes sin abrir
     // en ML?), no el estado pendiente/mediación/respondido de esta app — por eso se
     // combina con el filtro de estado en vez de reemplazarlo (ver READ_FILTER_CYCLE).
     const matchesRead = !state.readFilter
       || (state.readFilter === 'unread' ? r.unreadCount > 0 : !(r.unreadCount > 0));
-    return matchesQ && matchesStatus && matchesFlag && matchesRead;
+    return matchesQ && matchesStatus && matchesCategory && matchesFlag && matchesRead;
   });
   // sort() es estable: dentro de cada grupo de prioridad se conserva el orden por
   // fecha que ya trae el arreglo (el servidor lo entrega del más reciente al más viejo)
@@ -1595,6 +1625,7 @@ function render() {
   state.filteredIds = filtered.map((r) => r.packId);
 
   el.statusCounts.innerHTML = statusCountsHtml(state.records);
+  el.categoryCounts.innerHTML = categoryCountsHtml(state.records);
   const flaggedTotal = state.records.filter((r) => state.flags.has(r.packId)).length;
   el.flagFilterBtn.textContent = `⭐ Marcados (${flaggedTotal})`;
   el.flagFilterBtn.setAttribute('aria-pressed', String(state.showFlaggedOnly));
@@ -2395,6 +2426,16 @@ el.statusCounts.addEventListener('click', (e) => {
   const btn = e.target.closest('.badge');
   if (!btn) return;
   state.statusFilter = btn.dataset.status;
+  render();
+});
+
+el.categoryCounts.addEventListener('click', (e) => {
+  const btn = e.target.closest('.badge');
+  if (!btn) return;
+  // Clic sobre el filtro ya activo = quitarlo (mismo criterio que un toggle), en vez
+  // de quedar atorado sin forma visual de volver a "todas las categorías" salvo
+  // clicando exactamente el chip "Todas" — con esto cualquiera de los tres sirve.
+  state.categoryFilter = state.categoryFilter === btn.dataset.category ? '' : btn.dataset.category;
   render();
 });
 

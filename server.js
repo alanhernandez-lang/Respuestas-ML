@@ -521,6 +521,14 @@ async function syncPackById(token, packId, cache, unreadCount) {
     shippingStatus: info.shippingStatus,
     shippingStatusLabel: info.shippingStatusLabel,
     shippingSettled: info.shippingSettled,
+    // Para el filtro de "Refacturas" del sidebar (ver categoryCountsHtml en app.js).
+    // El de "Envíos acordados" no necesita un campo aparte: reutiliza
+    // shippingStatusLabel === 'Acordar con el vendedor', que ya viene de la API de
+    // envíos de ML (dato exacto), a diferencia de esto que solo es una detección por
+    // texto (ver REFACTURA_ASK_PATTERNS/vendorAskedFor, definidos más abajo en este
+    // archivo pero disponibles aquí igual — son const de módulo, ya están asignados
+    // para cuando esta función se llama de verdad).
+    isRefacturaCandidate: vendorAskedFor(messages, REFACTURA_ASK_PATTERNS),
     unreadCount,
     status: finalStatus,
     lastQuestion,
@@ -685,8 +693,10 @@ const MESSAGES_BACKFILL_BATCH = 80;
 // sincronizar), se sube este número — eso hace que TODAS pasen una vez más por el
 // backfill de abajo, sin importar que ya hubieran pasado por una versión anterior.
 // V1: la paginación de mensajes que se perdía en silencio. V2: los PDFs adjuntos
-// que se descartaban por completo antes de guardarse.
-const MESSAGES_BACKFILL_VERSION = 2;
+// que se descartaban por completo antes de guardarse. V3: isRefacturaCandidate
+// (filtro de categoría del sidebar) — sin este bump, todo lo ya cacheado como
+// "respondido" se quedaría sin ese campo hasta que alguien vuelva a escribir.
+const MESSAGES_BACKFILL_VERSION = 3;
 
 // El borrador de IA sigue siendo válido mientras nadie haya hecho una pregunta
 // nueva desde que se generó, así que solo se regenera cuando cambia lastQuestion.
