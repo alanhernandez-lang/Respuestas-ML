@@ -28,13 +28,22 @@
       <button class="view-tab" id="tabBank" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="viewBank">📚 Banco de respuestas</button>
     </nav>
     <div class="toolbar">
-      <button id="syncBtn" type="button">Sincronizar</button>
-      <span id="syncInfo" class="sync-info" role="status" aria-live="polite"></span>
-      <button id="regenPendingBtn" type="button" class="btn-secondary" title="Vuelve a generar el borrador de TODAS las conversaciones pendientes con el prompt más reciente del agente de IA">🔄 Regenerar pendientes</button>
-      <button id="shortcutsBtn" class="icon-btn" type="button" aria-label="Ver atajos de teclado" title="Atajos de teclado (?)">⌨</button>
-      <button id="themeToggle" class="icon-btn" type="button" aria-label="Cambiar a tema oscuro" title="Cambiar tema claro/oscuro">🌙</button>
-      <span id="userEmail" class="user-email"></span>
-      <a href="/api/auth/logout" class="logout-link">Cerrar sesión</a>
+      <div class="toolbar-group toolbar-actions">
+        <button id="syncBtn" type="button">🔄 Sincronizar</button>
+        <span id="syncInfo" class="sync-info" role="status" aria-live="polite"></span>
+        <button id="regenPendingBtn" type="button" class="btn-secondary" title="Vuelve a generar el borrador de TODAS las conversaciones pendientes con el prompt más reciente del agente de IA">✨ Regenerar pendientes</button>
+      </div>
+      <div class="toolbar-divider" aria-hidden="true"></div>
+      <div class="toolbar-group toolbar-utility">
+        <button id="shortcutsBtn" class="icon-btn" type="button" aria-label="Ver atajos de teclado" title="Atajos de teclado (?)">⌨</button>
+        <button id="themeToggle" class="icon-btn" type="button" aria-label="Cambiar a tema oscuro" title="Cambiar tema claro/oscuro">🌙</button>
+      </div>
+      <div class="toolbar-divider" aria-hidden="true"></div>
+      <div class="toolbar-group toolbar-account">
+        <span id="userAvatar" class="avatar" aria-hidden="true"></span>
+        <span id="userEmail" class="user-email"></span>
+        <a href="/api/auth/logout" class="logout-link">Cerrar sesión</a>
+      </div>
     </div>
   </header>
 

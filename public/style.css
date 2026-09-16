@@ -272,17 +272,48 @@ h1 {
 
 .toolbar {
   display: flex;
-  gap: 0.6rem;
+  gap: 0.7rem;
   align-items: center;
   flex-wrap: wrap;
   justify-self: end;
 }
 
+/* Agrupar en zonas (acciones / utilidades / cuenta) en vez de una sola fila plana de
+   botones sueltos — con el separador vertical de abajo, cada zona se lee de un
+   vistazo como "esto va junto", incluso cuando el header envuelve en pantallas
+   angostas (ver .toolbar-divider más abajo, que se oculta ahí para no dejar una
+   rayita huérfana al inicio de una línea nueva). */
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.toolbar-divider {
+  width: 1px;
+  height: 22px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+
+.toolbar-account {
+  margin-left: 0.1rem;
+}
+
+/* Mismo componente .avatar que usa el resto de la app (hilo de conversación, "quién
+   más está viendo esto"), solo más chico — evita reinventar un segundo estilo de
+   avatar aparte solo para el header. */
+.toolbar-account .avatar { width: 24px; height: 24px; font-size: 0.66rem; box-shadow: none; }
+
 .user-email {
-  margin-left: auto;
   color: var(--muted);
   font-size: 0.82rem;
   cursor: default;
+}
+
+@media (max-width: 900px) {
+  .toolbar-divider { display: none; }
 }
 
 .logout-link {

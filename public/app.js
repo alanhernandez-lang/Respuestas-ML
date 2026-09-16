@@ -61,6 +61,7 @@ const el = {
   regenPendingBtn: document.getElementById('regenPendingBtn'),
   syncInfo: document.getElementById('syncInfo'),
   userEmail: document.getElementById('userEmail'),
+  userAvatar: document.getElementById('userAvatar'),
   statusCounts: document.getElementById('statusCounts'),
   categoryCounts: document.getElementById('categoryCounts'),
   conversationList: document.getElementById('conversationList'),
@@ -458,8 +459,11 @@ async function loadUserEmail() {
     if (!res.ok) return;
     const data = await res.json();
     if (data.email) {
-      el.userEmail.textContent = shortName(data.email);
+      const name = shortName(data.email);
+      el.userEmail.textContent = name;
       el.userEmail.title = data.email;
+      el.userAvatar.textContent = initials(name);
+      el.userAvatar.classList.add(avatarColorClass(name));
     }
   } catch {
     // No es crítico para el uso de la app si esto falla, se omite en silencio.
