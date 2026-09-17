@@ -63,7 +63,6 @@ const el = {
   userEmail: document.getElementById('userEmail'),
   userAvatar: document.getElementById('userAvatar'),
   statusCounts: document.getElementById('statusCounts'),
-  categoryCounts: document.getElementById('categoryCounts'),
   conversationList: document.getElementById('conversationList'),
   empty: document.getElementById('emptyState'),
   chatEmpty: document.getElementById('chatEmpty'),
@@ -1480,15 +1479,18 @@ function isEnvioAcordado(r) {
 // el chat normal; mezclar los dos confunde qué necesita acción y por dónde). Por eso
 // el conteo y el filtro exigen status === 'pendiente' a propósito, no solo la
 // categoría — ver también matchesCategory en render().
+// Sin chip propio de "Todas las categorías" — el "Todas (N)" de statusCountsHtml ya
+// limpia los dos filtros a la vez (ver el click handler), así que un segundo botón
+// de "reset" aquí solo sería un chip más ocupando espacio sin agregar nada; para
+// quitar un filtro de categoría puntual basta con volver a clicarlo (toggle).
 function categoryCountsHtml(records) {
   const refacturas = records.filter((r) => r.isRefacturaCandidate && r.status === 'pendiente').length;
   const envios = records.filter((r) => isEnvioAcordado(r) && r.status === 'pendiente').length;
   const chip = (cat, label) => `
-    <button class="badge ${cat || 'all'}" aria-selected="${state.categoryFilter === cat}" data-category="${cat}">${label}</button>
+    <button class="badge ${cat}" aria-selected="${state.categoryFilter === cat}" data-category="${cat}">${label}</button>
   `;
-  return chip('', 'Todas las categorías')
-    + chip('refactura', `🧾 ${refacturas} refactura${refacturas === 1 ? '' : 's'} pendiente${refacturas === 1 ? '' : 's'}`)
-    + chip('envio_acordado', `📦 ${envios} envío${envios === 1 ? '' : 's'} acordado${envios === 1 ? '' : 's'} pendiente${envios === 1 ? '' : 's'}`);
+  return chip('refactura', `🧾 ${refacturas} refactura${refacturas === 1 ? '' : 's'}`)
+    + chip('envio_acordado', `📦 ${envios} acordado${envios === 1 ? '' : 's'}`);
 }
 
 function timeAgo(iso) {
@@ -1637,8 +1639,12 @@ function render() {
 
   state.filteredIds = filtered.map((r) => r.packId);
 
-  el.statusCounts.innerHTML = statusCountsHtml(state.records);
-  el.categoryCounts.innerHTML = categoryCountsHtml(state.records);
+  // Una sola fila con scroll horizontal (ver CSS de .status-counts) en vez de dos
+  // filas apiladas — con la barra lateral angosta, dos filas de chips completas
+  // dejaban muy poco alto para la lista de conversaciones en sí.
+  el.statusCounts.innerHTML = statusCountsHtml(state.records)
+    + '<span class="chip-divider" aria-hidden="true"></span>'
+    + categoryCountsHtml(state.records);
   const flaggedTotal = state.records.filter((r) => state.flags.has(r.packId)).length;
   el.flagFilterBtn.textContent = `⭐ Marcados (${flaggedTotal})`;
   el.flagFilterBtn.setAttribute('aria-pressed', String(state.showFlaggedOnly));
@@ -2435,25 +2441,28 @@ function activateRowOnEnterOrSpace(rowSelector) {
 }
 el.conversationList.addEventListener('keydown', activateRowOnEnterOrSpace('.conversation-item'));
 
+// Un solo contenedor para los dos grupos de chips (estado + categoría, ver render())
+// desde que se unieron en una sola fila con scroll horizontal — un botón trae
+// `data-status` o `data-category` según a cuál grupo pertenezca, nunca los dos.
 el.statusCounts.addEventListener('click', (e) => {
   const btn = e.target.closest('.badge');
   if (!btn) return;
-  state.statusFilter = btn.dataset.status;
-  render();
-});
-
-el.categoryCounts.addEventListener('click', (e) => {
-  const btn = e.target.closest('.badge');
-  if (!btn) return;
-  // Clic sobre el filtro ya activo = quitarlo (mismo criterio que un toggle), en vez
-  // de quedar atorado sin forma visual de volver a "todas las categorías" salvo
-  // clicando exactamente el chip "Todas" — con esto cualquiera de los tres sirve.
-  const activating = state.categoryFilter !== btn.dataset.category && btn.dataset.category;
-  state.categoryFilter = activating ? btn.dataset.category : '';
-  // Estas categorías ya fuerzan "pendiente" en el filtrado (matchesCategory), así que
-  // si el filtro de estado quedara en "Respondido" o "Mediación" se vería una lista
-  // vacía sin explicación — se alinea el chip de estado para que no confunda.
-  if (activating) state.statusFilter = 'pendiente';
+  if (btn.dataset.category !== undefined) {
+    // Clic sobre el filtro ya activo = quitarlo (toggle), en vez de necesitar un
+    // chip de "todas las categorías" aparte solo para eso.
+    const activating = state.categoryFilter !== btn.dataset.category && btn.dataset.category;
+    state.categoryFilter = activating ? btn.dataset.category : '';
+    // Estas categorías ya fuerzan "pendiente" en el filtrado (matchesCategory), así
+    // que si el filtro de estado quedara en "Respondido" o "Mediación" se vería una
+    // lista vacía sin explicación — se alinea el chip de estado para que no confunda.
+    if (activating) state.statusFilter = 'pendiente';
+  } else {
+    state.statusFilter = btn.dataset.status;
+    // "Todas" (data-status="") limpia también cualquier filtro de categoría activo —
+    // sin esto, quedaría "atorado" en Refacturas/Envíos sin un botón visible para
+    // salir de ahí salvo volver a clicar ese mismo chip.
+    if (!btn.dataset.status) state.categoryFilter = '';
+  }
   render();
 });
 
