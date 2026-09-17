@@ -63,6 +63,7 @@ const el = {
   userEmail: document.getElementById('userEmail'),
   userAvatar: document.getElementById('userAvatar'),
   statusCounts: document.getElementById('statusCounts'),
+  categoryCounts: document.getElementById('categoryCounts'),
   conversationList: document.getElementById('conversationList'),
   empty: document.getElementById('emptyState'),
   chatEmpty: document.getElementById('chatEmpty'),
@@ -116,6 +117,11 @@ const el = {
   sortMode: document.getElementById('sortMode'),
   flagFilterBtn: document.getElementById('flagFilterBtn'),
   readFilterBtn: document.getElementById('readFilterBtn'),
+  filtersMenuBtn: document.getElementById('filtersMenuBtn'),
+  filtersMenu: document.getElementById('filtersMenu'),
+  accountMenuBtn: document.getElementById('accountMenuBtn'),
+  accountMenu: document.getElementById('accountMenu'),
+  syncWarning: document.getElementById('syncWarning'),
   shortcutsBtn: document.getElementById('shortcutsBtn'),
   shortcutsOverlay: document.getElementById('shortcutsOverlay'),
   shortcutsClose: document.getElementById('shortcutsClose'),
@@ -365,13 +371,64 @@ el.shortcutsOverlay.addEventListener('click', (e) => {
   if (e.target === el.shortcutsOverlay) closeShortcuts();
 });
 
+// Popovers chicos anclados a un botón (menú "⋯" de filtros del sidebar, menú de
+// cuenta del header) — a diferencia de los overlays de arriba, no bloquean el resto
+// de la app: se cierran solos con clic afuera, Escape, o al abrirse otro.
+let openPopover = null;
+
+function setupPopover(trigger, panel, { onOpen } = {}) {
+  const control = { close };
+  function open() {
+    openPopover?.close();
+    onOpen?.();
+    panel.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    document.addEventListener('keydown', onKeydown);
+    // Sin el setTimeout, el propio clic que abre el popover burbujea hasta este mismo
+    // listener de document y lo cerraría en el acto.
+    setTimeout(() => document.addEventListener('click', onOutsideClick), 0);
+    openPopover = control;
+  }
+  function close() {
+    if (panel.hidden) return;
+    panel.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+    document.removeEventListener('keydown', onKeydown);
+    document.removeEventListener('click', onOutsideClick);
+    if (openPopover === control) openPopover = null;
+  }
+  function onKeydown(e) {
+    if (e.key !== 'Escape') return;
+    close();
+    trigger.focus();
+  }
+  function onOutsideClick(e) {
+    if (!panel.contains(e.target) && !trigger.contains(e.target)) close();
+  }
+  trigger.addEventListener('click', () => (panel.hidden ? open() : close()));
+  return control;
+}
+
+// .filters-menu es position:fixed (ver comentario en style.css sobre por qué), así
+// que su posición no la resuelve el flujo normal — se calcula a mano contra el botón
+// cada vez que se abre.
+setupPopover(el.filtersMenuBtn, el.filtersMenu, {
+  onOpen: () => {
+    const r = el.filtersMenuBtn.getBoundingClientRect();
+    el.filtersMenu.style.top = `${r.bottom + 8}px`;
+    el.filtersMenu.style.right = `${window.innerWidth - r.right}px`;
+  },
+});
+setupPopover(el.accountMenuBtn, el.accountMenu);
+
 // Atajos de teclado para quien use la herramienta muchas horas al día (ver también
 // el modal de ayuda que abre "?", con la lista completa). Se ignoran por completo
 // mientras la persona esté escribiendo en un campo de texto (isEditableField) o
 // mientras haya un modal propio abierto (confirmación/imagen/atajos), que ya manejan
 // su propio teclado.
 document.addEventListener('keydown', (e) => {
-  if (!el.confirmOverlay.hidden || !el.lightboxOverlay.hidden || !el.shortcutsOverlay.hidden) return;
+  if (!el.confirmOverlay.hidden || !el.lightboxOverlay.hidden || !el.shortcutsOverlay.hidden
+    || !el.filtersMenu.hidden || !el.accountMenu.hidden) return;
 
   // Sin esto, cualquier combinación con Ctrl/Cmd/Alt donde la tecla coincida con uno
   // de nuestros atajos de letra sin modificador (sobre todo Ctrl/Cmd+F "buscar en la
@@ -1450,6 +1507,11 @@ function renderLog() {
   });
 }
 
+// Estos chips viven en la franja de acciones del header (ver .header-filters en
+// style.css), no en la barra lateral — ahí sí hay ancho de sobra para la etiqueta
+// completa ("101 pendientes"), a diferencia de los 330px del sidebar donde esto
+// vivía antes y donde ícono+número a secas era la única forma de que las 4 cupieran
+// sin recortarse.
 function statusCountsHtml(records) {
   const counts = { pendiente: 0, mediacion: 0, respondido: 0 };
   records.forEach((r) => { counts[r.status] = (counts[r.status] || 0) + 1; });
@@ -1550,6 +1612,35 @@ function fmtDate(iso) {
   return new Date(iso).toLocaleString('es-MX', { dateStyle: 'medium', timeStyle: 'short' });
 }
 
+// Solo hora si fue hoy, si no día+mes+hora — la fecha completa (fmtDate) queda en el
+// title del span para quien la necesite, pero el texto visible no hace falta que
+// cargue con el año siempre: .sync-status ya vive en su propia franja del header
+// (ver .header-actions en style.css), así que no compite por ancho con nada más.
+function fmtSyncShort(iso) {
+  const d = new Date(iso);
+  const sameDay = d.toDateString() === new Date().toDateString();
+  return d.toLocaleString('es-MX', sameDay
+    ? { timeStyle: 'short' }
+    : { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+}
+
+// Centraliza el texto de "última sincronización" + el aviso de error, que antes vivían
+// concatenados en un solo textContent largo. El aviso queda en su propio span
+// (.sync-warning) para que sea visible de un vistazo, no solo al pasar el mouse por
+// el title.
+function setSyncInfo(syncedAt, warningText) {
+  if (syncedAt) {
+    el.syncInfo.textContent = `🕒 Última sincronización: ${fmtSyncShort(syncedAt)}`;
+    el.syncInfo.title = fmtDate(syncedAt);
+  } else {
+    el.syncInfo.textContent = 'Aún no se ha sincronizado';
+    el.syncInfo.title = '';
+  }
+  el.syncWarning.hidden = !warningText;
+  el.syncWarning.textContent = warningText ? `⚠ ${warningText}` : '';
+  el.syncWarning.title = warningText || '';
+}
+
 // Solo fecha (sin hora) — para la fecha de venta no hace falta la precisión de
 // minutos que sí importa en el hilo de mensajes.
 function fmtSaleDate(iso) {
@@ -1639,17 +1730,23 @@ function render() {
 
   state.filteredIds = filtered.map((r) => r.packId);
 
-  // Una sola fila con scroll horizontal (ver CSS de .status-counts) en vez de dos
-  // filas apiladas — con la barra lateral angosta, dos filas de chips completas
-  // dejaban muy poco alto para la lista de conversaciones en sí.
-  el.statusCounts.innerHTML = statusCountsHtml(state.records)
-    + '<span class="chip-divider" aria-hidden="true"></span>'
-    + categoryCountsHtml(state.records);
+  // Estado y categoría son dos contenedores separados (ver el click handler más abajo)
+  // que ahora viven lado a lado en la franja de acciones del header, no apilados en
+  // la barra lateral — ver .header-filters en style.css.
+  el.statusCounts.innerHTML = statusCountsHtml(state.records);
+  el.categoryCounts.innerHTML = categoryCountsHtml(state.records);
   const flaggedTotal = state.records.filter((r) => state.flags.has(r.packId)).length;
   el.flagFilterBtn.textContent = `⭐ Marcados (${flaggedTotal})`;
   el.flagFilterBtn.setAttribute('aria-pressed', String(state.showFlaggedOnly));
   el.readFilterBtn.textContent = READ_FILTER_LABELS[state.readFilter];
   el.readFilterBtn.setAttribute('aria-pressed', String(Boolean(state.readFilter)));
+  // El botón "⋯" se resalta cuando algo dentro del menú que abre dejó de estar en su
+  // valor por default — para no esconder del todo que hay un filtro secundario
+  // prendido solo porque ese menú está cerrado (ver .filters-menu en style.css).
+  el.filtersMenuBtn.classList.toggle(
+    'has-active-filter',
+    state.showFlaggedOnly || Boolean(state.readFilter) || state.sortMode === 'urgencia',
+  );
   el.empty.hidden = filtered.length > 0;
 
   withFocusPreserved(el.conversationList, () => {
@@ -2345,12 +2442,10 @@ async function loadMessages() {
   }
 
   state.records = data.records;
-  el.syncInfo.textContent = data.syncedAt
-    ? `Última sincronización: ${fmtDate(data.syncedAt)}`
-    : 'Aún no se ha sincronizado';
-  if (data.lastSyncError) {
-    el.syncInfo.textContent += ` (⚠ falló la última sincronización automática: ${data.lastSyncError})`;
-  }
+  setSyncInfo(
+    data.syncedAt,
+    data.lastSyncError ? `Falló la última sincronización automática: ${data.lastSyncError}` : '',
+  );
   render();
 }
 
@@ -2363,7 +2458,10 @@ async function sync() {
     if (!res.ok) throw new Error(data.error || 'Error desconocido');
     await loadMessages();
     if (data.errors) {
-      el.syncInfo.textContent += ` (⚠ ${data.errors} paquetes con error)`;
+      const extra = `${data.errors} paquete${data.errors === 1 ? '' : 's'} con error`;
+      el.syncWarning.textContent = el.syncWarning.hidden ? `⚠ ${extra}` : `${el.syncWarning.textContent} · ${extra}`;
+      el.syncWarning.hidden = false;
+      el.syncWarning.title = el.syncWarning.textContent;
     }
   } catch (err) {
     showToast(`Error al sincronizar: ${err.message}`);
@@ -2441,10 +2539,10 @@ function activateRowOnEnterOrSpace(rowSelector) {
 }
 el.conversationList.addEventListener('keydown', activateRowOnEnterOrSpace('.conversation-item'));
 
-// Un solo contenedor para los dos grupos de chips (estado + categoría, ver render())
-// desde que se unieron en una sola fila con scroll horizontal — un botón trae
-// `data-status` o `data-category` según a cuál grupo pertenezca, nunca los dos.
-el.statusCounts.addEventListener('click', (e) => {
+// Mismo manejador para las dos filas de chips (estado / categoría, ver render()) —
+// un botón trae `data-status` o `data-category` según a cuál fila pertenezca, nunca
+// los dos.
+function onCountChipClick(e) {
   const btn = e.target.closest('.badge');
   if (!btn) return;
   if (btn.dataset.category !== undefined) {
@@ -2464,7 +2562,9 @@ el.statusCounts.addEventListener('click', (e) => {
     if (!btn.dataset.status) state.categoryFilter = '';
   }
   render();
-});
+}
+el.statusCounts.addEventListener('click', onCountChipClick);
+el.categoryCounts.addEventListener('click', onCountChipClick);
 
 el.tabMessages.addEventListener('click', () => switchView('messages'));
 el.tabLog.addEventListener('click', () => switchView('log'));
