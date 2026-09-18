@@ -7,7 +7,18 @@ const state = {
   viewers: {},
   presenceInterval: null,
   statusFilter: '',
+  // '' (todas) / 'refactura' / 'envio_acordado' — filtro independiente del de estado
+  // (pendiente/mediación/respondido): una refactura o un envío acordado puede estar
+  // en cualquiera de esos tres estados, así que se combina con él en vez de
+  // reemplazarlo (ver matchesCategory en render()).
+  categoryFilter: '',
   logEntries: [],
+  // Conteo acumulado por persona/día, clave "YYYY-MM-DD|email" → cantidad — viene
+  // de /api/answer-counts (ver ANSWER_COUNTS_KEY en el server), NUNCA se recorta.
+  // A diferencia de logEntries (las últimas 1000 respuestas de TODO el equipo,
+  // pensadas para el banco de respuestas), esto es lo que alimenta la gráfica de
+  // "respuestas por persona" y los contadores junto a cada nombre en la Bitácora.
+  answerCounts: {},
   logFilterEmail: '',
   bank: [],
   // Preferencias de uso diario que sí importa recordar entre sesiones, pero que no
@@ -47,9 +58,12 @@ const state = {
 const el = {
   search: document.getElementById('search'),
   syncBtn: document.getElementById('syncBtn'),
+  regenPendingBtn: document.getElementById('regenPendingBtn'),
   syncInfo: document.getElementById('syncInfo'),
   userEmail: document.getElementById('userEmail'),
+  userAvatar: document.getElementById('userAvatar'),
   statusCounts: document.getElementById('statusCounts'),
+  categoryCounts: document.getElementById('categoryCounts'),
   conversationList: document.getElementById('conversationList'),
   empty: document.getElementById('emptyState'),
   chatEmpty: document.getElementById('chatEmpty'),
@@ -103,6 +117,11 @@ const el = {
   sortMode: document.getElementById('sortMode'),
   flagFilterBtn: document.getElementById('flagFilterBtn'),
   readFilterBtn: document.getElementById('readFilterBtn'),
+  filtersMenuBtn: document.getElementById('filtersMenuBtn'),
+  filtersMenu: document.getElementById('filtersMenu'),
+  accountMenuBtn: document.getElementById('accountMenuBtn'),
+  accountMenu: document.getElementById('accountMenu'),
+  syncWarning: document.getElementById('syncWarning'),
   shortcutsBtn: document.getElementById('shortcutsBtn'),
   shortcutsOverlay: document.getElementById('shortcutsOverlay'),
   shortcutsClose: document.getElementById('shortcutsClose'),
@@ -352,13 +371,64 @@ el.shortcutsOverlay.addEventListener('click', (e) => {
   if (e.target === el.shortcutsOverlay) closeShortcuts();
 });
 
+// Popovers chicos anclados a un botón (menú "⋯" de filtros del sidebar, menú de
+// cuenta del header) — a diferencia de los overlays de arriba, no bloquean el resto
+// de la app: se cierran solos con clic afuera, Escape, o al abrirse otro.
+let openPopover = null;
+
+function setupPopover(trigger, panel, { onOpen } = {}) {
+  const control = { close };
+  function open() {
+    openPopover?.close();
+    onOpen?.();
+    panel.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    document.addEventListener('keydown', onKeydown);
+    // Sin el setTimeout, el propio clic que abre el popover burbujea hasta este mismo
+    // listener de document y lo cerraría en el acto.
+    setTimeout(() => document.addEventListener('click', onOutsideClick), 0);
+    openPopover = control;
+  }
+  function close() {
+    if (panel.hidden) return;
+    panel.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+    document.removeEventListener('keydown', onKeydown);
+    document.removeEventListener('click', onOutsideClick);
+    if (openPopover === control) openPopover = null;
+  }
+  function onKeydown(e) {
+    if (e.key !== 'Escape') return;
+    close();
+    trigger.focus();
+  }
+  function onOutsideClick(e) {
+    if (!panel.contains(e.target) && !trigger.contains(e.target)) close();
+  }
+  trigger.addEventListener('click', () => (panel.hidden ? open() : close()));
+  return control;
+}
+
+// .filters-menu es position:fixed (ver comentario en style.css sobre por qué), así
+// que su posición no la resuelve el flujo normal — se calcula a mano contra el botón
+// cada vez que se abre.
+setupPopover(el.filtersMenuBtn, el.filtersMenu, {
+  onOpen: () => {
+    const r = el.filtersMenuBtn.getBoundingClientRect();
+    el.filtersMenu.style.top = `${r.bottom + 8}px`;
+    el.filtersMenu.style.right = `${window.innerWidth - r.right}px`;
+  },
+});
+setupPopover(el.accountMenuBtn, el.accountMenu);
+
 // Atajos de teclado para quien use la herramienta muchas horas al día (ver también
 // el modal de ayuda que abre "?", con la lista completa). Se ignoran por completo
 // mientras la persona esté escribiendo en un campo de texto (isEditableField) o
 // mientras haya un modal propio abierto (confirmación/imagen/atajos), que ya manejan
 // su propio teclado.
 document.addEventListener('keydown', (e) => {
-  if (!el.confirmOverlay.hidden || !el.lightboxOverlay.hidden || !el.shortcutsOverlay.hidden) return;
+  if (!el.confirmOverlay.hidden || !el.lightboxOverlay.hidden || !el.shortcutsOverlay.hidden
+    || !el.filtersMenu.hidden || !el.accountMenu.hidden) return;
 
   // Sin esto, cualquier combinación con Ctrl/Cmd/Alt donde la tecla coincida con uno
   // de nuestros atajos de letra sin modificador (sobre todo Ctrl/Cmd+F "buscar en la
@@ -445,8 +515,11 @@ async function loadUserEmail() {
     if (!res.ok) return;
     const data = await res.json();
     if (data.email) {
-      el.userEmail.textContent = shortName(data.email);
+      const name = shortName(data.email);
+      el.userEmail.textContent = name;
       el.userEmail.title = data.email;
+      el.userAvatar.textContent = initials(name);
+      el.userAvatar.classList.add(avatarColorClass(name));
     }
   } catch {
     // No es crítico para el uso de la app si esto falla, se omite en silencio.
@@ -646,10 +719,17 @@ el.bankList.addEventListener('click', async (e) => {
 
 async function refreshLog() {
   try {
-    const res = await fetch('/api/log');
-    if (!res.ok) return;
-    const data = await res.json();
+    const [logRes, countsRes] = await Promise.all([fetch('/api/log'), fetch('/api/answer-counts')]);
+    if (!logRes.ok) return;
+    const data = await logRes.json();
     state.logEntries = data.entries || [];
+    // /api/answer-counts es el conteo acumulado por persona/día (nunca se recorta,
+    // ver ANSWER_COUNTS_KEY en el server) — si por lo que sea falla, seguimos con
+    // lo que ya había en state.answerCounts en vez de tumbar toda la bitácora.
+    if (countsRes.ok) {
+      const countsData = await countsRes.json();
+      state.answerCounts = countsData.counts || {};
+    }
     renderLog();
     renderChart();
   } catch {
@@ -687,6 +767,15 @@ function chartDayKey(dateLike) {
 function formatChartDayLabel(key) {
   const [y, m, d] = key.split('-').map(Number);
   return new Date(y, m - 1, d).toLocaleDateString('es-MX', { day: 'numeric', month: 'short' });
+}
+
+// Misma idea que formatChartDayLabel pero devolviendo el Date en sí (medianoche
+// local) — las claves de state.answerCounts vienen como "YYYY-MM-DD|email" y el
+// día ya lo calculó el server en hora de México (ver mexicoDayKey), así que aquí
+// solo hace falta parsear el string, no convertir husos horarios de nuevo.
+function chartDayKeyToDate(key) {
+  const [y, m, d] = key.split('-').map(Number);
+  return new Date(y, m - 1, d);
 }
 
 // Rango personalizado elegido a mano: { custom: true, from: 'YYYY-MM-DD', to: 'YYYY-MM-DD' }
@@ -735,34 +824,35 @@ function chartRangeLabelText(rangeDays) {
 // Arma los días del eje X (todos, aunque no haya actividad ese día — para que la
 // línea no salte fechas) y, para cada una de las 4 personas, cuántas respuestas
 // publicó por día. `rangeDays` es un número de días hacia atrás, 'all', o un
-// rango personalizado (ver isCustomChartRange).
+// rango personalizado (ver isCustomChartRange). Lee de state.answerCounts (el
+// contador que NUNCA se recorta) en vez de state.logEntries (las últimas 1000
+// respuestas de todo el equipo) — con eso, "todo el historial" muestra de
+// verdad todo el historial, no solo el último día u dos de mucho volumen.
 function computeChartData(rangeDays) {
   const { start: startDate, end: endDate } = resolveChartWindow(rangeDays);
-  // Fin de ese día completo (23:59:59.999) — un rango personalizado puede
-  // terminar en el pasado, así que no basta con comparar contra "ahora".
-  const endOfEndDate = new Date(endDate);
-  endOfEndDate.setHours(23, 59, 59, 999);
+  const counts = state.answerCounts || {};
 
-  const relevant = state.logEntries.filter((e) => {
-    if (!CHART_PEOPLE.some((p) => p.email === e.answeredBy)) return false;
-    const d = new Date(e.date);
+  const relevantKeys = Object.keys(counts).filter((key) => {
+    const [day, email] = key.split('|');
+    if (!CHART_PEOPLE.some((p) => p.email === email)) return false;
+    const d = chartDayKeyToDate(day);
     if (startDate && d < startDate) return false;
-    if (d > endOfEndDate) return false;
+    if (d > endDate) return false;
     return true;
   });
 
-  if (!relevant.length) return { days: [], series: [] };
+  if (!relevantKeys.length) return { days: [], series: [] };
 
   let firstDate = startDate;
   if (!firstDate) {
     // "Todo": arranca en el día del primer dato real que haya para este grupo,
     // no desde el inicio de los tiempos.
-    let earliest = new Date(relevant[0].date);
-    relevant.forEach((e) => {
-      const d = new Date(e.date);
-      if (d < earliest) earliest = d;
+    let earliest = null;
+    relevantKeys.forEach((key) => {
+      const d = chartDayKeyToDate(key.split('|')[0]);
+      if (!earliest || d < earliest) earliest = d;
     });
-    firstDate = new Date(earliest.getFullYear(), earliest.getMonth(), earliest.getDate());
+    firstDate = earliest;
   }
 
   const days = [];
@@ -772,15 +862,13 @@ function computeChartData(rangeDays) {
     cursor.setDate(cursor.getDate() + 1);
   }
 
-  const countsByPersonDay = new Map();
-  relevant.forEach((e) => {
-    const key = `${e.answeredBy}|${chartDayKey(e.date)}`;
-    countsByPersonDay.set(key, (countsByPersonDay.get(key) || 0) + 1);
-  });
-
   const series = CHART_PEOPLE.map((p) => ({
     ...p,
-    values: days.map((d) => countsByPersonDay.get(`${p.email}|${d}`) || 0),
+    // Number(...) por si acaso: viene de un HGETALL y no queremos depender de si
+    // el cliente de Redis lo deserializa a número o lo deja como string — sumar
+    // strings concatena en vez de sumar, y ahí sí volveríamos a tener un contador
+    // que "no cambia" (o que cambia mal) sin que se note por qué.
+    values: days.map((d) => Number(counts[`${d}|${p.email}`]) || 0),
   }));
 
   return { days, series };
@@ -788,14 +876,16 @@ function computeChartData(rangeDays) {
 
 // Total de respuestas de cada persona dentro de una ventana [start, endExclusivo)
 // — nada más para comparar contra el período anterior en las tarjetas de resumen;
-// no toca ni reemplaza el cálculo día-por-día de computeChartData().
+// no toca ni reemplaza el cálculo día-por-día de computeChartData(). Igual que
+// ahí, lee de state.answerCounts para no perder historial viejo.
 function sumPersonsInWindow(startDate, endExclusive) {
   const totals = new Map(CHART_PEOPLE.map((p) => [p.email, 0]));
-  state.logEntries.forEach((e) => {
-    if (!totals.has(e.answeredBy)) return;
-    const d = new Date(e.date);
+  Object.entries(state.answerCounts || {}).forEach(([key, count]) => {
+    const [day, email] = key.split('|');
+    if (!totals.has(email)) return;
+    const d = chartDayKeyToDate(day);
     if (d < startDate || d >= endExclusive) return;
-    totals.set(e.answeredBy, totals.get(e.answeredBy) + 1);
+    totals.set(email, totals.get(email) + (Number(count) || 0));
   });
   return totals;
 }
@@ -1358,12 +1448,33 @@ function dayLabel(iso) {
 }
 
 function renderLog() {
-  const uniqueEmails = [...new Set(state.logEntries.map((e) => e.answeredBy).filter(Boolean))];
+  // El número junto a cada nombre viene de state.answerCounts (acumulado, nunca
+  // se recorta) y no de contar cuántas entradas de state.logEntries tiene esa
+  // persona: ese feed solo guarda las últimas 1000 respuestas de TODO el equipo,
+  // así que con el volumen actual se llena en menos de un día — contando ahí, el
+  // número de la persona más activa se queda "atorado" (cada respuesta nueva le
+  // tira una vieja de encima para hacerle lugar) aunque siga contestando. Ver
+  // ANSWER_COUNTS_KEY en el server para el caso real que destapó esto.
+  const totalsByPerson = new Map();
+  Object.entries(state.answerCounts || {}).forEach(([key, count]) => {
+    const email = key.split('|')[1];
+    totalsByPerson.set(email, (totalsByPerson.get(email) || 0) + (Number(count) || 0));
+  });
+  const grandTotal = [...totalsByPerson.values()].reduce((sum, n) => sum + n, 0);
+
+  // Unión de quien aparece en el feed reciente y quien tiene contador acumulado,
+  // para no perder de la lista de filtros a alguien activo cuyas respuestas más
+  // recientes por casualidad ya no entran en el feed recortado.
+  const uniqueEmails = [...new Set([
+    ...state.logEntries.map((e) => e.answeredBy).filter(Boolean),
+    ...totalsByPerson.keys(),
+  ])];
+
   const filterChip = (email, label, count) => `
     <button class="badge all${state.logFilterEmail === email ? ' active' : ''}" aria-selected="${state.logFilterEmail === email}" data-email="${escapeHtml(email)}">${escapeHtml(label)} (${count})</button>
   `;
-  el.logFilters.innerHTML = filterChip('', 'Todas', state.logEntries.length)
-    + uniqueEmails.map((email) => filterChip(email, shortName(email), state.logEntries.filter((e) => e.answeredBy === email).length)).join('');
+  el.logFilters.innerHTML = filterChip('', 'Todas', grandTotal)
+    + uniqueEmails.map((email) => filterChip(email, shortName(email), totalsByPerson.get(email) || 0)).join('');
 
   const entries = state.logEntries.filter((e) => !state.logFilterEmail || e.answeredBy === state.logFilterEmail);
   el.logEmptyState.hidden = entries.length > 0;
@@ -1396,6 +1507,11 @@ function renderLog() {
   });
 }
 
+// Estos chips viven en la franja de acciones del header (ver .header-filters en
+// style.css), no en la barra lateral — ahí sí hay ancho de sobra para la etiqueta
+// completa ("101 pendientes"), a diferencia de los 330px del sidebar donde esto
+// vivía antes y donde ícono+número a secas era la única forma de que las 4 cupieran
+// sin recortarse.
 function statusCountsHtml(records) {
   const counts = { pendiente: 0, mediacion: 0, respondido: 0 };
   records.forEach((r) => { counts[r.status] = (counts[r.status] || 0) + 1; });
@@ -1406,6 +1522,37 @@ function statusCountsHtml(records) {
     + chip('pendiente', 'pendiente', `${STATUS_ICON.pendiente} ${counts.pendiente} pendiente${counts.pendiente === 1 ? '' : 's'}`)
     + chip('mediacion', 'mediacion', `${STATUS_ICON.mediacion} ${counts.mediacion} mediaci${counts.mediacion === 1 ? 'ón' : 'ones'}`)
     + chip('respondido', 'respondido', `${STATUS_ICON.respondido} ${counts.respondido} respondido${counts.respondido === 1 ? '' : 's'}`);
+}
+
+// Filtro aparte de "categoría" (refacturas / envíos acordados) — no reemplaza al de
+// estado, se combina con él (una refactura puede estar pendiente, respondida o en
+// mediación). "Envío acordado" reutiliza shippingStatusLabel, que ya viene de la API
+// de envíos de ML (dato exacto, no una suposición); "Refactura" viene de
+// isRefacturaCandidate, calculado en el servidor (ver vendorAskedFor/
+// REFACTURA_ASK_PATTERNS en server.js) porque no hay un campo estructurado
+// equivalente para eso.
+function isEnvioAcordado(r) {
+  return r.shippingStatusLabel === 'Acordar con el vendedor';
+}
+
+// Estas dos categorías son listas de "trabajo pendiente" (para la automatización de
+// Odoo, entre otras cosas) — nunca deben mostrar casos ya respondidos, y tampoco los
+// que estén en mediación (esos se manejan por el flujo de reclamos, no respondiendo
+// el chat normal; mezclar los dos confunde qué necesita acción y por dónde). Por eso
+// el conteo y el filtro exigen status === 'pendiente' a propósito, no solo la
+// categoría — ver también matchesCategory en render().
+// Sin chip propio de "Todas las categorías" — el "Todas (N)" de statusCountsHtml ya
+// limpia los dos filtros a la vez (ver el click handler), así que un segundo botón
+// de "reset" aquí solo sería un chip más ocupando espacio sin agregar nada; para
+// quitar un filtro de categoría puntual basta con volver a clicarlo (toggle).
+function categoryCountsHtml(records) {
+  const refacturas = records.filter((r) => r.isRefacturaCandidate && r.status === 'pendiente').length;
+  const envios = records.filter((r) => isEnvioAcordado(r) && r.status === 'pendiente').length;
+  const chip = (cat, label) => `
+    <button class="badge ${cat}" aria-selected="${state.categoryFilter === cat}" data-category="${cat}">${label}</button>
+  `;
+  return chip('refactura', `🧾 ${refacturas} refactura${refacturas === 1 ? '' : 's'}`)
+    + chip('envio_acordado', `📦 ${envios} acordado${envios === 1 ? '' : 's'}`);
 }
 
 function timeAgo(iso) {
@@ -1463,6 +1610,35 @@ function itemTitlesHtml(r) {
 function fmtDate(iso) {
   if (!iso) return '—';
   return new Date(iso).toLocaleString('es-MX', { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+// Solo hora si fue hoy, si no día+mes+hora — la fecha completa (fmtDate) queda en el
+// title del span para quien la necesite, pero el texto visible no hace falta que
+// cargue con el año siempre: .sync-status ya vive en su propia franja del header
+// (ver .header-actions en style.css), así que no compite por ancho con nada más.
+function fmtSyncShort(iso) {
+  const d = new Date(iso);
+  const sameDay = d.toDateString() === new Date().toDateString();
+  return d.toLocaleString('es-MX', sameDay
+    ? { timeStyle: 'short' }
+    : { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+}
+
+// Centraliza el texto de "última sincronización" + el aviso de error, que antes vivían
+// concatenados en un solo textContent largo. El aviso queda en su propio span
+// (.sync-warning) para que sea visible de un vistazo, no solo al pasar el mouse por
+// el title.
+function setSyncInfo(syncedAt, warningText) {
+  if (syncedAt) {
+    el.syncInfo.textContent = `🕒 Última sincronización: ${fmtSyncShort(syncedAt)}`;
+    el.syncInfo.title = fmtDate(syncedAt);
+  } else {
+    el.syncInfo.textContent = 'Aún no se ha sincronizado';
+    el.syncInfo.title = '';
+  }
+  el.syncWarning.hidden = !warningText;
+  el.syncWarning.textContent = warningText ? `⚠ ${warningText}` : '';
+  el.syncWarning.title = warningText || '';
 }
 
 // Solo fecha (sin hora) — para la fecha de venta no hace falta la precisión de
@@ -1525,13 +1701,18 @@ function render() {
       || r.itemTitles.join(' ').toLowerCase().includes(q)
       || (r.lastQuestion?.text || '').toLowerCase().includes(q);
     const matchesStatus = !state.statusFilter || r.status === state.statusFilter;
+    // Solo pendientes por responder — nunca respondidos ni en mediación (ver
+    // comentario junto a categoryCountsHtml).
+    const matchesCategory = !state.categoryFilter
+      || (r.status === 'pendiente'
+        && (state.categoryFilter === 'refactura' ? r.isRefacturaCandidate : isEnvioAcordado(r)));
     const matchesFlag = !state.showFlaggedOnly || state.flags.has(r.packId);
     // "No leídos"/"Leídos" es el concepto de Mercado Libre (¿hay mensajes sin abrir
     // en ML?), no el estado pendiente/mediación/respondido de esta app — por eso se
     // combina con el filtro de estado en vez de reemplazarlo (ver READ_FILTER_CYCLE).
     const matchesRead = !state.readFilter
       || (state.readFilter === 'unread' ? r.unreadCount > 0 : !(r.unreadCount > 0));
-    return matchesQ && matchesStatus && matchesFlag && matchesRead;
+    return matchesQ && matchesStatus && matchesCategory && matchesFlag && matchesRead;
   });
   // sort() es estable: dentro de cada grupo de prioridad se conserva el orden por
   // fecha que ya trae el arreglo (el servidor lo entrega del más reciente al más viejo)
@@ -1549,12 +1730,23 @@ function render() {
 
   state.filteredIds = filtered.map((r) => r.packId);
 
+  // Estado y categoría son dos contenedores separados (ver el click handler más abajo)
+  // que ahora viven lado a lado en la franja de acciones del header, no apilados en
+  // la barra lateral — ver .header-filters en style.css.
   el.statusCounts.innerHTML = statusCountsHtml(state.records);
+  el.categoryCounts.innerHTML = categoryCountsHtml(state.records);
   const flaggedTotal = state.records.filter((r) => state.flags.has(r.packId)).length;
   el.flagFilterBtn.textContent = `⭐ Marcados (${flaggedTotal})`;
   el.flagFilterBtn.setAttribute('aria-pressed', String(state.showFlaggedOnly));
   el.readFilterBtn.textContent = READ_FILTER_LABELS[state.readFilter];
   el.readFilterBtn.setAttribute('aria-pressed', String(Boolean(state.readFilter)));
+  // El botón "⋯" se resalta cuando algo dentro del menú que abre dejó de estar en su
+  // valor por default — para no esconder del todo que hay un filtro secundario
+  // prendido solo porque ese menú está cerrado (ver .filters-menu en style.css).
+  el.filtersMenuBtn.classList.toggle(
+    'has-active-filter',
+    state.showFlaggedOnly || Boolean(state.readFilter) || state.sortMode === 'urgencia',
+  );
   el.empty.hidden = filtered.length > 0;
 
   withFocusPreserved(el.conversationList, () => {
@@ -1971,11 +2163,6 @@ async function handleDraftAction(e) {
       showToast(`Error al publicar: ${err.message}`);
       publishBtn.disabled = false;
       publishBtn.textContent = 'Publicar';
-      // Un 403 de Mercado Libre (conversación bloqueada por mediación, etc.) ya deja
-      // el pack actualizado en el servidor — se recarga para que se vea el estado
-      // real de una vez, en vez de que la tarjeta se quede mostrando el borrador
-      // viejo hasta el siguiente sondeo automático.
-      await loadMessages();
     }
     return;
   }
@@ -2255,12 +2442,10 @@ async function loadMessages() {
   }
 
   state.records = data.records;
-  el.syncInfo.textContent = data.syncedAt
-    ? `Última sincronización: ${fmtDate(data.syncedAt)}`
-    : 'Aún no se ha sincronizado';
-  if (data.lastSyncError) {
-    el.syncInfo.textContent += ` (⚠ falló la última sincronización automática: ${data.lastSyncError})`;
-  }
+  setSyncInfo(
+    data.syncedAt,
+    data.lastSyncError ? `Falló la última sincronización automática: ${data.lastSyncError}` : '',
+  );
   render();
 }
 
@@ -2273,7 +2458,10 @@ async function sync() {
     if (!res.ok) throw new Error(data.error || 'Error desconocido');
     await loadMessages();
     if (data.errors) {
-      el.syncInfo.textContent += ` (⚠ ${data.errors} paquetes con error)`;
+      const extra = `${data.errors} paquete${data.errors === 1 ? '' : 's'} con error`;
+      el.syncWarning.textContent = el.syncWarning.hidden ? `⚠ ${extra}` : `${el.syncWarning.textContent} · ${extra}`;
+      el.syncWarning.hidden = false;
+      el.syncWarning.title = el.syncWarning.textContent;
     }
   } catch (err) {
     showToast(`Error al sincronizar: ${err.message}`);
@@ -2299,8 +2487,43 @@ async function autoSync() {
   }
 }
 
+// Regenera el borrador de TODAS las conversaciones pendientes con el prompt más
+// reciente del agente de IA — para cuando se mejora el prompt (ej. la base de
+// conocimiento técnico o el razonamiento de Flash) y los pendientes ya generados
+// se quedaron con el texto de la versión anterior (el sync normal los deja como
+// "frescos" y nunca los toca de nuevo). Corre en segundo plano en el servidor: el
+// botón se libera de inmediato y los borradores se van actualizando solos en los
+// próximos minutos conforme avanza el sync automático.
+async function regeneratePendingDrafts() {
+  const pendingCount = state.records.filter((r) => r.status === 'pendiente').length;
+  if (!pendingCount) {
+    showToast('No hay borradores pendientes que regenerar', 'success');
+    return;
+  }
+  const confirmed = confirm(
+    `Esto vuelve a generar el borrador de las ${pendingCount} conversaciones pendientes con el ` +
+    'prompt más reciente del agente de IA. Puede tardar varios minutos en terminar. ¿Continuar?',
+  );
+  if (!confirmed) return;
+
+  el.regenPendingBtn.disabled = true;
+  el.regenPendingBtn.textContent = 'Regenerando...';
+  try {
+    const res = await fetch('/api/admin/regenerate-pending-drafts', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Error desconocido');
+    showToast(`Regenerando ${pendingCount} borradores pendientes en segundo plano — se van actualizando solos.`, 'success');
+  } catch (err) {
+    showToast(`Error al regenerar pendientes: ${err.message}`);
+  } finally {
+    el.regenPendingBtn.disabled = false;
+    el.regenPendingBtn.textContent = '🔄 Regenerar pendientes';
+  }
+}
+
 el.search.addEventListener('input', render);
 el.syncBtn.addEventListener('click', sync);
+el.regenPendingBtn.addEventListener('click', regeneratePendingDrafts);
 
 // Filas clicables que son <div role="button"> (no <button>/<a> nativos): el navegador
 // no les da activación por teclado gratis, así que Enter/Espacio se manejan a mano
@@ -2316,12 +2539,32 @@ function activateRowOnEnterOrSpace(rowSelector) {
 }
 el.conversationList.addEventListener('keydown', activateRowOnEnterOrSpace('.conversation-item'));
 
-el.statusCounts.addEventListener('click', (e) => {
+// Mismo manejador para las dos filas de chips (estado / categoría, ver render()) —
+// un botón trae `data-status` o `data-category` según a cuál fila pertenezca, nunca
+// los dos.
+function onCountChipClick(e) {
   const btn = e.target.closest('.badge');
   if (!btn) return;
-  state.statusFilter = btn.dataset.status;
+  if (btn.dataset.category !== undefined) {
+    // Clic sobre el filtro ya activo = quitarlo (toggle), en vez de necesitar un
+    // chip de "todas las categorías" aparte solo para eso.
+    const activating = state.categoryFilter !== btn.dataset.category && btn.dataset.category;
+    state.categoryFilter = activating ? btn.dataset.category : '';
+    // Estas categorías ya fuerzan "pendiente" en el filtrado (matchesCategory), así
+    // que si el filtro de estado quedara en "Respondido" o "Mediación" se vería una
+    // lista vacía sin explicación — se alinea el chip de estado para que no confunda.
+    if (activating) state.statusFilter = 'pendiente';
+  } else {
+    state.statusFilter = btn.dataset.status;
+    // "Todas" (data-status="") limpia también cualquier filtro de categoría activo —
+    // sin esto, quedaría "atorado" en Refacturas/Envíos sin un botón visible para
+    // salir de ahí salvo volver a clicar ese mismo chip.
+    if (!btn.dataset.status) state.categoryFilter = '';
+  }
   render();
-});
+}
+el.statusCounts.addEventListener('click', onCountChipClick);
+el.categoryCounts.addEventListener('click', onCountChipClick);
 
 el.tabMessages.addEventListener('click', () => switchView('messages'));
 el.tabLog.addEventListener('click', () => switchView('log'));
@@ -2372,12 +2615,7 @@ el.liveNowList.addEventListener('keydown', activateRowOnEnterOrSpace('.live-now-
 
 window.addEventListener('beforeunload', stopPresenceHeartbeat);
 
-// Antes eran 20s: cada persona con la pestaña abierta jala el catálogo COMPLETO de
-// conversaciones (con su historial) del servidor. Con varias personas todo el día,
-// eso fue lo que agotó el límite gratuito de ancho de banda de Vercel y pausó el
-// sitio. 45s sigue siendo "casi al instante" para este uso, pero corta las peticiones
-// (y el gasto de banda) más de la mitad.
-const AUTO_REFRESH_MS = 45000;
+const AUTO_REFRESH_MS = 20000;
 const PRESENCE_POLL_MS = 8000;
 const AUTO_SYNC_MS = 120000;
 setInterval(loadMessages, AUTO_REFRESH_MS);

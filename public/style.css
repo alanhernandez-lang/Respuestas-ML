@@ -34,6 +34,14 @@
      --pending/--mediation (texto saturado sobre fondo muy pálido). */
   --full: #1d4ed8;
   --full-bg: #e0e7ff;
+  /* Categorías de automatización (refacturas / envíos acordados con el comprador,
+     ver categoryCountsHtml en app.js) — mismo perfil de contraste que el resto
+     (texto saturado sobre fondo muy pálido), en tonos que no chocan con los tres
+     colores de estado (naranja/verde/rojo) ni con FULL (azul). */
+  --refactura: #8526c9;
+  --refactura-bg: #f3e5ff;
+  --acordado: #0d7a70;
+  --acordado-bg: #dbf5f1;
   /* Tonos oscurecidos a propósito (vs. la paleta "pastel" original) para que las
      iniciales blancas del avatar cumplan contraste AA (>=4.5:1) sobre cualquiera. */
   --av-1: #1d4ed8;
@@ -79,6 +87,10 @@
     --flag: #fbbf24;
     --full: #93b4ff;
     --full-bg: #1e2a4a;
+    --refactura: #d8a8ff;
+    --refactura-bg: #2f1a42;
+    --acordado: #5eead4;
+    --acordado-bg: #12332e;
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow-md: 0 3px 10px rgba(0, 0, 0, 0.35);
     --shadow-lg: 0 10px 32px rgba(0, 0, 0, 0.45);
@@ -110,6 +122,10 @@
   --flag: #fbbf24;
   --full: #93b4ff;
   --full-bg: #1e2a4a;
+  --refactura: #d8a8ff;
+  --refactura-bg: #2f1a42;
+  --acordado: #5eead4;
+  --acordado-bg: #12332e;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-md: 0 3px 10px rgba(0, 0, 0, 0.35);
   --shadow-lg: 0 10px 32px rgba(0, 0, 0, 0.45);
@@ -184,8 +200,11 @@ body {
 ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--muted) 35%, transparent); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
 ::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--muted) 55%, transparent); background-clip: padding-box; }
 
+/* Dos franjas en vez de una sola fila apretada: .header-top (identidad — marca,
+   pestañas, cuenta) es la barra "tranquila"; .header-actions (sincronizar/regenerar)
+   tiene su propio fondo (--surface-2) para leerse como una sección de trabajo aparte,
+   no como más botones sueltos compitiendo por el mismo renglón. */
 header {
-  padding: 0.65rem 1.5rem;
   border-bottom: 1px solid var(--border);
   background: var(--surface);
   box-shadow: var(--shadow-sm);
@@ -193,6 +212,20 @@ header {
   top: 0;
   z-index: 5;
   flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Mismo max-width que #viewMessages/#viewLog (ver más abajo) — sin esto, en un
+   monitor ancho el fondo del header sigue estirándose de borde a borde (correcto,
+   es la franja completa) pero su CONTENIDO también se estiraba con él, dejando
+   huecos enormes entre marca/pestañas/cuenta y entre sincronizar/regenerar. */
+.header-top {
+  max-width: 1400px;
+  width: 100%;
+  margin: 0 auto;
+  box-sizing: border-box;
+  padding: 0.6rem 1.5rem;
   display: grid;
   grid-template-columns: 1fr auto 1fr;
   align-items: center;
@@ -254,20 +287,84 @@ h1 {
 
 .brand-sep { color: var(--muted); font-weight: 400; margin: 0 0.15rem; }
 
-.toolbar {
+.header-top-actions {
   display: flex;
-  gap: 0.6rem;
   align-items: center;
-  flex-wrap: wrap;
+  gap: 0.5rem;
   justify-self: end;
 }
 
-.user-email {
-  margin-left: auto;
+/* Franja de trabajo bajo la identidad (ver comentario junto a `header` arriba):
+   sincronizar (+ su estado) a la izquierda, regenerar borradores a la derecha —
+   dos acciones de fondo/datos, separadas de la navegación de arriba. El fondo
+   --surface-2 va en .header-actions (de borde a borde, como toda la franja);
+   .header-actions-inner es quien limita el ANCHO del contenido a 1400px — sin esa
+   separación, en un monitor ancho el hueco entre sincronizar y regenerar crecía
+   tanto como la pantalla (ver captura: eso es lo que se veía "vacío" en medio). */
+.header-actions {
+  display: flex;
+  justify-content: center;
+  padding: 0.5rem 1.5rem;
+  background: var(--surface-2);
+  border-top: 1px solid var(--border);
+}
+
+.header-actions-inner {
+  max-width: 1400px;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.sync-group {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.sync-status {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.account-menu-wrap { position: relative; }
+
+/* Botón "invisible" que solo envuelve el avatar (círculo, sin el marco cuadrado de
+   los demás botones) — el avatar en sí ya se ve clicable por el hover/foco de abajo. */
+.account-trigger {
+  background: transparent;
+  border: none;
+  padding: 2px;
+  min-height: 0;
+  border-radius: 50%;
+  display: inline-flex;
+  cursor: pointer;
+}
+.account-trigger:hover .avatar,
+.account-trigger[aria-expanded="true"] .avatar {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+/* Mismo componente .avatar que usa el resto de la app (hilo de conversación, "quién
+   más está viendo esto"), solo un poco más chico — evita reinventar un segundo
+   estilo de avatar aparte solo para el header. */
+.account-menu-wrap .avatar { width: 28px; height: 28px; font-size: 0.7rem; }
+
+.account-menu-email {
+  margin: 0;
+  padding: 0 0 0.5rem;
+  border-bottom: 1px solid var(--border);
   color: var(--muted);
   font-size: 0.82rem;
-  cursor: default;
+  word-break: break-all;
 }
+
+.account-menu-logout { justify-content: center; }
 
 .logout-link {
   color: var(--muted);
@@ -281,6 +378,47 @@ h1 {
   transition: background 0.12s ease, color 0.12s ease;
 }
 .logout-link:hover { color: var(--text); background: color-mix(in srgb, var(--muted) 12%, transparent); text-decoration: none; }
+
+/* Info de sincronización acortada (solo hora, con el detalle completo en el title) +
+   aviso aparte cuando algo falló — antes era un solo texto largo ("Última
+   sincronización: 17 sep 2026, 3:00 p.m. (⚠ ...)") que, sumado al nombre/correo del
+   header, hacía que la barra completa envolviera a 2 líneas en ventanas normales. */
+.sync-warning {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.78rem;
+  font-weight: 650;
+  color: var(--urgent);
+  background: var(--urgent-bg);
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+/* Popover chico anclado a un botón (menú de filtros del sidebar, menú de cuenta) —
+   a diferencia de los overlays de pantalla completa (confirmación, atajos, imagen),
+   no bloquea el resto de la app: se cierra solo con clic afuera, Escape, o al abrir
+   otro (ver setupPopover() en app.js). */
+.popover {
+  z-index: 20;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  padding: 0.7rem;
+  animation: pop-in 0.14s ease;
+}
+
+.account-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
 
 .icon-btn {
   background: var(--surface-2);
@@ -303,34 +441,94 @@ h1 {
 .icon-btn:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); border-color: var(--accent); }
 .icon-btn:active { transform: translateY(1px); }
 
+/* Filtros de estado/categoría: viven en .header-filters, dentro de la franja de
+   acciones del header (ver .header-actions-inner) — no en la barra lateral. Ahí los
+   330px de ancho obligaban a elegir entre etiquetas completas cortadas a media
+   palabra o un scroll horizontal poco evidente; aquí, con el ancho de sobra del
+   header, cada grupo (estado / categoría, ver statusCountsHtml/categoryCountsHtml en
+   app.js) es su propia fila interna que envuelve sin problema si hace falta. */
+.header-filters {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex: 1;
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: center;
+}
 .status-counts {
   display: flex;
-  gap: 0.4rem;
+  align-items: center;
   flex-wrap: wrap;
-  padding: 0.6rem 0.85rem;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
+  gap: 0.4rem;
 }
 .status-counts .badge {
-  font-size: 0.72rem;
-  padding: 0.22rem 0.6rem;
-  min-height: 28px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  padding: 0.28rem 0.6rem;
+  min-height: 27px;
+  white-space: nowrap;
   cursor: pointer;
   border: 1px solid transparent;
   transition: border-color 0.12s ease, transform 0.08s ease;
 }
 .status-counts .badge:hover { transform: translateY(-1px); }
 .status-counts .badge[aria-selected="true"] { border-color: currentColor; }
-.status-counts .badge.all { color: var(--text); background: var(--surface-2); }
+.status-counts .badge.all { color: var(--text); background: var(--surface-2); font-weight: 600; }
 
-/* Segunda fila de controles del sidebar (orden, marcados, densidad) — separada del
-   input de búsqueda para que quepan varios controles chicos sin competir por ancho
-   con el buscador, que necesita ser el elemento más prominente de esa barra. */
-.sidebar-controls {
+.chip-divider {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+
+/* Fila del buscador: el input manda (ocupa todo el ancho disponible) y el botón "⋯"
+   al final abre el menú de Ordenar/Marcados/Leído (ver .filters-menu) — así esa fila
+   de controles secundarios, que antes vivía siempre visible debajo del buscador, ya
+   no le resta alto fijo a la lista de conversaciones. */
+.sidebar-search-row {
   display: flex;
-  gap: 0.4rem;
-  flex-wrap: wrap;
   align-items: center;
+  gap: 0.4rem;
+}
+.sidebar-toolbar .sidebar-search-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Contenido del menú "⋯" — mismos controles de antes (Ordenar/Marcados/Leído), solo
+   que ahora aparecen bajo demanda en vez de ocupar una fila fija todo el tiempo.
+   position:fixed (con top/right calculados en JS, ver setupPopover() en app.js) a
+   propósito: .chat-sidebar y .chat-layout usan overflow:hidden para las esquinas
+   redondeadas, y eso recortaría un popover position:absolute normal antes de que
+   llegara a verse. */
+.filters-menu {
+  position: fixed;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 195px;
+}
+.filters-menu-label {
+  font-size: 0.7rem;
+  font-weight: 650;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin: 0 0 -0.2rem;
+}
+.filters-menu #sortMode { width: 100%; }
+.filters-menu-toggle { width: 100%; justify-content: flex-start; border-radius: var(--radius-sm); }
+
+/* El botón "⋯" se resalta igual que un filtro activo (mismo tratamiento que
+   .chip-toggle[aria-pressed="true"]) cuando algo dentro del menú deja de estar en su
+   valor por default — para no esconder del todo que hay un filtro secundario prendido
+   solo porque el menú que lo contiene está cerrado (ver render() en app.js). */
+#filtersMenuBtn.has-active-filter {
+  border-color: var(--flag);
+  color: var(--flag);
+  background: color-mix(in srgb, var(--flag) 14%, transparent);
 }
 
 #sortMode {
@@ -362,18 +560,6 @@ h1 {
   border-color: var(--flag);
   color: var(--flag);
   background: color-mix(in srgb, var(--flag) 14%, transparent);
-}
-
-/* El botón de densidad (☰) es un .icon-btn genérico (38×38, pensado para la barra
-   superior) — aquí, junto al select y al chip de "Marcados" (ambos de 30px), se
-   achica para que las tres alturas de esta fila queden parejas. */
-.sidebar-controls .icon-btn {
-  width: 30px;
-  height: 30px;
-  min-width: 24px;
-  min-height: 24px;
-  font-size: 0.85rem;
-  flex-shrink: 0;
 }
 
 .toast-container {
@@ -541,7 +727,19 @@ button#syncBtn {
 button#syncBtn:hover:not(:disabled) { background: var(--accent-strong); }
 button#syncBtn:disabled { opacity: 0.6; cursor: default; }
 
-.sync-info { color: var(--muted); font-size: 0.85rem; }
+/* Pill con borde propio (no solo texto suelto) para que se lea como un indicador de
+   estado con intención, apoyado sobre el fondo --surface-2 de .header-actions. */
+.sync-info {
+  display: inline-flex;
+  align-items: center;
+  color: var(--muted);
+  font-size: 0.82rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 0.3rem 0.7rem;
+  border-radius: 999px;
+  white-space: nowrap;
+}
 
 main {
   padding: 1.1rem 1.5rem;
@@ -1133,6 +1331,13 @@ input[type="search"] {
 .badge.shipping-badge { color: var(--muted); background: var(--surface-2); border: 1px solid var(--border); }
 .badge.shipping-badge::before { display: none; }
 
+/* Categorías de automatización (filtro de la barra lateral, ver categoryCountsHtml
+   en app.js) — llevan su propio ícono (🧾/📦) en vez del puntito genérico, mismo
+   criterio que full-badge/shipping-badge de arriba. */
+.badge.refactura { color: var(--refactura); background: var(--refactura-bg); }
+.badge.envio_acordado { color: var(--acordado); background: var(--acordado-bg); }
+.badge.refactura::before, .badge.envio_acordado::before { display: none; }
+
 /* Los tres estados vacíos (sidebar, bitácora, banco) siguen siendo un único <p>
    normal dentro del flujo de su columna flex — a propósito, para no arriesgar
    el cálculo de espacio que ya tienen sus contenedores (conversationList/logList
@@ -1658,16 +1863,16 @@ input[type="search"] {
 }
 
 @media (max-width: 760px) {
-  header {
+  .header-top {
     grid-template-columns: 1fr;
     grid-template-rows: auto auto auto;
     row-gap: 0.55rem;
     padding: 0.65rem 1rem;
   }
-  .brand, .view-switch, .toolbar { justify-self: stretch; }
+  .brand, .view-switch, .header-top-actions { justify-self: stretch; }
   .view-switch { width: 100%; overflow-x: auto; }
-  .toolbar { width: 100%; }
-  .user-email { margin-left: 0; }
+  .header-top-actions { justify-content: flex-end; }
+  .header-actions { padding: 0.5rem 1rem; }
 
   h1 {
     font-size: 1rem;
