@@ -743,6 +743,7 @@ async function attachDrafts(packs, token, touched) {
         token,
         frequentResponses,
         isFull: record.isFull,
+        shippingStatusLabel: record.shippingStatusLabel,
       });
       record.draftAnswer = { text, generatedAt: new Date().toISOString(), forQuestionDate: questionDate, imagesExcluded, flags };
       if (flags && flags.length) {
@@ -960,6 +961,7 @@ async function regenerateDraftInner(packId) {
     frequentResponses,
     previousDraftText: previousText,
     isFull: record.isFull,
+    shippingStatusLabel: record.shippingStatusLabel,
   });
   if (flags && flags.length) {
     console.warn(`Borrador IA del pack ${packId} marcado para revisar (${flags.join(', ')})`);
