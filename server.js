@@ -1564,14 +1564,10 @@ function buildRefacturaReminderText(missing) {
   return `Gracias por la información. Para poder emitir su factura aún nos falta que nos comparta:\n${bullets}\n\nEn cuanto recibamos los datos completos, procedemos con la emisión.`;
 }
 
-// La plantilla aprobada "Mensaje recordatorio de datos pendientes" (ver
-// RESPONSE_TEMPLATES en lib/agent.js) no lista campos específicos — se reutiliza
-// TAL CUAL, en vez de inventar una versión con lista dinámica que nadie aprobó.
-const ENVIO_ACORDADO_REMINDER_TEXT = 'Hola 👋 Quedo pendiente de los datos completos para poder activar tu envío gratis 🎉 Envíamelos por favor en el formato solicitado para continuar con tu envío.';
-
 // Copia literal de la plantilla aprobada "Solicitud de datos para envío gratis" (ver
-// RESPONSE_TEMPLATES en lib/agent.js) — mismo criterio que ENVIO_ACORDADO_REMINDER_TEXT
-// de arriba: se reutiliza tal cual en vez de referenciarla dinámicamente.
+// RESPONSE_TEMPLATES en lib/agent.js) — se reutiliza tal cual en vez de
+// referenciarla dinámicamente, para no depender de que el prompt del agente de IA
+// nunca cambie esa plantilla sin querer.
 const ENVIO_ACORDADO_FIRST_CONTACT_TEXT = 'Hola, buen día. Tu pedido aplica para envío gratis 🎉 Para activarlo necesito que me envíes por mensaje los siguientes datos completos:\n• Nombre:\n• Dirección completa (calle, número, colonia, CP, ciudad y estado)\n• Referencias de domicilio\n• Teléfono\n\nEn cuanto los reciba, libero tu envío sin costo. Quedo pendiente.';
 
 // Mismo mecanismo de envío que publishAnswerInner (buyerId al vuelo si falta,
@@ -1656,6 +1652,13 @@ async function sendAutomationReminders() {
     .map((p) => p.record)
     .filter((r) => r && r.status === 'pendiente');
 
+  // OJO: a pedido explícito de Alan (2026-09-21), "envío acordado" ya NO manda un
+  // recordatorio automático si el cliente contesta incompleto — en pedidos "Acordar
+  // con el vendedor" lo único que se manda sin revisión humana es el primer contacto
+  // (ver sendFirstContactForAgreedShipping). Cualquier respuesta del cliente después
+  // de eso (completa, incompleta, o cualquier otra cosa) pasa por el borrador de IA
+  // normal en la pestaña "Borradores IA", igual que el resto de casos. Solo queda el
+  // recordatorio automático de "refactura" (sin relación con envíos).
   await mapWithConcurrency(candidates, 3, async (record) => {
     await remindOneCategory(record, {
       categoria: 'refactura',
@@ -1664,14 +1667,6 @@ async function sendAutomationReminders() {
       extractFn: extractRefacturaData,
       buildText: buildRefacturaReminderText,
       label: 'Automatización (datos de refactura faltantes)',
-    });
-    await remindOneCategory(record, {
-      categoria: 'envio_acordado',
-      askPatterns: ENVIO_ACORDADO_ASK_PATTERNS,
-      fieldLabels: ENVIO_ACORDADO_FIELD_LABELS,
-      extractFn: extractEnvioAcordadoData,
-      buildText: () => ENVIO_ACORDADO_REMINDER_TEXT,
-      label: 'Automatización (datos de envío faltantes)',
     });
   });
 }
