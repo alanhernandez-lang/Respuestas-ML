@@ -925,6 +925,9 @@ async function runSyncInner() {
   // lo que esto vaya escribiendo (envía mensajes de verdad, no puede permitirse esa
   // condición de carrera). Ver comentario junto a su definición.
   await sendAutomationReminders().catch((err) => console.error('[automation] error inesperado mandando recordatorios:', err.message));
+  // Misma razón que el de arriba: descubre y guarda packs nuevos por su cuenta
+  // (ventas sin ningún mensaje todavía), así que corre aparte del resto del ciclo.
+  await sendFirstContactForAgreedShipping().catch((err) => console.error('[automation] error inesperado mandando primer contacto:', err.message));
 
   return { syncedAt, totalPacks: Object.keys(packs).length, errors };
 }
@@ -1566,6 +1569,11 @@ function buildRefacturaReminderText(missing) {
 // TAL CUAL, en vez de inventar una versión con lista dinámica que nadie aprobó.
 const ENVIO_ACORDADO_REMINDER_TEXT = 'Hola 👋 Quedo pendiente de los datos completos para poder activar tu envío gratis 🎉 Envíamelos por favor en el formato solicitado para continuar con tu envío.';
 
+// Copia literal de la plantilla aprobada "Solicitud de datos para envío gratis" (ver
+// RESPONSE_TEMPLATES en lib/agent.js) — mismo criterio que ENVIO_ACORDADO_REMINDER_TEXT
+// de arriba: se reutiliza tal cual en vez de referenciarla dinámicamente.
+const ENVIO_ACORDADO_FIRST_CONTACT_TEXT = 'Hola, buen día. Tu pedido aplica para envío gratis 🎉 Para activarlo necesito que me envíes por mensaje los siguientes datos completos:\n• Nombre:\n• Dirección completa (calle, número, colonia, CP, ciudad y estado)\n• Referencias de domicilio\n• Teléfono\n\nEn cuanto los reciba, libero tu envío sin costo. Quedo pendiente.';
+
 // Mismo mecanismo de envío que publishAnswerInner (buyerId al vuelo si falta,
 // mandar, marcar leído, reflejar en el caché y en la bitácora), pero sin depender de
 // que exista un draftAnswer y sin sumar al conteo de respuestas por persona
@@ -1666,6 +1674,94 @@ async function sendAutomationReminders() {
       label: 'Automatización (datos de envío faltantes)',
     });
   });
+}
+
+// ---------------------------------------------------------------------------------
+// Primer contacto automático en pedidos "Acordar con el vendedor" (a pedido de Alan,
+// 2026-09-21, con visto bueno de su gerente): a diferencia del recordatorio de
+// arriba (que solo insiste sobre un pendiente que YA se le planteó al cliente),
+// esto manda el PRIMER mensaje del hilo completo, sin esperar a que el cliente
+// escriba nada — apenas se detecta la venta. El sync normal (fetchUnreadPacks) jamás
+// la encontraría por su cuenta: sin ningún mensaje todavía, Mercado Libre no la
+// reporta como "no leída". Por eso se descubre aparte, consultando ventas recientes
+// por /orders/search (mismo endpoint que runHistoryBackfillInner, pero acotado a los
+// últimos días en vez de todo el historial) y filtrando las que no tengan
+// `shipping.id` (mismo criterio exacto que resolveShippingInfo usa para reportar
+// "Acordar con el vendedor"). Ese filtro sobre el resultado de /orders/search es solo
+// un prefiltro barato para no llamar syncPackById de más: la decisión real de
+// mandar el mensaje se apoya en record.shippingStatusLabel, que sí viene del mismo
+// resolveShippingInfo ya confiable en el resto de la app.
+//
+// Igual que el recordatorio de arriba, el texto es 100% mecánico (la plantilla
+// aprobada tal cual, nunca texto libre de la IA) y queda apagado por default hasta
+// que alguien prenda AUTOMATION_FIRST_CONTACT_ENABLED=true a propósito.
+const AUTOMATION_FIRST_CONTACT_KEY = 'app:automation:first_contact_envio_acordado';
+// Ventana chica a propósito: solo hace falta alcanzar a las ventas de hoy/ayer antes
+// de que alguien las note manualmente — no es un backfill histórico.
+const FIRST_CONTACT_ORDERS_DAYS_BACK = 2;
+
+async function isFirstContactHandled(packId) {
+  return Boolean(await redis.hget(AUTOMATION_FIRST_CONTACT_KEY, packId));
+}
+
+async function markFirstContactHandled(packId, extra) {
+  await redis.hset(AUTOMATION_FIRST_CONTACT_KEY, {
+    [packId]: { handledAt: new Date().toISOString(), ...extra },
+  });
+}
+
+async function sendFirstContactForAgreedShipping() {
+  if (process.env.AUTOMATION_FIRST_CONTACT_ENABLED !== 'true') return;
+
+  const { access_token: token } = await getAccessToken();
+  const orders = await fetchAllSellerOrders(token, SELLER_ID, FIRST_CONTACT_ORDERS_DAYS_BACK);
+  const packIds = [...new Set(
+    orders
+      .filter((o) => !o.shipping?.id && o.status !== 'cancelled')
+      .map((o) => o.pack_id || o.id),
+  )];
+
+  const cache = await loadCache();
+  let sent = 0;
+  let skipped = 0;
+  await mapWithConcurrency(packIds, 3, async (packId) => {
+    if (await isFirstContactHandled(packId)) return;
+    try {
+      const record = await syncPackById(token, packId, cache, 0);
+      // Doble chequeo antes de mandar: solo si de verdad no hay NADA escrito todavía
+      // en el hilo (ni cliente ni vendedor) — si ya hay algo, el flujo normal
+      // (borrador de IA o el recordatorio de arriba) ya se encarga, y mandar esto
+      // encima sería un mensaje duplicado o fuera de contexto.
+      if (record.shippingStatusLabel === 'Acordar con el vendedor' && record.messages.length === 0) {
+        await savePackEntry(packId, {
+          info: {
+            orderId: record.orderId,
+            buyerName: record.buyerName,
+            buyerId: record.buyerId,
+            itemTitles: record.itemTitles,
+            itemLinks: record.itemLinks,
+            saleDate: record.saleDate,
+            isFull: record.isFull,
+            shippingStatus: record.shippingStatus,
+            shippingStatusLabel: record.shippingStatusLabel,
+            shippingSettled: record.shippingSettled,
+            shippingChecked: true,
+          },
+          record,
+        });
+        await withLock(`lock:pack:${packId}`, 30000, () => sendAutomatedMessage(packId, ENVIO_ACORDADO_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — envío acordado)'));
+        sent++;
+      } else {
+        skipped++;
+      }
+      await markFirstContactHandled(packId);
+    } catch (err) {
+      console.warn('[automation] no se pudo mandar el primer contacto (envío acordado) del pack', packId, err.message);
+    }
+  });
+  if (sent > 0 || skipped > 0) {
+    console.log(`[automation] Primer contacto envío acordado: ${sent} mandados, ${skipped} ya tenían mensajes.`);
+  }
 }
 
 function checkAutomationSecret(req, res) {
