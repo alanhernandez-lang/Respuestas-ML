@@ -1581,8 +1581,12 @@ const ENVIO_ACORDADO_FIRST_CONTACT_TEXT = 'Hola, buen día. Tu pedido aplica par
 
 // Mismo mecanismo de envío que publishAnswerInner (buyerId al vuelo si falta,
 // mandar, marcar leído, reflejar en el caché y en la bitácora), pero sin depender de
-// que exista un draftAnswer y sin sumar al conteo de respuestas por persona
-// (bumpAnswerCount) — nadie del equipo respondió esto, no le corresponde a nadie.
+// que exista un draftAnswer. SÍ suma al mismo contador que usa publishAnswerInner
+// (bumpAnswerCount, con el label de la automatización en vez de un email) — sin
+// esto, la automatización aparecía como chip de filtro en la Bitácora (porque
+// appendAnswerLog sí la registra) pero siempre con "(0)", porque ese número sale de
+// answerCounts, no de contar entradas del feed (ver comentario junto a renderLog en
+// public/app.js).
 async function sendAutomatedMessage(packId, text, label) {
   const entry = await getPackEntryOrThrow(packId);
   const record = entry.record;
@@ -1625,6 +1629,7 @@ async function sendAutomatedMessage(packId, text, label) {
     question: record.lastQuestion?.text || null,
     date: now,
   });
+  await bumpAnswerCount(label, now);
 }
 
 async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, extractFn, buildText, label }) {
