@@ -526,10 +526,14 @@ async function syncPackById(token, packId, cache, unreadCount) {
     // El de "Envíos acordados" no necesita un campo aparte: reutiliza
     // shippingStatusLabel === 'Acordar con el vendedor', que ya viene de la API de
     // envíos de ML (dato exacto), a diferencia de esto que solo es una detección por
-    // texto (ver REFACTURA_ASK_PATTERNS/vendorAskedFor, definidos más abajo en este
-    // archivo pero disponibles aquí igual — son const de módulo, ya están asignados
-    // para cuando esta función se llama de verdad).
-    isRefacturaCandidate: vendorAskedFor(messages, REFACTURA_ASK_PATTERNS),
+    // texto (ver REFACTURA_ASK_PATTERNS/REFACTURA_CLOSE_PATTERNS/vendorAskedFor,
+    // definidos más abajo en este archivo pero disponibles aquí igual — son const de
+    // módulo, ya están asignados para cuando esta función se llama de verdad). Se
+    // exige que el vendedor haya pedido los datos Y que NO le haya avisado ya al
+    // cliente que la factura quedó lista/enviada — así una conversación ya cerrada no
+    // reaparece en el filtro solo porque el cliente volvió a escribir por otro tema.
+    isRefacturaCandidate: vendorAskedFor(messages, REFACTURA_ASK_PATTERNS)
+      && !vendorAskedFor(messages, REFACTURA_CLOSE_PATTERNS),
     unreadCount,
     status: finalStatus,
     lastQuestion,
@@ -1569,6 +1573,25 @@ async function markPlanned(categoria, packId, extra) {
 // plantillas cambian de redacción, hay que revisar estos patrones también.
 const REFACTURA_ASK_PATTERNS = [/uso de cfdi/i, /r[eé]gimen fiscal/i, /raz[oó]n social/i];
 const ENVIO_ACORDADO_ASK_PATTERNS = [/env[ií]o gratis/i, /dirección completa \(calle/i];
+
+// A pedido de Alan (2026-09-22): una vez que el vendedor YA le mandó la factura al
+// cliente (o le avisó que ya se procedió con la facturación), esa conversación debe
+// dejar de contar como "refactura pendiente" aunque el cliente vuelva a escribir
+// después por otro tema — sin esto, isRefacturaCandidate se queda en true para
+// siempre (nunca se "des-pide" un dato una vez pedido) y una conversación ya resuelta
+// reaparecía en el filtro de refacturas solo porque el hilo volvió a estar
+// "pendiente" por una pregunta sin relación. Basado en las plantillas aprobadas
+// "Pasar a facturar" y "Compartir factura ya generada" (ver RESPONSE_TEMPLATES en
+// lib/agent.js) — si el equipo cierra el tema con otra redacción, esto no lo detecta
+// (mismo límite que cualquier prefiltro por texto, ver comentario de arriba).
+const REFACTURA_CLOSE_PATTERNS = [
+  /procedemos con (la|su) facturaci[oó]n/i,
+  /te env(í|i)o (tu|su) factura/i,
+  /te enviamos (tu|su) factura/i,
+  /adjunto (tu|su) factura/i,
+  /aqu(í|i) (tu|su|est(á|a)) factura/i,
+  /factura (ya )?(enviada|generada|lista)/i,
+];
 
 function vendorAskedFor(messages, patterns) {
   return (messages || []).some((m) => m.sender === 'vendedor' && patterns.some((p) => p.test(m.text || '')));
