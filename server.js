@@ -526,14 +526,14 @@ async function syncPackById(token, packId, cache, unreadCount) {
     // El de "Envíos acordados" no necesita un campo aparte: reutiliza
     // shippingStatusLabel === 'Acordar con el vendedor', que ya viene de la API de
     // envíos de ML (dato exacto), a diferencia de esto que solo es una detección por
-    // texto (ver REFACTURA_ASK_PATTERNS/REFACTURA_CLOSE_PATTERNS/vendorAskedFor,
-    // definidos más abajo en este archivo pero disponibles aquí igual — son const de
-    // módulo, ya están asignados para cuando esta función se llama de verdad). Se
-    // exige que el vendedor haya pedido los datos Y que NO le haya avisado ya al
-    // cliente que la factura quedó lista/enviada — así una conversación ya cerrada no
-    // reaparece en el filtro solo porque el cliente volvió a escribir por otro tema.
+    // texto (ver REFACTURA_ASK_PATTERNS/vendorSentFacturaPdf, definidos más abajo en
+    // este archivo pero disponibles aquí igual — son const/función de módulo, ya
+    // están asignados para cuando esta función se llama de verdad). Se exige que el
+    // vendedor haya pedido los datos Y que NO le haya entregado ya el PDF de la
+    // factura — así una conversación ya cerrada no reaparece en el filtro solo
+    // porque el cliente volvió a escribir por otro tema.
     isRefacturaCandidate: vendorAskedFor(messages, REFACTURA_ASK_PATTERNS)
-      && !vendorAskedFor(messages, REFACTURA_CLOSE_PATTERNS),
+      && !vendorSentFacturaPdf(messages),
     unreadCount,
     status: finalStatus,
     lastQuestion,
@@ -1574,18 +1574,25 @@ async function markPlanned(categoria, packId, extra) {
 const REFACTURA_ASK_PATTERNS = [/uso de cfdi/i, /r[eé]gimen fiscal/i, /raz[oó]n social/i];
 const ENVIO_ACORDADO_ASK_PATTERNS = [/env[ií]o gratis/i, /dirección completa \(calle/i];
 
-// A pedido de Alan (2026-09-22): una vez que el vendedor YA le mandó la factura al
-// cliente (o le avisó que ya se procedió con la facturación), esa conversación debe
-// dejar de contar como "refactura pendiente" aunque el cliente vuelva a escribir
-// después por otro tema — sin esto, isRefacturaCandidate se queda en true para
-// siempre (nunca se "des-pide" un dato una vez pedido) y una conversación ya resuelta
-// reaparecía en el filtro de refacturas solo porque el hilo volvió a estar
-// "pendiente" por una pregunta sin relación. Basado en las plantillas aprobadas
-// "Pasar a facturar" y "Compartir factura ya generada" (ver RESPONSE_TEMPLATES en
-// lib/agent.js) — si el equipo cierra el tema con otra redacción, esto no lo detecta
+// A pedido de Alan (2026-09-22, ajustado el mismo día tras ver un caso real): una
+// vez que el vendedor YA le entregó el PDF de la factura al cliente, esa
+// conversación debe dejar de contar como "refactura pendiente" aunque el cliente
+// vuelva a escribir después por otro tema — sin esto, isRefacturaCandidate se queda
+// en true para siempre (nunca se "des-pide" un dato una vez pedido) y una
+// conversación ya resuelta reaparecía en el filtro de refacturas solo porque el
+// hilo volvió a estar "pendiente" por una pregunta sin relación.
+//
+// A propósito NO basta con el texto solo (p.ej. "Procedemos con la facturación de
+// su compra", plantilla "Pasar a facturar") — ese mensaje es solo un aviso de que
+// está en trámite (tarda 1-3 días hábiles), el PDF real normalmente llega después
+// en un mensaje aparte, y hasta que eso pase sigue siendo trabajo pendiente de
+// verdad. Por eso se exige texto de entrega (ver plantilla aprobada "Compartir
+// factura ya generada" en RESPONSE_TEMPLATES, lib/agent.js) Y un PDF adjunto en ESE
+// MISMO mensaje — así "te envío tu factura" sin nada adjunto (un despiste, o
+// alguien escribiéndolo de más) no cierra el tema por accidente. Si el equipo cierra
+// el tema con una redacción muy distinta a estos patrones, esto no lo detecta
 // (mismo límite que cualquier prefiltro por texto, ver comentario de arriba).
-const REFACTURA_CLOSE_PATTERNS = [
-  /procedemos con (la|su) facturaci[oó]n/i,
+const REFACTURA_CLOSE_TEXT_PATTERNS = [
   /te env(í|i)o (tu|su) factura/i,
   /te enviamos (tu|su) factura/i,
   /adjunto (tu|su) factura/i,
@@ -1595,6 +1602,12 @@ const REFACTURA_CLOSE_PATTERNS = [
 
 function vendorAskedFor(messages, patterns) {
   return (messages || []).some((m) => m.sender === 'vendedor' && patterns.some((p) => p.test(m.text || '')));
+}
+
+function vendorSentFacturaPdf(messages) {
+  return (messages || []).some((m) => m.sender === 'vendedor'
+    && REFACTURA_CLOSE_TEXT_PATTERNS.some((p) => p.test(m.text || ''))
+    && (m.attachments || []).some((a) => a.kind === 'pdf'));
 }
 
 // ---------------------------------------------------------------------------------
