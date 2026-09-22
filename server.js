@@ -1495,6 +1495,47 @@ app.get('/api/cron/regenerate-pending-drafts', async (req, res) => {
   runRegeneratePendingDraftsInner().catch((err) => console.error('[regen-pendientes] Error general:', err));
 });
 
+// 2026-09-22: uso puntual, una sola vez — sendAutomatedMessage() ya suma al
+// contador (bumpAnswerCount, ver comentario junto a su definición), pero eso solo
+// corrige los mensajes automáticos mandados DESPUÉS de ese fix. Los que ya se
+// habían mandado antes se quedaron en "app:answerlog" (la Bitácora) sin su
+// contraparte en "app:answercounts" — por eso el chip de cada automatización se
+// veía siempre en "(0)" aunque ya hubiera entradas reales en la lista. Este
+// endpoint recorre el log y le suma a bumpAnswerCount lo que falte, UNA VEZ (el
+// marcador en Redis evita que un segundo llamado accidental vuelva a contar lo
+// mismo dos veces).
+const AUTOMATION_ANSWERCOUNTS_BACKFILL_KEY = 'app:automation:answercounts_backfilled_v1';
+
+async function backfillAutomationAnswerCountsInner() {
+  const already = await redis.get(AUTOMATION_ANSWERCOUNTS_BACKFILL_KEY);
+  if (already) return { skipped: true, backfilledAt: already };
+
+  const entries = await loadAnswerLog();
+  let counted = 0;
+  for (const e of entries) {
+    if (!e.answeredBy || !e.date) continue;
+    if (!e.answeredBy.startsWith('Automatización')) continue; // solo lo que mandaron las automatizaciones, nunca a una persona real
+    await bumpAnswerCount(e.answeredBy, e.date);
+    counted++;
+  }
+  const backfilledAt = new Date().toISOString();
+  await redis.set(AUTOMATION_ANSWERCOUNTS_BACKFILL_KEY, backfilledAt);
+  return { skipped: false, counted, backfilledAt };
+}
+
+app.get('/api/cron/backfill-automation-answer-counts', async (req, res) => {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const result = await backfillAutomationAnswerCountsInner();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ---------------------------------------------------------------------------------
 // Automatización n8n: refacturas y envíos acordados con el comprador (aprobado por
 // el gerente de Alan con alcance reducido — ver
