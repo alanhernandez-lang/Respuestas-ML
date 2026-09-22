@@ -1108,6 +1108,7 @@ const PUBLIC_PATHS = new Set([
   '/api/cron/sync',
   '/api/cron/backfill-history',
   '/api/cron/regenerate-pending-drafts',
+  '/api/cron/backfill-automation-answer-counts',
   // Automatización n8n de refacturas/envíos acordados (ver
   // docs/odoo-refacturas-envios-automation-plan.md) — se autentica con CRON_SECRET,
   // mismo patrón que el cron externo, no con una sesión de usuario.
