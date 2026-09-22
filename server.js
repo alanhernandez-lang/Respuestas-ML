@@ -24,6 +24,7 @@ const {
   generateDraftAnswer,
   extractRefacturaData,
   extractEnvioAcordadoData,
+  detectsFirstFacturaRequest,
   REFACTURA_FIELD_LABELS,
   ENVIO_ACORDADO_FIELD_LABELS,
 } = require('./lib/agent');
@@ -928,6 +929,9 @@ async function runSyncInner() {
   // Misma razón que el de arriba: descubre y guarda packs nuevos por su cuenta
   // (ventas sin ningún mensaje todavía), así que corre aparte del resto del ciclo.
   await sendFirstContactForAgreedShipping().catch((err) => console.error('[automation] error inesperado mandando primer contacto:', err.message));
+  // Independiente de sendAutomationReminders() a propósito (ver comentario junto a
+  // su definición) — se apaga con su propia variable de entorno.
+  await sendFacturaFirstContact().catch((err) => console.error('[automation] error inesperado mandando primer contacto de factura:', err.message));
 
   return { syncedAt, totalPacks: Object.keys(packs).length, errors };
 }
@@ -1564,6 +1568,11 @@ function buildRefacturaReminderText(missing) {
   return `Gracias por la información. Para poder emitir su factura aún nos falta que nos comparta:\n${bullets}\n\nEn cuanto recibamos los datos completos, procedemos con la emisión.`;
 }
 
+// Copia literal de la plantilla aprobada "Solicitar datos de factura" (ver
+// RESPONSE_TEMPLATES en lib/agent.js) — mismo criterio que ENVIO_ACORDADO_FIRST_CONTACT_TEXT
+// de abajo: se reutiliza tal cual en vez de referenciarla dinámicamente.
+const FACTURA_FIRST_CONTACT_TEXT = 'Buen día 🙏 Con gusto realizamos su factura. Para generarla, favor de enviarnos:\n• Constancia de situación fiscal (PDF o fotografía legible)\n• Uso de CFDI\n• Forma de pago\n\nEn cuanto recibamos la información completa, procedemos con su emisión.';
+
 // Copia literal de la plantilla aprobada "Solicitud de datos para envío gratis" (ver
 // RESPONSE_TEMPLATES en lib/agent.js) — se reutiliza tal cual en vez de
 // referenciarla dinámicamente, para no depender de que el prompt del agente de IA
@@ -1637,6 +1646,81 @@ async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, 
   } catch (err) {
     console.warn(`[automation] no se pudo mandar recordatorio (${categoria}) del pack`, record.packId, err.message);
   }
+}
+
+// ---------------------------------------------------------------------------------
+// Primer contacto automático cuando el cliente pide factura/refactura por primera
+// vez (a pedido de Alan, 2026-09-22, mismo criterio de aprobación que el primer
+// contacto de envío acordado): a diferencia de ese caso (donde el disparador es un
+// dato exacto de la API, `shipping.id` ausente), aquí el disparador es la intención
+// del CLIENTE en su propio mensaje — no hay forma de saberlo sin interpretar texto
+// libre, así que se apoya en detectsFirstFacturaRequest (lib/agent.js, vía Gemini)
+// en vez de un regex simple, para no dispararse con negaciones ("no necesito
+// factura") ni con un cliente que ya la había pedido antes en el mismo hilo.
+//
+// No hace falta descubrir packs nuevos por su cuenta (a diferencia del envío
+// acordado): el cliente pidiendo factura ya llega por el sync normal como
+// "pendiente", así que esto corre dentro del mismo lote de candidatos de
+// sendAutomationReminders(), no por separado.
+const AUTOMATION_FACTURA_FIRST_CONTACT_KEY = 'app:automation:first_contact_factura';
+
+// Prefiltro barato antes de gastar una llamada a Gemini por pack: sin esto, cada
+// ciclo de sync llamaría a Gemini por cada conversación "pendiente" sin importar el
+// tema. Solo vale la pena preguntarle a Gemini si el cliente mencionó algo de
+// facturación en su propio mensaje.
+const CLIENT_FACTURA_MENTION_PATTERN = /factur|cfdi/i;
+
+async function isFacturaFirstContactHandled(packId) {
+  return Boolean(await redis.hget(AUTOMATION_FACTURA_FIRST_CONTACT_KEY, packId));
+}
+
+async function markFacturaFirstContactHandled(packId, questionDate) {
+  await redis.hset(AUTOMATION_FACTURA_FIRST_CONTACT_KEY, {
+    [packId]: { questionDate, handledAt: new Date().toISOString() },
+  });
+}
+
+async function sendFacturaFirstContactForRecord(record) {
+  if (process.env.AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED !== 'true') return;
+  if (!CLIENT_FACTURA_MENTION_PATTERN.test(record.lastQuestion?.text || '')) return;
+  // El vendedor ya pidió estos datos antes en este hilo (misma señal que usa el
+  // recordatorio de refactura de abajo) — entonces esta ya no es la primera vez.
+  if (vendorAskedFor(record.messages, REFACTURA_ASK_PATTERNS)) return;
+  if (await isFacturaFirstContactHandled(record.packId)) return;
+  const questionDate = record.lastQuestion?.date || null;
+  if (!questionDate) return;
+
+  let asksForFactura;
+  try {
+    asksForFactura = await detectsFirstFacturaRequest(record.messages, process.env.GEMINI_API_KEY);
+  } catch (err) {
+    console.warn('[automation] no se pudo evaluar solicitud de factura del pack', record.packId, err.message);
+    return;
+  }
+  if (!asksForFactura) return;
+
+  try {
+    await withLock(`lock:pack:${record.packId}`, 30000, () => sendAutomatedMessage(record.packId, FACTURA_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — solicitud de factura)'));
+    await markFacturaFirstContactHandled(record.packId, questionDate);
+  } catch (err) {
+    console.warn('[automation] no se pudo mandar el primer contacto (factura) del pack', record.packId, err.message);
+  }
+}
+
+// Wrapper con su propia carga de caché, a propósito SEPARADO de
+// sendAutomationReminders() de abajo — aunque ambos recorren los mismos candidatos
+// "pendiente", cada uno tiene que apagarse con su propia variable de entorno sin
+// depender de la otra (AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED aquí,
+// AUTOMATION_REMINDERS_ENABLED allá). El chequeo de la variable también vive dentro
+// de sendFacturaFirstContactForRecord — aquí se repite antes para no gastar un
+// loadCache() completo cuando está apagada.
+async function sendFacturaFirstContact() {
+  if (process.env.AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED !== 'true') return;
+  const cache = await loadCache();
+  const candidates = Object.values(cache.packs)
+    .map((p) => p.record)
+    .filter((r) => r && r.status === 'pendiente');
+  await mapWithConcurrency(candidates, 3, (record) => sendFacturaFirstContactForRecord(record));
 }
 
 // Apagado por default a propósito: esto manda mensajes reales al cliente en
