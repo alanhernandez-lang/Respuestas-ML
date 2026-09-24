@@ -25,6 +25,7 @@ const {
   extractRefacturaData,
   extractEnvioAcordadoData,
   detectsFirstFacturaRequest,
+  classifyAgreedShippingFirstContact,
   REFACTURA_FIELD_LABELS,
   ENVIO_ACORDADO_FIELD_LABELS,
 } = require('./lib/agent');
@@ -1930,45 +1931,89 @@ async function sendFirstContactForAgreedShipping() {
   )];
 
   const cache = await loadCache();
-  let sent = 0;
+  let sentEnvio = 0;
+  let sentAmbas = 0;
   let skipped = 0;
   await mapWithConcurrency(packIds, 3, async (packId) => {
     if (await isFirstContactHandled(packId)) return;
     try {
       const record = await syncPackById(token, packId, cache, 0);
-      // Doble chequeo antes de mandar: solo si de verdad no hay NADA escrito todavía
-      // en el hilo (ni cliente ni vendedor) — si ya hay algo, el flujo normal
-      // (borrador de IA o el recordatorio de arriba) ya se encarga, y mandar esto
-      // encima sería un mensaje duplicado o fuera de contexto.
-      if (record.shippingStatusLabel === 'Acordar con el vendedor' && record.messages.length === 0) {
-        await savePackEntry(packId, {
-          info: {
-            orderId: record.orderId,
-            buyerName: record.buyerName,
-            buyerId: record.buyerId,
-            itemTitles: record.itemTitles,
-            itemLinks: record.itemLinks,
-            saleDate: record.saleDate,
-            isFull: record.isFull,
-            shippingStatus: record.shippingStatus,
-            shippingStatusLabel: record.shippingStatusLabel,
-            shippingSettled: record.shippingSettled,
-            shippingChecked: true,
-          },
-          record,
-        });
-        await withLock(`lock:pack:${packId}`, 30000, () => sendAutomatedMessage(packId, ENVIO_ACORDADO_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — envío acordado)'));
-        sent++;
-      } else {
+      if (record.shippingStatusLabel !== 'Acordar con el vendedor') {
         skipped++;
+        await markFirstContactHandled(packId);
+        return;
       }
+      // El vendedor ya le contestó algo a este pack (a mano, o por otra vía) — el
+      // flujo normal ya se encarga, mandar esto encima sería un mensaje duplicado.
+      if (record.messages.some((m) => m.sender === 'vendedor')) {
+        skipped++;
+        await markFirstContactHandled(packId);
+        return;
+      }
+
+      // A pedido explícito de Alan (2026-09-24, "opción 2" del problema de la
+      // carrera con el sync): ya no exige que el hilo esté completamente vacío —
+      // si el cliente escribió primero (antes de que esta automatización alcanzara
+      // a mandar su mensaje), igual se manda la plantilla de envío, SIEMPRE Y
+      // CUANDO lo que escribió no obligue a ignorar algo importante. Un chequeo
+      // determinístico barato (adjuntos) más classifyAgreedShippingFirstContact
+      // (Gemini, lib/agent.js) deciden si es seguro mandar algo automático o si hay
+      // que abstenerse y dejarlo pasar a revisión humana.
+      let category = 'solo_envio';
+      if (record.messages.length > 0) {
+        const clientAttached = record.messages.some((m) => m.sender === 'cliente' && m.hasAttachment);
+        if (clientAttached) {
+          category = 'abstenerse';
+        } else {
+          try {
+            category = await classifyAgreedShippingFirstContact(record.messages, process.env.GEMINI_API_KEY);
+          } catch (err) {
+            console.warn('[automation] no se pudo clasificar el primer mensaje del pack', packId, err.message);
+            category = 'abstenerse';
+          }
+        }
+      }
+
+      if (category === 'abstenerse') {
+        skipped++;
+        await markFirstContactHandled(packId);
+        return;
+      }
+
+      await savePackEntry(packId, {
+        info: {
+          orderId: record.orderId,
+          buyerName: record.buyerName,
+          buyerId: record.buyerId,
+          itemTitles: record.itemTitles,
+          itemLinks: record.itemLinks,
+          saleDate: record.saleDate,
+          isFull: record.isFull,
+          shippingStatus: record.shippingStatus,
+          shippingStatusLabel: record.shippingStatusLabel,
+          shippingSettled: record.shippingSettled,
+          shippingChecked: true,
+        },
+        record,
+      });
+      await withLock(`lock:pack:${packId}`, 30000, async () => {
+        await sendAutomatedMessage(packId, ENVIO_ACORDADO_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — envío acordado)');
+        // Caso real (2026-09-24): el cliente ya pidió factura en el mismo mensaje
+        // donde apenas se está enterando del envío gratis, sin haber dado ningún
+        // dato todavía — se manda también la plantilla de factura, en un segundo
+        // mensaje aparte, en vez de dejarla pasar a revisión humana sin necesidad.
+        if (category === 'envio_y_factura') {
+          await sendAutomatedMessage(packId, FACTURA_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — solicitud de factura)');
+        }
+      });
+      if (category === 'envio_y_factura') sentAmbas++; else sentEnvio++;
       await markFirstContactHandled(packId);
     } catch (err) {
       console.warn('[automation] no se pudo mandar el primer contacto (envío acordado) del pack', packId, err.message);
     }
   });
-  if (sent > 0 || skipped > 0) {
-    console.log(`[automation] Primer contacto envío acordado: ${sent} mandados, ${skipped} ya tenían mensajes.`);
+  if (sentEnvio > 0 || sentAmbas > 0 || skipped > 0) {
+    console.log(`[automation] Primer contacto envío acordado: ${sentEnvio} solo envío, ${sentAmbas} envío+factura, ${skipped} sin mandar.`);
   }
 }
 
