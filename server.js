@@ -526,13 +526,19 @@ async function syncPackById(token, packId, cache, unreadCount) {
     // El de "Envíos acordados" no necesita un campo aparte: reutiliza
     // shippingStatusLabel === 'Acordar con el vendedor', que ya viene de la API de
     // envíos de ML (dato exacto), a diferencia de esto que solo es una detección por
-    // texto (ver REFACTURA_ASK_PATTERNS/vendorSentFacturaPdf, definidos más abajo en
-    // este archivo pero disponibles aquí igual — son const/función de módulo, ya
-    // están asignados para cuando esta función se llama de verdad). Se exige que el
-    // vendedor haya pedido los datos Y que NO le haya entregado ya el PDF de la
-    // factura — así una conversación ya cerrada no reaparece en el filtro solo
-    // porque el cliente volvió a escribir por otro tema.
-    isRefacturaCandidate: vendorAskedFor(messages, REFACTURA_ASK_PATTERNS)
+    // texto (ver REFACTURA_ASK_PATTERNS/clientMentionedFactura/vendorSentFacturaPdf,
+    // definidos más abajo en este archivo pero disponibles aquí igual — son
+    // const/función de módulo, ya están asignados para cuando esta función se llama
+    // de verdad). Cuenta como candidata si el VENDEDOR ya pidió los datos fiscales
+    // O si el CLIENTE mencionó factura/CFDI en cualquiera de sus mensajes — antes
+    // solo miraba lo primero, así que un cliente que pide/manda su factura antes de
+    // que nadie del equipo le conteste (caso real: "Xa Za", 2026-09-24, mandó toda
+    // su factura en su primer mensaje) no aparecía en el filtro aunque claramente
+    // necesitaba atención de refactura. En ambos casos se exige además que el
+    // vendedor NO le haya entregado ya el PDF de la factura — así una conversación
+    // ya cerrada no reaparece en el filtro solo porque el cliente volvió a escribir
+    // por otro tema.
+    isRefacturaCandidate: (vendorAskedFor(messages, REFACTURA_ASK_PATTERNS) || clientMentionedFactura(messages))
       && !vendorSentFacturaPdf(messages),
     unreadCount,
     status: finalStatus,
@@ -1610,6 +1616,22 @@ function vendorSentFacturaPdf(messages) {
     && (m.attachments || []).some((a) => a.kind === 'pdf'));
 }
 
+// A pedido de Alan (2026-09-24, caso real: cliente "Xa Za" mandó su factura completa
+// en su primer mensaje y la conversación no aparecía en el filtro de refacturas
+// porque isRefacturaCandidate solo miraba si el VENDEDOR ya había pedido los datos
+// — si el cliente se adelanta y pide/manda su factura antes de que nadie del equipo
+// responda, antes no había ninguna señal que lo detectara). Prefiltro barato por
+// texto (no Gemini) a propósito: esto solo alimenta un filtro/chip de la interfaz
+// para que el equipo lo vea, no dispara ningún mensaje automático — el costo de un
+// falso positivo aquí es mínimo (aparece de más en la lista), así que no amerita el
+// costo/latencia de una llamada a Gemini por cada pack en cada sync, a diferencia de
+// detectsFirstFacturaRequest (que sí decide si se manda un mensaje solo).
+const CLIENT_FACTURA_MENTION_PATTERN = /factur|cfdi/i;
+
+function clientMentionedFactura(messages) {
+  return (messages || []).some((m) => m.sender === 'cliente' && CLIENT_FACTURA_MENTION_PATTERN.test(m.text || ''));
+}
+
 // ---------------------------------------------------------------------------------
 // Recordatorio automático de datos faltantes (refactura / envío acordado) — decisión
 // explícita de Alan (2026-09-10): a diferencia de la planificación en Odoo (que es
@@ -1746,12 +1768,6 @@ async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, 
 // "pendiente", así que esto corre dentro del mismo lote de candidatos de
 // sendAutomationReminders(), no por separado.
 const AUTOMATION_FACTURA_FIRST_CONTACT_KEY = 'app:automation:first_contact_factura';
-
-// Prefiltro barato antes de gastar una llamada a Gemini por pack: sin esto, cada
-// ciclo de sync llamaría a Gemini por cada conversación "pendiente" sin importar el
-// tema. Solo vale la pena preguntarle a Gemini si el cliente mencionó algo de
-// facturación en su propio mensaje.
-const CLIENT_FACTURA_MENTION_PATTERN = /factur|cfdi/i;
 
 async function isFacturaFirstContactHandled(packId) {
   return Boolean(await redis.hget(AUTOMATION_FACTURA_FIRST_CONTACT_KEY, packId));
