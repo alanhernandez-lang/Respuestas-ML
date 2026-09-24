@@ -461,11 +461,23 @@ async function syncPackById(token, packId, cache, unreadCount) {
   // seguía marcada "blocked" por el lado de ML aunque el reclamo en sí ya cerró).
   // Se exige además que el reclamo siga "opened" — no basta con que exista.
   const isGenuineMediation = isBlocked && Boolean(mediation?.claimId) && mediation?.status === 'opened';
+  // Antes de las automatizaciones de "primer contacto" (envío acordado, 2026-09-21),
+  // toda conversación arrancaba siempre con un mensaje del CLIENTE — así que
+  // lastQuestion nunca era null una vez que había algo de actividad, y exigir
+  // lastAnswer && lastQuestion nunca era un problema. Ahora el VENDEDOR puede ser
+  // quien escribe primero (el cliente todavía no ha contestado nada), y en ese caso
+  // lastQuestion sigue siendo null para siempre — la condición de abajo nunca se
+  // cumplía y la conversación se quedaba en "pendiente" aunque ya no hubiera nada
+  // que el equipo tuviera que hacer (caso real: Jose Carlos Topete Gonzalez,
+  // 2026-09-24, solo tenía el mensaje automático del vendedor y ningún mensaje del
+  // cliente, y aun así aparecía como pendiente). Si ya hay una respuesta nuestra y
+  // el cliente nunca ha preguntado nada, no hay nada pendiente de nuestro lado —
+  // cuenta como "respondido" (estamos esperando al cliente, no al revés).
   const naturalStatus = isGenuineMediation
     ? 'mediacion'
-    : (lastAnswer && lastQuestion && new Date(lastAnswer.date) > new Date(lastQuestion.date)
-      ? 'respondido'
-      : 'pendiente');
+    : (!lastAnswer
+      ? 'pendiente'
+      : (!lastQuestion || new Date(lastAnswer.date) > new Date(lastQuestion.date) ? 'respondido' : 'pendiente'));
   // 2026-08-31: si ML bloqueó la conversación pero todavía no calificó como
   // mediación genuina arriba (sin claimId confirmado, típicamente un reclamo
   // recién abierto cuyo ID aún no propaga), tampoco debe verse como "pendiente"
