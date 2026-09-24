@@ -80,9 +80,30 @@ const TERMINAL_SHIPPING_STATUSES = new Set(['delivered', 'cancelled', 'not_deliv
 // Libre), `order.shipping` no trae `id` — ahí ni siquiera existe un envío que
 // consultar, así que se reporta directo como "Acordar con el vendedor" en vez de
 // gastar una llamada a /shipments que fallaría de todos modos.
+// Mercado Libre a veces tarda un rato en asignar el envío real (FULL u otro) a una
+// orden recién creada — si se consulta MUY temprano (la automatización de primer
+// contacto de envío acordado lo hace, a veces minutos después de la venta, vía
+// /orders/search), se puede encontrar `shipping.id` ausente todavía aunque el
+// pedido SÍ vaya a tener un envío gestionado por ML poco después. Antes de esta
+// automatización, la app solo revisaba un pedido hasta que el cliente ya había
+// escrito algo (horas o días después), tiempo de sobra para que ML ya hubiera
+// asignado el envío — así que la ausencia de shipping.id, tratada como señal
+// PERMANENTE ("Acordar con el vendedor" para siempre), nunca había dado un falso
+// positivo. Caso real: pedido de Gracia Ugalde (2026-09-24) — Mercado Libre lo
+// muestra como FULL con guía real, pero la app lo etiquetó "Acordar con el
+// vendedor" porque lo revisó apenas creado. Mientras el pedido sea más nuevo que
+// este margen, no se asienta en ningún lado (shippingSettled: false), así que el
+// sync normal lo vuelve a revisar en ciclos futuros hasta saber con certeza.
+const SHIPPING_ASSIGNMENT_GRACE_MS = 60 * 60 * 1000; // 1 hora
+
 async function resolveShippingInfo(token, order) {
   const shippingId = order.shipping?.id;
   if (!shippingId) {
+    const createdAt = order.date_created ? new Date(order.date_created).getTime() : NaN;
+    const stillWaitingForAssignment = Number.isFinite(createdAt) && (Date.now() - createdAt) < SHIPPING_ASSIGNMENT_GRACE_MS;
+    if (stillWaitingForAssignment) {
+      return { isFull: false, shippingStatus: null, shippingStatusLabel: null, shippingSettled: false };
+    }
     return { isFull: false, shippingStatus: null, shippingStatusLabel: 'Acordar con el vendedor', shippingSettled: true };
   }
   try {
@@ -1133,6 +1154,7 @@ const PUBLIC_PATHS = new Set([
   '/api/cron/regenerate-pending-drafts',
   '/api/cron/backfill-automation-answer-counts',
   '/api/cron/fix-numeric-pack-ids',
+  '/api/cron/recheck-agreed-shipping-labels',
   // Automatización n8n de refacturas/envíos acordados (ver
   // docs/odoo-refacturas-envios-automation-plan.md) — se autentica con CRON_SECRET,
   // mismo patrón que el cron externo, no con una sesión de usuario.
@@ -1556,6 +1578,70 @@ app.get('/api/cron/fix-numeric-pack-ids', async (req, res) => {
   }
   try {
     const result = await fixNumericPackIdsInner();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2026-09-24, uso puntual: antes del margen de gracia agregado a
+// resolveShippingInfo (ver comentario junto a su definición), un pedido revisado
+// muy temprano por sendFirstContactForAgreedShipping podía quedar etiquetado
+// "Acordar con el vendedor" PARA SIEMPRE aunque Mercado Libre le asignara un envío
+// real (FULL u otro) poco después — una vez que resolvePackInfo cree que
+// "shippingSettled: true", nunca lo vuelve a consultar solo. Este endpoint fuerza
+// una relectura completa (orden + envío) de TODO lo que hoy esté etiquetado
+// "Acordar con el vendedor", para corregir cualquier caso ya atrapado por el bug
+// (caso real: Gracia Ugalde, 2026-09-24 — Mercado Libre la muestra como FULL con
+// guía real). Seguro de correr de más: los que de verdad son "Acordar con el
+// vendedor" simplemente se vuelven a confirmar igual.
+async function recheckAgreedShippingLabelsInner() {
+  const { access_token: token } = await getAccessToken();
+  const cache = await loadCache();
+  const candidates = Object.entries(cache.packs)
+    .filter(([, entry]) => entry.record?.shippingStatusLabel === 'Acordar con el vendedor')
+    .map(([packId]) => packId);
+
+  let corrected = 0;
+  let confirmed = 0;
+  await mapWithConcurrency(candidates, 3, async (packId) => {
+    try {
+      // cache vacío a propósito: fuerza a resolvePackInfo a volver a consultar
+      // orden + envío desde cero, en vez de confiar en shippingSettled ya guardado
+      // (que puede estar mal, justo lo que estamos corrigiendo).
+      const record = await syncPackById(token, packId, { packs: {} }, cache.packs[packId]?.record?.unreadCount || 0);
+      if (record.shippingStatusLabel !== 'Acordar con el vendedor') corrected++; else confirmed++;
+      const fresh = await loadPackEntry(packId);
+      if (!fresh) return;
+      fresh.record = record;
+      fresh.info = {
+        orderId: record.orderId,
+        buyerName: record.buyerName,
+        buyerId: record.buyerId,
+        itemTitles: record.itemTitles,
+        itemLinks: record.itemLinks,
+        saleDate: record.saleDate,
+        isFull: record.isFull,
+        shippingStatus: record.shippingStatus,
+        shippingStatusLabel: record.shippingStatusLabel,
+        shippingSettled: record.shippingSettled,
+        shippingChecked: true,
+      };
+      await savePackEntry(packId, fresh);
+    } catch (err) {
+      console.warn('[recheck-acordados] error en pack', packId, err.message);
+    }
+  });
+  return { totalCandidates: candidates.length, corrected, confirmed };
+}
+
+app.get('/api/cron/recheck-agreed-shipping-labels', async (req, res) => {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const result = await recheckAgreedShippingLabelsInner();
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1997,6 +2083,13 @@ async function sendFirstContactForAgreedShipping() {
     try {
       const record = await syncPackById(token, packId, cache, 0);
       if (record.shippingStatusLabel !== 'Acordar con el vendedor') {
+        // Si todavía no se sabe con certeza (shippingSettled: false — ver margen de
+        // gracia en resolveShippingInfo), NO lo marques como manejado: hay que
+        // volver a intentarlo en un ciclo futuro, una vez que Mercado Libre le haya
+        // asignado su envío real o haya pasado el margen de gracia. Marcarlo aquí
+        // lo dejaría descartado para siempre aunque resultara ser "Acordar con el
+        // vendedor" de verdad (caso real: Gracia Ugalde, ver resolveShippingInfo).
+        if (!record.shippingSettled) return;
         skipped++;
         await markFirstContactHandled(packId);
         return;
