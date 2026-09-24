@@ -91,9 +91,19 @@ const TERMINAL_SHIPPING_STATUSES = new Set(['delivered', 'cancelled', 'not_deliv
 // PERMANENTE ("Acordar con el vendedor" para siempre), nunca había dado un falso
 // positivo. Caso real: pedido de Gracia Ugalde (2026-09-24) — Mercado Libre lo
 // muestra como FULL con guía real, pero la app lo etiquetó "Acordar con el
-// vendedor" porque lo revisó apenas creado. Mientras el pedido sea más nuevo que
-// este margen, no se asienta en ningún lado (shippingSettled: false), así que el
-// sync normal lo vuelve a revisar en ciclos futuros hasta saber con certeza.
+// vendedor" porque lo revisó apenas creado.
+//
+// OJO (2026-09-24, mismo día — primer intento de este fix escondía el tag por
+// completo durante el margen, y eso rompió el caso normal: pedido de Jose Gasca,
+// que Mercado Libre SÍ marca como "Acuerdas la entrega" desde el minuto uno, se
+// quedó sin ningún tag ni la nota de envío gratis en el prompt de la IA, porque su
+// pedido tenía menos de 1 hora — la inmensa mayoría de "Acordar con el vendedor"
+// son así de genuinos desde el principio; los casos como Gracia Ugalde son la
+// excepción, no la regla). Por eso el label SIEMPRE se muestra de inmediato — lo
+// único que espera el margen es `shippingSettled`, que es lo que de verdad
+// necesita certeza (evita que sendFirstContactForAgreedShipping mande el mensaje
+// automático antes de estar seguro — ver el chequeo explícito ahí). Si en el
+// margen aparece un envío real, se corrige solo en el siguiente ciclo de sync.
 const SHIPPING_ASSIGNMENT_GRACE_MS = 60 * 60 * 1000; // 1 hora
 
 async function resolveShippingInfo(token, order) {
@@ -101,10 +111,7 @@ async function resolveShippingInfo(token, order) {
   if (!shippingId) {
     const createdAt = order.date_created ? new Date(order.date_created).getTime() : NaN;
     const stillWaitingForAssignment = Number.isFinite(createdAt) && (Date.now() - createdAt) < SHIPPING_ASSIGNMENT_GRACE_MS;
-    if (stillWaitingForAssignment) {
-      return { isFull: false, shippingStatus: null, shippingStatusLabel: null, shippingSettled: false };
-    }
-    return { isFull: false, shippingStatus: null, shippingStatusLabel: 'Acordar con el vendedor', shippingSettled: true };
+    return { isFull: false, shippingStatus: null, shippingStatusLabel: 'Acordar con el vendedor', shippingSettled: !stillWaitingForAssignment };
   }
   try {
     const shipment = await fetchShipmentDetail(token, shippingId);
@@ -2083,17 +2090,21 @@ async function sendFirstContactForAgreedShipping() {
     try {
       const record = await syncPackById(token, packId, cache, 0);
       if (record.shippingStatusLabel !== 'Acordar con el vendedor') {
-        // Si todavía no se sabe con certeza (shippingSettled: false — ver margen de
-        // gracia en resolveShippingInfo), NO lo marques como manejado: hay que
-        // volver a intentarlo en un ciclo futuro, una vez que Mercado Libre le haya
-        // asignado su envío real o haya pasado el margen de gracia. Marcarlo aquí
-        // lo dejaría descartado para siempre aunque resultara ser "Acordar con el
-        // vendedor" de verdad (caso real: Gracia Ugalde, ver resolveShippingInfo).
-        if (!record.shippingSettled) return;
+        // Ya se confirmó que este pedido SÍ tiene un envío real gestionado por ML
+        // (dejó de mostrar "Acordar con el vendedor" porque le asignaron un
+        // shipping.id) — nada que mandar aquí.
         skipped++;
         await markFirstContactHandled(packId);
         return;
       }
+      // El label se muestra optimista desde el minuto uno (ver resolveShippingInfo)
+      // — pero mientras no esté "asentado" (shippingSettled: false, dentro del
+      // margen de gracia) todavía no hay certeza de que este pedido no vaya a
+      // recibir un envío real de un momento a otro. NO marques como manejado: hay
+      // que reintentarlo en un ciclo futuro (caso real: Gracia Ugalde, terminó
+      // siendo FULL a pesar de mostrarse como "Acordar con el vendedor" al
+      // principio — mandarle el mensaje automático ahí habría sido un error).
+      if (!record.shippingSettled) return;
       // El vendedor ya le contestó algo a este pack (a mano, o por otra vía) — el
       // flujo normal ya se encarga, mandar esto encima sería un mensaje duplicado.
       if (record.messages.some((m) => m.sender === 'vendedor')) {
