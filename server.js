@@ -1792,6 +1792,14 @@ async function sendFacturaFirstContactForRecord(record) {
   // deja pasar siempre a revisión humana.
   if (record.shippingStatusLabel === 'Acordar con el vendedor') return;
   if (!CLIENT_FACTURA_MENTION_PATTERN.test(record.lastQuestion?.text || '')) return;
+  // A pedido explícito de Alan (2026-09-24): esta plantilla SOLO es para el mensaje
+  // simple ("me pueden facturar", "necesito facturar"), nunca cuando el cliente ya
+  // mandó algún dato (aunque sea uno) o adjuntó una foto/PDF — eso se deja siempre
+  // como borrador para que alguien lo revise a mano, la plantilla genérica volvería
+  // a pedir datos que ya dio. Chequeo determinístico aparte del que hace Gemini más
+  // abajo (detectsFirstFacturaRequest) porque un adjunto sin texto no siempre se lo
+  // describe bien a la IA, y esto es más barato/confiable que depender solo de ella.
+  if (record.lastQuestion?.hasAttachment) return;
   // El vendedor ya pidió estos datos antes en este hilo (misma señal que usa el
   // recordatorio de refactura de abajo) — entonces esta ya no es la primera vez.
   if (vendorAskedFor(record.messages, REFACTURA_ASK_PATTERNS)) return;
