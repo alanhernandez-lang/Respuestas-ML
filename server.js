@@ -1923,14 +1923,24 @@ async function sendFirstContactForAgreedShipping() {
   if (process.env.AUTOMATION_FIRST_CONTACT_ENABLED !== 'true') return;
 
   const { access_token: token } = await getAccessToken();
-  const orders = await fetchAllSellerOrders(token, SELLER_ID, FIRST_CONTACT_ORDERS_DAYS_BACK);
-  const packIds = [...new Set(
-    orders
-      .filter((o) => !o.shipping?.id && o.status !== 'cancelled')
-      .map((o) => o.pack_id || o.id),
-  )];
-
   const cache = await loadCache();
+  const orders = await fetchAllSellerOrders(token, SELLER_ID, FIRST_CONTACT_ORDERS_DAYS_BACK);
+  // El descubrimiento por /orders/search (últimos 2 días) es lo que sostiene esta
+  // automatización en marcha normal — pero se combina con TODO lo que ya está en
+  // caché como "Acordar con el vendedor" y pendiente, sin importar la fecha de la
+  // orden (a pedido de Alan, 2026-09-24: barrer también los pendientes de antes de
+  // que existiera esta automatización, o que por lo que sea la ventana de 2 días se
+  // haya saltado). isFirstContactHandled sigue evitando que un pack ya evaluado se
+  // vuelva a procesar en ciclos futuros, así que este barrido extra solo tiene
+  // efecto real la primera vez que corre sobre cada pack.
+  const knownAgreedShippingPending = Object.values(cache.packs)
+    .filter((p) => p.record?.status === 'pendiente' && p.record?.shippingStatusLabel === 'Acordar con el vendedor')
+    .map((p) => p.record.packId);
+  const packIds = [...new Set([
+    ...orders.filter((o) => !o.shipping?.id && o.status !== 'cancelled').map((o) => o.pack_id || o.id),
+    ...knownAgreedShippingPending,
+  ])];
+
   let sentEnvio = 0;
   let sentAmbas = 0;
   let skipped = 0;
