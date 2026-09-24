@@ -1132,6 +1132,7 @@ const PUBLIC_PATHS = new Set([
   '/api/cron/backfill-history',
   '/api/cron/regenerate-pending-drafts',
   '/api/cron/backfill-automation-answer-counts',
+  '/api/cron/fix-numeric-pack-ids',
   // Automatización n8n de refacturas/envíos acordados (ver
   // docs/odoo-refacturas-envios-automation-plan.md) — se autentica con CRON_SECRET,
   // mismo patrón que el cron externo, no con una sesión de usuario.
@@ -1412,7 +1413,12 @@ app.get('/api/cron/sync', async (req, res) => {
 async function runHistoryBackfillInner() {
   const { access_token: token } = await getAccessToken();
   const orders = await fetchAllSellerOrders(token, SELLER_ID);
-  const packIds = [...new Set(orders.map((o) => o.pack_id || o.id))];
+  // String(...): /orders/search devuelve pack_id/id como número, pero el resto de
+  // la app siempre trata packId como texto (ver comentario igual en
+  // sendFirstContactForAgreedShipping) — sin esto, un pack que nadie más vuelva a
+  // tocar por la vía normal se queda con packId numérico y el frontend nunca lo
+  // encuentra al comparar con ===.
+  const packIds = [...new Set(orders.map((o) => String(o.pack_id || o.id)))];
   console.log(`[backfill] ${orders.length} órdenes, ${packIds.length} packs únicos a revisar`);
 
   const cache = await loadCache();
@@ -1517,6 +1523,43 @@ app.get('/api/cron/regenerate-pending-drafts', async (req, res) => {
   }
   res.json({ started: true }); // puede tardar varios minutos con muchos pendientes — se revisa en logs
   runRegeneratePendingDraftsInner().catch((err) => console.error('[regen-pendientes] Error general:', err));
+});
+
+// 2026-09-24, uso puntual: /orders/search devuelve pack_id/id como NÚMERO — antes
+// del fix en sendFirstContactForAgreedShipping/runHistoryBackfillInner (ver
+// comentario junto a esas funciones), cualquier pack descubierto por esa vía se
+// guardaba con record.packId como número en vez de texto. El resto de la app
+// siempre compara packId con === contra un valor de texto (viene de una URL vía
+// regex, o de un atributo data-* del HTML), así que esos packs se guardaban bien
+// pero el frontend nunca los encontraba al seleccionarlos (caso real: Gracia
+// Ugalde, 2026-09-24 — el mensaje automático se mandó bien, pero el chat se veía
+// como si no existiera). Este endpoint recorre TODO el caché una sola vez y
+// corrige el tipo donde haga falta; es seguro correrlo de más (si ya no hay nada
+// que corregir, no hace ninguna escritura).
+async function fixNumericPackIdsInner() {
+  const cache = await loadCache();
+  let fixed = 0;
+  for (const [packId, entry] of Object.entries(cache.packs)) {
+    if (entry?.record && typeof entry.record.packId !== 'string') {
+      entry.record.packId = String(entry.record.packId);
+      await savePackEntry(packId, entry);
+      fixed++;
+    }
+  }
+  return { fixed, totalPacks: Object.keys(cache.packs).length };
+}
+
+app.get('/api/cron/fix-numeric-pack-ids', async (req, res) => {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const result = await fixNumericPackIdsInner();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // 2026-09-22: uso puntual, una sola vez — sendAutomatedMessage() ya suma al
@@ -1937,7 +1980,12 @@ async function sendFirstContactForAgreedShipping() {
     .filter((p) => p.record?.status === 'pendiente' && p.record?.shippingStatusLabel === 'Acordar con el vendedor')
     .map((p) => p.record.packId);
   const packIds = [...new Set([
-    ...orders.filter((o) => !o.shipping?.id && o.status !== 'cancelled').map((o) => o.pack_id || o.id),
+    // String(...) a propósito: /orders/search devuelve pack_id/id como NÚMERO, pero
+    // en el resto de la app el packId siempre es texto (viene de una URL vía regex,
+    // o de un atributo data-* del HTML) — sin esto, el pack se guarda bien pero el
+    // frontend nunca lo encuentra al comparar con === (caso real: Gracia Ugalde,
+    // 2026-09-24, el mensaje se mandó bien pero el chat parecía no existir).
+    ...orders.filter((o) => !o.shipping?.id && o.status !== 'cancelled').map((o) => String(o.pack_id || o.id)),
     ...knownAgreedShippingPending,
   ])];
 
