@@ -1781,6 +1781,16 @@ async function markFacturaFirstContactHandled(packId, questionDate) {
 
 async function sendFacturaFirstContactForRecord(record) {
   if (process.env.AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED !== 'true') return;
+  // Caso real (2026-09-24, casos de Jose Manuel Trejo Medellin y Laura Marcela Ruiz
+  // Leos): en pedidos "Acordar con el vendedor" es muy común que el cliente pida su
+  // factura Y necesite coordinar el envío en el mismo mensaje o mensajes seguidos —
+  // el borrador de IA revisado por un humano ya combina bien los dos temas en una
+  // sola respuesta (ver REGLA GENERAL sobre MÁS DE UN TEMA PENDIENTE en el prompt de
+  // lib/agent.js), pero esta automatización solo manda la plantilla de factura sola,
+  // sin tocar el envío — mandarla aquí dejaría el tema de envío sin resolver y sin
+  // que nadie se entere. Por eso, en estos pedidos, nunca se manda automático: se
+  // deja pasar siempre a revisión humana.
+  if (record.shippingStatusLabel === 'Acordar con el vendedor') return;
   if (!CLIENT_FACTURA_MENTION_PATTERN.test(record.lastQuestion?.text || '')) return;
   // El vendedor ya pidió estos datos antes en este hilo (misma señal que usa el
   // recordatorio de refactura de abajo) — entonces esta ya no es la primera vez.
