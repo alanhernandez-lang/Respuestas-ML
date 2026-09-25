@@ -1812,6 +1812,30 @@ async function markReminded(categoria, packId, questionDate) {
   });
 }
 
+// A pedido explícito de Alan (2026-09-25): aunque la factura todavía no se haya
+// entregado, si el cliente YA dio un dato en algún momento (por texto o por una
+// foto/PDF), el agente nunca debe volver a pedírselo. extractStructuredData ya lee
+// los adjuntos (ver comentario en lib/agent.js), pero seguía siendo posible perder
+// un dato ya confirmado: si Gemini es inconsistente entre una corrida y otra, o si
+// la foto donde venía el dato queda fuera de la ventana de los últimos 4 adjuntos
+// que se le mandan (downloadThreadAttachments), una corrida futura podría concluir
+// erróneamente que ese dato "falta". Por eso esto guarda la UNIÓN de todo lo que
+// alguna vez se confirmó, para esa combinación categoría+pack — nunca se le resta
+// nada, así que un dato confirmado una vez queda confirmado para siempre.
+const CONFIRMED_FIELDS_KEY = 'app:automation:confirmed_fields';
+
+async function getConfirmedFields(categoria, packId) {
+  const stored = await redis.hget(CONFIRMED_FIELDS_KEY, `${categoria}:${packId}`);
+  return new Set(Array.isArray(stored) ? stored : []);
+}
+
+async function addConfirmedFields(categoria, packId, newFieldKeys) {
+  if (!newFieldKeys.length) return;
+  const current = await getConfirmedFields(categoria, packId);
+  newFieldKeys.forEach((key) => current.add(key));
+  await redis.hset(CONFIRMED_FIELDS_KEY, { [`${categoria}:${packId}`]: [...current] });
+}
+
 function buildRefacturaReminderText(missing) {
   const bullets = missing.map((key) => `• ${REFACTURA_FIELD_LABELS[key]}`).join('\n');
   return `Gracias por la información. Para poder emitir su factura aún nos falta que nos comparta:\n${bullets}\n\nEn cuanto recibamos los datos completos, procedemos con la emisión.`;
@@ -1895,12 +1919,20 @@ async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, 
   const questionDate = record.lastQuestion?.date || null;
   if (!questionDate || (await alreadyRemindedForQuestion(categoria, record.packId, questionDate))) return;
 
-  const { complete, missing } = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
+  const { data } = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
+  // No confiamos ciegamente en el resultado de ESTA corrida para decidir qué falta
+  // — se combina con todo lo que alguna vez se haya confirmado antes (ver comentario
+  // junto a CONFIRMED_FIELDS_KEY). Así, un dato ya confirmado nunca se le vuelve a
+  // pedir al cliente, ni siquiera si Gemini es inconsistente entre una corrida y
+  // otra o si el adjunto original ya salió de la ventana de los últimos 4 archivos.
+  await addConfirmedFields(categoria, record.packId, Object.keys(data));
+  const confirmed = await getConfirmedFields(categoria, record.packId);
+  const missing = Object.keys(fieldLabels).filter((key) => !confirmed.has(key));
   const totalFields = Object.keys(fieldLabels).length;
   // Ni completo (no hay nada que recordar) ni en cero (el cliente todavía no
   // contestó nada — insistir antes de que responda algo sería puro spam):
   // recordamos solo el caso de en medio, datos parciales.
-  if (complete || missing.length === 0 || missing.length >= totalFields) return;
+  if (missing.length === 0 || missing.length >= totalFields) return;
 
   try {
     await withLock(`lock:pack:${record.packId}`, 30000, () => sendAutomatedMessage(record.packId, buildText(missing), label));
@@ -1948,7 +1980,12 @@ async function sendFacturaFirstContactForRecord(record) {
   // que nadie se entere. Por eso, en estos pedidos, nunca se manda automático: se
   // deja pasar siempre a revisión humana.
   if (record.shippingStatusLabel === 'Acordar con el vendedor') return;
-  if (!CLIENT_FACTURA_MENTION_PATTERN.test(record.lastQuestion?.text || '')) return;
+  // clientMentionedFactura revisa TODOS los mensajes del cliente, no solo el más
+  // reciente — antes esto solo miraba record.lastQuestion, así que si el cliente
+  // mencionaba "factura" en un mensaje y agregaba algo más en uno seguido (antes de
+  // que nadie contestara), el prefiltro nunca lo detectaba y esta automatización
+  // ni siquiera evaluaba el caso.
+  if (!clientMentionedFactura(record.messages)) return;
   // A pedido explícito de Alan (2026-09-24): esta plantilla SOLO es para el mensaje
   // simple ("me pueden facturar", "necesito facturar"), nunca cuando el cliente ya
   // mandó algún dato (aunque sea uno) o adjuntó una foto/PDF — eso se deja siempre
@@ -1956,7 +1993,8 @@ async function sendFacturaFirstContactForRecord(record) {
   // a pedir datos que ya dio. Chequeo determinístico aparte del que hace Gemini más
   // abajo (detectsFirstFacturaRequest) porque un adjunto sin texto no siempre se lo
   // describe bien a la IA, y esto es más barato/confiable que depender solo de ella.
-  if (record.lastQuestion?.hasAttachment) return;
+  // Igual que arriba, se revisan TODOS los mensajes del cliente, no solo el último.
+  if (record.messages.some((m) => m.sender === 'cliente' && m.hasAttachment)) return;
   // El vendedor ya pidió estos datos antes en este hilo (misma señal que usa el
   // recordatorio de refactura de abajo) — entonces esta ya no es la primera vez.
   if (vendorAskedFor(record.messages, REFACTURA_ASK_PATTERNS)) return;
@@ -2170,17 +2208,37 @@ async function sendFirstContactForAgreedShipping() {
         },
         record,
       });
+      let facturaPartFailed = false;
       await withLock(`lock:pack:${packId}`, 30000, async () => {
         await sendAutomatedMessage(packId, ENVIO_ACORDADO_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — envío acordado)');
         // Caso real (2026-09-24): el cliente ya pidió factura en el mismo mensaje
         // donde apenas se está enterando del envío gratis, sin haber dado ningún
         // dato todavía — se manda también la plantilla de factura, en un segundo
         // mensaje aparte, en vez de dejarla pasar a revisión humana sin necesidad.
+        //
+        // OJO: si este segundo mensaje falla (el primero YA se mandó y no se puede
+        // deshacer), el próximo ciclo va a ver que el vendedor "ya contestó" y va a
+        // dar este pack por manejado para siempre — la factura se quedaría sin
+        // pedir y nadie se enteraría. Por eso se reintenta un par de veces antes de
+        // rendirse, en vez de un solo intento.
         if (category === 'envio_y_factura') {
-          await sendAutomatedMessage(packId, FACTURA_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — solicitud de factura)');
+          const maxAttempts = 3;
+          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+              await sendAutomatedMessage(packId, FACTURA_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — solicitud de factura)');
+              break;
+            } catch (err) {
+              if (attempt === maxAttempts) {
+                facturaPartFailed = true;
+                console.warn('[automation] se mandó el envío pero falló el de factura (reintentado) para el pack', packId, err.message);
+              } else {
+                await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+              }
+            }
+          }
         }
       });
-      if (category === 'envio_y_factura') sentAmbas++; else sentEnvio++;
+      if (category === 'envio_y_factura' && !facturaPartFailed) sentAmbas++; else sentEnvio++;
       await markFirstContactHandled(packId);
     } catch (err) {
       console.warn('[automation] no se pudo mandar el primer contacto (envío acordado) del pack', packId, err.message);
