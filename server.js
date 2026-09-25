@@ -1991,12 +1991,14 @@ async function sendFacturaFirstContact() {
 
 // Apagado por default a propósito: esto manda mensajes reales al cliente en
 // Mercado Libre SIN revisión humana (ver comentario de AUTOMATION_REMINDED_KEY
-// arriba). No hay forma de confirmar desde el código si Coolify ya desplegó un
-// commit dado, así que en vez de asumir que "recién subido" significa "todavía no
-// corre en producción", que el propio deploy quede inofensivo hasta que alguien
-// prenda AUTOMATION_REMINDERS_ENABLED=true a propósito en las variables de entorno.
+// arriba). A pedido de Alan (2026-09-25): las automatizaciones se agrupan por
+// tema en un solo interruptor en vez de una variable por cada una — como esta
+// función solo manda el recordatorio de REFACTURA (el de envío se quitó, ver
+// comentario más abajo), reutiliza la misma variable que ya prende el primer
+// contacto de factura (AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED) en vez de una
+// nueva (AUTOMATION_REMINDERS_ENABLED, que nunca llegó a usarse en producción).
 async function sendAutomationReminders() {
-  if (process.env.AUTOMATION_REMINDERS_ENABLED !== 'true') return;
+  if (process.env.AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED !== 'true') return;
   const cache = await loadCache();
   const candidates = Object.values(cache.packs)
     .map((p) => p.record)
