@@ -1765,6 +1765,24 @@ function vendorSentFacturaPdf(messages) {
     && (m.attachments || []).some((a) => a.kind === 'pdf'));
 }
 
+// Mismo criterio que REFACTURA_CLOSE_TEXT_PATTERNS, pero para envío acordado: una
+// vez que el vendedor confirma que el envío ya está en proceso o comparte el
+// número de guía (plantillas aprobadas "Después de compartir datos de envío" y
+// "Para pasar guía de envío"), ese pendiente ya quedó resuelto — no tiene caso
+// seguir recordándole datos de envío al cliente aunque escriba algo después. A
+// diferencia de la factura, aquí NO se exige un adjunto (la guía normalmente se
+// comparte como texto, no como PDF).
+const ENVIO_ACORDADO_CLOSE_TEXT_PATTERNS = [
+  /ya est[aá] en proceso de asignaci[oó]n/i,
+  /te comparto tu n[uú]mero de gu[ií]a/i,
+  /n[uú]mero de gu[ií]a/i,
+];
+
+function vendorConfirmedEnvioAcordado(messages) {
+  return (messages || []).some((m) => m.sender === 'vendedor'
+    && ENVIO_ACORDADO_CLOSE_TEXT_PATTERNS.some((p) => p.test(m.text || '')));
+}
+
 // A pedido de Alan (2026-09-24, caso real: cliente "Xa Za" mandó su factura completa
 // en su primer mensaje y la conversación no aparecía en el filtro de refacturas
 // porque isRefacturaCandidate solo miraba si el VENDEDOR ya había pedido los datos
@@ -1841,6 +1859,16 @@ function buildRefacturaReminderText(missing) {
   return `Gracias por la información. Para poder emitir su factura aún nos falta que nos comparta:\n${bullets}\n\nEn cuanto recibamos los datos completos, procedemos con la emisión.`;
 }
 
+// A pedido de Alan (2026-09-25): mismo tratamiento que el recordatorio de
+// refactura, pero para envío acordado — lista dinámicamente solo los datos de
+// envío que de verdad faltan (nombre, dirección completa, referencias de
+// domicilio, teléfono), en vez de la plantilla fija genérica que se usaba antes
+// (que ya no distinguía cuáles datos puntuales seguían pendientes).
+function buildEnvioAcordadoReminderText(missing) {
+  const bullets = missing.map((key) => `• ${ENVIO_ACORDADO_FIELD_LABELS[key]}`).join('\n');
+  return `Gracias por la información. Para poder activar tu envío gratis aún nos falta que nos compartas:\n${bullets}\n\nEn cuanto los recibamos, coordinamos tu entrega.`;
+}
+
 // Copia literal de la plantilla aprobada "Solicitar datos de factura" (ver
 // RESPONSE_TEMPLATES en lib/agent.js) — mismo criterio que ENVIO_ACORDADO_FIRST_CONTACT_TEXT
 // de abajo: se reutiliza tal cual en vez de referenciarla dinámicamente.
@@ -1906,6 +1934,10 @@ async function sendAutomatedMessage(packId, text, label) {
 }
 
 async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, extractFn, buildText, label, token }) {
+  // A pedido de Alan (2026-09-25): el recordatorio de envío solo aplica a pedidos
+  // "Acordar con el vendedor" — en el resto de los tipos de envío no hace falta
+  // coordinar nada directo con el cliente.
+  if (categoria === 'envio_acordado' && record.shippingStatusLabel !== 'Acordar con el vendedor') return;
   if (!vendorAskedFor(record.messages, askPatterns)) return;
   // La factura ya se entregó (PDF real adjunto, no solo el aviso de "procedemos
   // con la facturación") — no tiene caso seguir pidiendo datos que ya no importan,
@@ -1915,6 +1947,9 @@ async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, 
   // mandado el 21 sep, y el recordatorio se disparó de nuevo el 25 sep solo porque
   // el cliente escribió "gracias, excelente noche".
   if (categoria === 'refactura' && vendorSentFacturaPdf(record.messages)) return;
+  // Mismo criterio para envío: si el vendedor ya confirmó que el envío está en
+  // proceso o ya compartió la guía, ese pendiente quedó resuelto.
+  if (categoria === 'envio_acordado' && vendorConfirmedEnvioAcordado(record.messages)) return;
   if (await isAlreadyPlanned(categoria, record.packId)) return; // ya completo y planificado — nada que recordar
   const questionDate = record.lastQuestion?.date || null;
   if (!questionDate || (await alreadyRemindedForQuestion(categoria, record.packId, questionDate))) return;
@@ -2038,36 +2073,55 @@ async function sendFacturaFirstContact() {
 // Apagado por default a propósito: esto manda mensajes reales al cliente en
 // Mercado Libre SIN revisión humana (ver comentario de AUTOMATION_REMINDED_KEY
 // arriba). A pedido de Alan (2026-09-25): las automatizaciones se agrupan por
-// tema en un solo interruptor en vez de una variable por cada una — como esta
-// función solo manda el recordatorio de REFACTURA (el de envío se quitó, ver
-// comentario más abajo), reutiliza la misma variable que ya prende el primer
-// contacto de factura (AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED) en vez de una
-// nueva (AUTOMATION_REMINDERS_ENABLED, que nunca llegó a usarse en producción).
+// tema en un solo interruptor por grupo, no una variable nueva por cada una —
+// el recordatorio de refactura reutiliza AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED
+// (el mismo que ya prende el primer contacto de factura) y el de envío acordado
+// reutiliza AUTOMATION_FIRST_CONTACT_ENABLED (el mismo que ya prende el primer
+// contacto de envío) — nunca se llegó a usar AUTOMATION_REMINDERS_ENABLED en
+// producción, así que no hace falta agregarla.
 async function sendAutomationReminders() {
-  if (process.env.AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED !== 'true') return;
+  // Cada categoría depende del interruptor de SU grupo (factura vs. envío), no de
+  // uno solo compartido — misma agrupación por tema que ya se usa para el resto de
+  // las automatizaciones (a pedido de Alan, 2026-09-25).
+  const facturaEnabled = process.env.AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED === 'true';
+  const envioEnabled = process.env.AUTOMATION_FIRST_CONTACT_ENABLED === 'true';
+  if (!facturaEnabled && !envioEnabled) return;
+
   const { access_token: token } = await getAccessToken();
   const cache = await loadCache();
   const candidates = Object.values(cache.packs)
     .map((p) => p.record)
     .filter((r) => r && r.status === 'pendiente');
 
-  // OJO: a pedido explícito de Alan (2026-09-21), "envío acordado" ya NO manda un
-  // recordatorio automático si el cliente contesta incompleto — en pedidos "Acordar
-  // con el vendedor" lo único que se manda sin revisión humana es el primer contacto
-  // (ver sendFirstContactForAgreedShipping). Cualquier respuesta del cliente después
-  // de eso (completa, incompleta, o cualquier otra cosa) pasa por el borrador de IA
-  // normal en la pestaña "Borradores IA", igual que el resto de casos. Solo queda el
-  // recordatorio automático de "refactura" (sin relación con envíos).
   await mapWithConcurrency(candidates, 3, async (record) => {
-    await remindOneCategory(record, {
-      categoria: 'refactura',
-      askPatterns: REFACTURA_ASK_PATTERNS,
-      fieldLabels: REFACTURA_FIELD_LABELS,
-      extractFn: extractRefacturaData,
-      buildText: buildRefacturaReminderText,
-      label: 'Automatización (datos de refactura faltantes)',
-      token,
-    });
+    if (facturaEnabled) {
+      await remindOneCategory(record, {
+        categoria: 'refactura',
+        askPatterns: REFACTURA_ASK_PATTERNS,
+        fieldLabels: REFACTURA_FIELD_LABELS,
+        extractFn: extractRefacturaData,
+        buildText: buildRefacturaReminderText,
+        label: 'Automatización (datos de refactura faltantes)',
+        token,
+      });
+    }
+    if (envioEnabled) {
+      // A pedido de Alan (2026-09-25): mismo tratamiento que refactura, pero para
+      // los datos de envío en pedidos "Acordar con el vendedor" — antes (2026-09-21)
+      // se había quitado este recordatorio a propósito porque solo mandaba una
+      // plantilla fija sin distinguir qué faltaba; ahora que remindOneCategory ya
+      // lista dinámicamente los datos puntuales que siguen pendientes (igual que
+      // refactura), se reactiva con ese mismo criterio, más robusto.
+      await remindOneCategory(record, {
+        categoria: 'envio_acordado',
+        askPatterns: ENVIO_ACORDADO_ASK_PATTERNS,
+        fieldLabels: ENVIO_ACORDADO_FIELD_LABELS,
+        extractFn: extractEnvioAcordadoData,
+        buildText: buildEnvioAcordadoReminderText,
+        label: 'Automatización (datos de envío faltantes)',
+        token,
+      });
+    }
   });
 }
 
