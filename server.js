@@ -2097,14 +2097,14 @@ async function sendFirstContactForAgreedShipping() {
         await markFirstContactHandled(packId);
         return;
       }
-      // El label se muestra optimista desde el minuto uno (ver resolveShippingInfo)
-      // — pero mientras no esté "asentado" (shippingSettled: false, dentro del
-      // margen de gracia) todavía no hay certeza de que este pedido no vaya a
-      // recibir un envío real de un momento a otro. NO marques como manejado: hay
-      // que reintentarlo en un ciclo futuro (caso real: Gracia Ugalde, terminó
-      // siendo FULL a pesar de mostrarse como "Acordar con el vendedor" al
-      // principio — mandarle el mensaje automático ahí habría sido un error).
-      if (!record.shippingSettled) return;
+      // A pedido explícito de Alan (2026-09-24): el mensaje automático debe salir
+      // apenas se detecta la venta o apenas escribe el cliente, sin esperar a que
+      // shippingSettled confirme el tipo de envío (eso sí puede tardar hasta 1
+      // hora — ver resolveShippingInfo). Se acepta el riesgo raro de que un pedido
+      // muestre "Acordar con el vendedor" al principio y termine siendo un envío
+      // real de ML (caso real: Gracia Ugalde, ~3 de 501 casos históricos) a cambio
+      // de no retrasar el caso normal. Si eso pasa, /api/cron/recheck-agreed-
+      // shipping-labels sigue disponible para corregirlo después.
       // El vendedor ya le contestó algo a este pack (a mano, o por otra vía) — el
       // flujo normal ya se encarga, mandar esto encima sería un mensaje duplicado.
       if (record.messages.some((m) => m.sender === 'vendedor')) {
