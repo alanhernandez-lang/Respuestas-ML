@@ -1,7 +1,6 @@
 require('dotenv').config();
 const path = require('path');
 const express = require('express');
-const compression = require('compression');
 const cookieParser = require('cookie-parser');
 const {
   getAccessToken,
@@ -9,6 +8,7 @@ const {
   fetchPackMessages,
   fetchPackDetail,
   fetchOrderDetail,
+  fetchAllSellerOrders,
   fetchShipmentDetail,
   fetchItemDetail,
   fetchClaimDetail,
@@ -20,9 +20,32 @@ const {
   markPackMessagesRead,
   mapWithConcurrency,
 } = require('./lib/ml');
-const { generateDraftAnswer } = require('./lib/agent');
+const {
+  generateDraftAnswer,
+  extractRefacturaData,
+  extractEnvioAcordadoData,
+  detectsFirstFacturaRequest,
+  classifyAgreedShippingFirstContact,
+  REFACTURA_FIELD_LABELS,
+  ENVIO_ACORDADO_FIELD_LABELS,
+} = require('./lib/agent');
 const { redis, withLock } = require('./lib/redis');
+const { legacyUpstashClient } = require('./lib/legacyUpstash');
 const { SESSION_COOKIE, verifyCredentials, createSessionToken, verifySessionToken } = require('./lib/auth');
+
+// 2026-08-29: reintroducido tras un ciclo real de caídas en producción — Upstash
+// alcanzó su límite de solicitudes ("max requests limit exceeded") y cada llamada a
+// Redis sin try/catch alrededor (login, sync, etc.) tronaba como promesa/excepción
+// sin capturar, matando el proceso entero una y otra vez apenas Coolify lo volvía a
+// levantar. Esto no arregla que Redis siga rechazando comandos (eso requiere subir
+// el límite/plan de Upstash o esperar a que se reinicie), pero al menos deja el
+// proceso vivo y respondiendo, en vez de reiniciarse sin parar.
+process.on('unhandledRejection', (reason) => {
+  console.error('[fatal] Promesa rechazada sin capturar:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[fatal] Excepción sin capturar (proceso sigue vivo):', err);
+});
 
 const CLAIM_ROLE_LABELS = { mediator: 'Mediador (ML)', respondent: 'Vendedor (tú)', complainant: 'Cliente' };
 
@@ -57,10 +80,38 @@ const TERMINAL_SHIPPING_STATUSES = new Set(['delivered', 'cancelled', 'not_deliv
 // Libre), `order.shipping` no trae `id` — ahí ni siquiera existe un envío que
 // consultar, así que se reporta directo como "Acordar con el vendedor" en vez de
 // gastar una llamada a /shipments que fallaría de todos modos.
+// Mercado Libre a veces tarda un rato en asignar el envío real (FULL u otro) a una
+// orden recién creada — si se consulta MUY temprano (la automatización de primer
+// contacto de envío acordado lo hace, a veces minutos después de la venta, vía
+// /orders/search), se puede encontrar `shipping.id` ausente todavía aunque el
+// pedido SÍ vaya a tener un envío gestionado por ML poco después. Antes de esta
+// automatización, la app solo revisaba un pedido hasta que el cliente ya había
+// escrito algo (horas o días después), tiempo de sobra para que ML ya hubiera
+// asignado el envío — así que la ausencia de shipping.id, tratada como señal
+// PERMANENTE ("Acordar con el vendedor" para siempre), nunca había dado un falso
+// positivo. Caso real: pedido de Gracia Ugalde (2026-09-24) — Mercado Libre lo
+// muestra como FULL con guía real, pero la app lo etiquetó "Acordar con el
+// vendedor" porque lo revisó apenas creado.
+//
+// OJO (2026-09-24, mismo día — primer intento de este fix escondía el tag por
+// completo durante el margen, y eso rompió el caso normal: pedido de Jose Gasca,
+// que Mercado Libre SÍ marca como "Acuerdas la entrega" desde el minuto uno, se
+// quedó sin ningún tag ni la nota de envío gratis en el prompt de la IA, porque su
+// pedido tenía menos de 1 hora — la inmensa mayoría de "Acordar con el vendedor"
+// son así de genuinos desde el principio; los casos como Gracia Ugalde son la
+// excepción, no la regla). Por eso el label SIEMPRE se muestra de inmediato — lo
+// único que espera el margen es `shippingSettled`, que es lo que de verdad
+// necesita certeza (evita que sendFirstContactForAgreedShipping mande el mensaje
+// automático antes de estar seguro — ver el chequeo explícito ahí). Si en el
+// margen aparece un envío real, se corrige solo en el siguiente ciclo de sync.
+const SHIPPING_ASSIGNMENT_GRACE_MS = 60 * 60 * 1000; // 1 hora
+
 async function resolveShippingInfo(token, order) {
   const shippingId = order.shipping?.id;
   if (!shippingId) {
-    return { isFull: false, shippingStatus: null, shippingStatusLabel: 'Acordar con el vendedor', shippingSettled: true };
+    const createdAt = order.date_created ? new Date(order.date_created).getTime() : NaN;
+    const stillWaitingForAssignment = Number.isFinite(createdAt) && (Date.now() - createdAt) < SHIPPING_ASSIGNMENT_GRACE_MS;
+    return { isFull: false, shippingStatus: null, shippingStatusLabel: 'Acordar con el vendedor', shippingSettled: !stillWaitingForAssignment };
   }
   try {
     const shipment = await fetchShipmentDetail(token, shippingId);
@@ -194,6 +245,70 @@ async function appendAnswerLog(entry) {
 async function loadAnswerLog() {
   const raw = await redis.lrange(ANSWER_LOG_KEY, 0, ANSWER_LOG_MAX - 1);
   return (raw || []).map(parseMaybeJson).filter(Boolean);
+}
+
+// Conteo acumulado de respuestas por persona/día — separado de ANSWER_LOG_KEY a
+// propósito. Ese log se recorta a las últimas ANSWER_LOG_MAX (1000) para no crecer
+// sin límite (piensa en el banco de respuestas, que solo necesita texto reciente),
+// pero con el volumen actual del equipo esas 1000 entradas se llenan en menos de
+// un día entre todas las personas — así que la gráfica de "respuestas por persona"
+// y el contador junto a cada nombre en la Bitácora, que SÍ dependían de ese mismo
+// log recortado, se quedaban "atorados": cada respuesta nueva de la persona más
+// activa tira una entrada vieja SUYA para hacerle lugar, y el total no se mueve
+// aunque siga contestando (caso real: Getzemany, 2026-09-01, "desde ayer tengo
+// 804 y hoy ya conteste y no cambia nada"). Este hash nunca se recorta: una
+// respuesta más solo hace HINCRBY, así que el contador siempre sube y el
+// histórico completo por día queda disponible para "todo el historial".
+const ANSWER_COUNTS_KEY = 'app:answercounts';
+
+// Mismo criterio de "día" para todo mundo sin importar en qué huso horario corra
+// el servidor: México ya no tiene horario de verano (desde 2022), así que
+// America/Mexico_City es un offset fijo (UTC-6) — coincide con el día que ve en
+// pantalla el equipo, que trabaja desde ahí. formato en-CA da directo YYYY-MM-DD.
+const MEXICO_DAY_FORMATTER = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'America/Mexico_City',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+function mexicoDayKey(dateIso) {
+  return MEXICO_DAY_FORMATTER.format(new Date(dateIso));
+}
+
+async function bumpAnswerCount(email, dateIso) {
+  if (!email) return; // el backfill histórico no sabe quién respondió — no hay nada que sumar
+  await redis.hincrby(ANSWER_COUNTS_KEY, `${mexicoDayKey(dateIso)}|${email}`, 1);
+}
+
+async function loadAnswerCounts() {
+  return (await redis.hgetall(ANSWER_COUNTS_KEY)) || {};
+}
+
+// Arranque en caliente, una sola vez: si ANSWER_COUNTS_KEY todavía no existe
+// (primera vez que corre este código, o el hash se perdió en algún incidente de
+// Redis como el de agosto), lo reconstruye a partir de lo que SÍ hay en
+// app:answerlog. Eso solo cubre las últimas ANSWER_LOG_MAX respuestas —no es un
+// historial completo—, pero evita que el contador arranque en 0 justo cuando
+// alguien esté viendo la gráfica. Una vez poblado (por esto o por una respuesta
+// real vía bumpAnswerCount), no se vuelve a tocar: el chequeo "¿ya tiene algo?"
+// hace que llamarlo de nuevo en cada arranque sea inofensivo.
+async function seedAnswerCountsIfEmpty() {
+  try {
+    await withLock('lock:answercounts:seed', 60000, async () => {
+      const existing = await redis.hgetall(ANSWER_COUNTS_KEY);
+      if (existing && Object.keys(existing).length > 0) return;
+      const entries = await loadAnswerLog();
+      let seeded = 0;
+      for (const e of entries) {
+        if (!e.answeredBy || !e.date) continue;
+        await redis.hincrby(ANSWER_COUNTS_KEY, `${mexicoDayKey(e.date)}|${e.answeredBy}`, 1);
+        seeded++;
+      }
+      console.log(`[answercounts] sembrado inicial: ${seeded} respuestas recuperadas de app:answerlog`);
+    });
+  } catch (err) {
+    if (err.status !== 409) console.error('[answercounts] error sembrando contador inicial:', err.message);
+  }
 }
 
 // Agrupa el historial de respuestas por texto EXACTO (recortando espacios): así el
@@ -361,11 +476,47 @@ async function syncPackById(token, packId, cache, unreadCount) {
   const mediation = isBlocked
     ? await resolveMediation(token, messagesResp.conversation_status?.claim_ids)
     : null;
-  const status = isBlocked
+  // 2026-08-31: "blocked" sin claim_id resultó NO ser confiable como señal de
+  // mediación genuina — se probó primero un margen de antigüedad (asumiendo que solo
+  // lo viejo-sin-reclamo era una ventana cerrada por tiempo), pero en producción esto
+  // seguía marcando cientos de conversaciones recientes-pero-sin-reclamo como
+  // mediación (378 de 722, verificado en vivo). Confirmado con /post-purchase/v1/claims
+  // directo: sin claimId, casi nunca hay un reclamo real detrás, sin importar la
+  // antigüedad.
+  //
+  // Ni siquiera tener claimId bastó: comparado contra el panel real de Mercado
+  // Libre (43 reclamos y mediaciones activos), la app mostraba 344 — 314 de esos
+  // 344 ya tenían mediation.status "closed" (reclamo YA resuelto, la conversación
+  // seguía marcada "blocked" por el lado de ML aunque el reclamo en sí ya cerró).
+  // Se exige además que el reclamo siga "opened" — no basta con que exista.
+  const isGenuineMediation = isBlocked && Boolean(mediation?.claimId) && mediation?.status === 'opened';
+  // Antes de las automatizaciones de "primer contacto" (envío acordado, 2026-09-21),
+  // toda conversación arrancaba siempre con un mensaje del CLIENTE — así que
+  // lastQuestion nunca era null una vez que había algo de actividad, y exigir
+  // lastAnswer && lastQuestion nunca era un problema. Ahora el VENDEDOR puede ser
+  // quien escribe primero (el cliente todavía no ha contestado nada), y en ese caso
+  // lastQuestion sigue siendo null para siempre — la condición de abajo nunca se
+  // cumplía y la conversación se quedaba en "pendiente" aunque ya no hubiera nada
+  // que el equipo tuviera que hacer (caso real: Jose Carlos Topete Gonzalez,
+  // 2026-09-24, solo tenía el mensaje automático del vendedor y ningún mensaje del
+  // cliente, y aun así aparecía como pendiente). Si ya hay una respuesta nuestra y
+  // el cliente nunca ha preguntado nada, no hay nada pendiente de nuestro lado —
+  // cuenta como "respondido" (estamos esperando al cliente, no al revés).
+  const naturalStatus = isGenuineMediation
     ? 'mediacion'
-    : (lastAnswer && lastQuestion && new Date(lastAnswer.date) > new Date(lastQuestion.date)
-      ? 'respondido'
-      : 'pendiente');
+    : (!lastAnswer
+      ? 'pendiente'
+      : (!lastQuestion || new Date(lastAnswer.date) > new Date(lastQuestion.date) ? 'respondido' : 'pendiente'));
+  // 2026-08-31: si ML bloqueó la conversación pero todavía no calificó como
+  // mediación genuina arriba (sin claimId confirmado, típicamente un reclamo
+  // recién abierto cuyo ID aún no propaga), tampoco debe verse como "pendiente"
+  // normal — publicar una respuesta por el chat no sirve de nada mientras siga
+  // bloqueada, y confunde al equipo mostrando un botón "Publicar" que va a fallar.
+  // Caso real: pedido de Laura Iveth Herrera Parra, bloqueado sin número de caso
+  // todavía, se veía como "pendiente" con un borrador listo para publicar.
+  const status = (naturalStatus === 'pendiente' && isBlocked && !isGenuineMediation)
+    ? 'respondido'
+    : naturalStatus;
 
   // Mientras la conversación está bloqueada por mediación ya bajamos el detalle
   // completo del reclamo (vía resolveMediation) — lo guardamos aparte para que, en
@@ -377,7 +528,7 @@ async function syncPackById(token, packId, cache, unreadCount) {
 
   let pastMediation = previousRecord?.pastMediation || null;
   let pastMediationChecked = Boolean(previousRecord?.pastMediationChecked);
-  if (isBlocked) {
+  if (isGenuineMediation) {
     // Está mediando otra vez ahora mismo: en cuanto se resuelva hay que volver a
     // revisar (una sola vez, gratis, desde lastActiveMediation de abajo) — si no
     // reseteáramos esto, una venta que ya se había revisado sin reclamo previo se
@@ -412,6 +563,24 @@ async function syncPackById(token, packId, cache, unreadCount) {
     shippingStatus: info.shippingStatus,
     shippingStatusLabel: info.shippingStatusLabel,
     shippingSettled: info.shippingSettled,
+    // Para el filtro de "Refacturas" del sidebar (ver categoryCountsHtml en app.js).
+    // El de "Envíos acordados" no necesita un campo aparte: reutiliza
+    // shippingStatusLabel === 'Acordar con el vendedor', que ya viene de la API de
+    // envíos de ML (dato exacto), a diferencia de esto que solo es una detección por
+    // texto (ver REFACTURA_ASK_PATTERNS/clientMentionedFactura/vendorSentFacturaPdf,
+    // definidos más abajo en este archivo pero disponibles aquí igual — son
+    // const/función de módulo, ya están asignados para cuando esta función se llama
+    // de verdad). Cuenta como candidata si el VENDEDOR ya pidió los datos fiscales
+    // O si el CLIENTE mencionó factura/CFDI en cualquiera de sus mensajes — antes
+    // solo miraba lo primero, así que un cliente que pide/manda su factura antes de
+    // que nadie del equipo le conteste (caso real: "Xa Za", 2026-09-24, mandó toda
+    // su factura en su primer mensaje) no aparecía en el filtro aunque claramente
+    // necesitaba atención de refactura. En ambos casos se exige además que el
+    // vendedor NO le haya entregado ya el PDF de la factura — así una conversación
+    // ya cerrada no reaparece en el filtro solo porque el cliente volvió a escribir
+    // por otro tema.
+    isRefacturaCandidate: (vendorAskedFor(messages, REFACTURA_ASK_PATTERNS) || clientMentionedFactura(messages))
+      && !vendorSentFacturaPdf(messages),
     unreadCount,
     status: finalStatus,
     lastQuestion,
@@ -499,6 +668,61 @@ async function checkPastMediation(token, record) {
   }
 }
 
+// 2026-08-31: checkPastMediation (arriba) solo corre UNA vez en la vida de cada
+// pack — sirve para rellenar el historial, no para vigilar reclamos nuevos. Hueco
+// real encontrado: una vez que un pack llega a "respondido", el sync normal deja de
+// tocarlo (solo se re-revisa si el cliente escribe un mensaje nuevo); si el cliente
+// abre un reclamo/mediación DIRECTO en Mercado Libre sin escribir nada en el chat,
+// la app nunca se entera. Confirmado en vivo: el panel real de ML mostraba 44
+// reclamos y mediaciones activos, la app solo 24 — los que faltaban eran justo
+// estos, reclamos abiertos sobre packs ya "respondido" que nunca se volvieron a
+// revisar. Esta función sí se repite periódicamente (ver lastMediationWatchAt).
+async function checkNewMediation(token, record) {
+  if (!record.orderId) {
+    record.lastMediationWatchAt = new Date().toISOString();
+    return;
+  }
+  try {
+    const resp = await fetchClaimsByOrder(token, record.orderId);
+    const claims = Array.isArray(resp) ? resp : (resp?.results || resp?.data || []);
+    const [mostRecent] = claims
+      .slice()
+      .sort((a, b) => new Date(b.last_updated || b.date_created || 0) - new Date(a.last_updated || a.date_created || 0));
+    if (mostRecent && mostRecent.status === 'opened') {
+      // Mismo criterio que en syncPackById: solo cuenta como mediación real si el
+      // detalle completo confirma que sigue abierto — el resumen del buscador a
+      // veces no coincide con /claims/{id}.
+      try {
+        const detail = await fetchClaimDetail(token, mostRecent.id);
+        if (detail.status === 'opened') {
+          record.mediation = {
+            claimId: mostRecent.id,
+            type: detail.type || mostRecent.type || null,
+            status: detail.status,
+            stage: detail.stage || mostRecent.stage || null,
+            resolution: detail.resolution || null,
+          };
+          record.lastActiveMediation = { ...record.mediation };
+          record.status = 'mediacion';
+        }
+      } catch (err) {
+        console.warn('No se pudo confirmar el detalle del reclamo nuevo del pack', record.packId, err.message);
+      }
+    }
+  } catch (err) {
+    console.warn('No se pudo revisar reclamo nuevo del pack', record.packId, err.message);
+  }
+  record.lastMediationWatchAt = new Date().toISOString();
+}
+
+// Cuántos packs "respondido" se revisan por ciclo buscando un reclamo nuevo (ver
+// checkNewMediation) — a diferencia de PAST_MEDIATION_CHECK_BATCH (un backlog que se
+// agota una sola vez), este lote se repite para siempre: cualquier venta ya
+// respondida puede escalar a un reclamo en cualquier momento. Con ~1000+
+// "respondido" y 50 por ciclo (cada 2 min), toda la cartera queda revisada cada
+// ~40 minutos.
+const MEDIATION_WATCH_BATCH = 50;
+
 // Cuántas conversaciones "viejas" (ya no reportadas como no leídas por ML) se
 // revisan de nuevo en cada ciclo — ver comentario en runSyncInner().
 const STALE_REFRESH_BATCH = 80;
@@ -521,8 +745,10 @@ const MESSAGES_BACKFILL_BATCH = 80;
 // sincronizar), se sube este número — eso hace que TODAS pasen una vez más por el
 // backfill de abajo, sin importar que ya hubieran pasado por una versión anterior.
 // V1: la paginación de mensajes que se perdía en silencio. V2: los PDFs adjuntos
-// que se descartaban por completo antes de guardarse.
-const MESSAGES_BACKFILL_VERSION = 2;
+// que se descartaban por completo antes de guardarse. V3: isRefacturaCandidate
+// (filtro de categoría del sidebar) — sin este bump, todo lo ya cacheado como
+// "respondido" se quedaría sin ese campo hasta que alguien vuelva a escribir.
+const MESSAGES_BACKFILL_VERSION = 3;
 
 // El borrador de IA sigue siendo válido mientras nadie haya hecho una pregunta
 // nueva desde que se generó, así que solo se regenera cuando cambia lastQuestion.
@@ -568,6 +794,8 @@ async function attachDrafts(packs, token, touched) {
         orderCreationDate: record.orderCreationDate,
         token,
         frequentResponses,
+        isFull: record.isFull,
+        shippingStatusLabel: record.shippingStatusLabel,
       });
       record.draftAnswer = { text, generatedAt: new Date().toISOString(), forQuestionDate: questionDate, imagesExcluded, flags };
       if (flags && flags.length) {
@@ -678,6 +906,31 @@ async function runSyncInner() {
     await savePackEntry(packId, fresh);
   });
 
+  // Ver comentario junto a checkNewMediation/MEDIATION_WATCH_BATCH arriba: a
+  // diferencia del lote de arriba (una sola vez en la vida del pack), este se repite
+  // para siempre — ordenado por el que lleva más tiempo sin revisarse, para que con
+  // el tiempo toda la cartera de "respondido" quede cubierta por igual.
+  const mediationWatchCandidates = Object.values(packs)
+    .filter((p) => p.record.status === 'respondido')
+    .sort((a, b) => new Date(a.record.lastMediationWatchAt || 0) - new Date(b.record.lastMediationWatchAt || 0))
+    .slice(0, MEDIATION_WATCH_BATCH);
+  await mapWithConcurrency(mediationWatchCandidates, 3, async (entry) => {
+    const packId = entry.record.packId;
+    await checkNewMediation(token, entry.record);
+    const fresh = await loadPackEntry(packId);
+    if (!fresh) return;
+    // Si mientras tanto alguien le contestó de nuevo (o dejó de estar "respondido"
+    // por cualquier otra razón), no le pisamos ese cambio más reciente con esto.
+    if (fresh.record.status !== 'respondido') return;
+    Object.assign(fresh.record, {
+      mediation: entry.record.mediation,
+      lastActiveMediation: entry.record.lastActiveMediation,
+      status: entry.record.status,
+      lastMediationWatchAt: entry.record.lastMediationWatchAt,
+    });
+    await savePackEntry(packId, fresh);
+  });
+
   // Las conversaciones "respondido" en caché nunca se vuelven a sincronizar solas
   // (el resto del sync las excluye a propósito) — pero a veces una corrección de
   // fondo (paginación de mensajes, adjuntos que se descartaban, etc.) necesita
@@ -708,19 +961,6 @@ async function runSyncInner() {
     }
   });
 
-  // Se guarda lo ya traído de Mercado Libre ANTES de meterse a generar borradores de
-  // IA: attachDrafts puede tardar mucho (o colgarse por completo) si Gemini está
-  // lento/caído/con una conexión mala de por medio — sin este guardado adelantado,
-  // un ciclo entero de mensajes nuevos se quedaba sin persistir mientras tanto (se
-  // vio en vivo corriendo la app en local con internet lento: la sincronización
-  // parecía "atorada" y nunca avanzaba, aunque los mensajes sí se habían traído).
-  if (touched.size) {
-    const toWrite = {};
-    touched.forEach((id) => { toWrite[id] = packs[id]; });
-    await savePacksBulk(toWrite);
-    await saveMeta({ syncedAt: new Date().toISOString() });
-  }
-
   await attachDrafts(packs, token, touched);
 
   if (touched.size) {
@@ -730,6 +970,20 @@ async function runSyncInner() {
   }
   const syncedAt = new Date().toISOString();
   await saveMeta({ syncedAt });
+
+  // Corre DESPUÉS de que todo lo de arriba ya se guardó (savePacksBulk) — lee su
+  // propia copia fresca de Redis en vez de reusar `packs`/`touched` de este ciclo,
+  // para no arriesgarse a que el guardado en bloque de arriba pise con datos viejos
+  // lo que esto vaya escribiendo (envía mensajes de verdad, no puede permitirse esa
+  // condición de carrera). Ver comentario junto a su definición.
+  await sendAutomationReminders().catch((err) => console.error('[automation] error inesperado mandando recordatorios:', err.message));
+  // Misma razón que el de arriba: descubre y guarda packs nuevos por su cuenta
+  // (ventas sin ningún mensaje todavía), así que corre aparte del resto del ciclo.
+  await sendFirstContactForAgreedShipping().catch((err) => console.error('[automation] error inesperado mandando primer contacto:', err.message));
+  // Independiente de sendAutomationReminders() a propósito (ver comentario junto a
+  // su definición) — se apaga con su propia variable de entorno.
+  await sendFacturaFirstContact().catch((err) => console.error('[automation] error inesperado mandando primer contacto de factura:', err.message));
+
   return { syncedAt, totalPacks: Object.keys(packs).length, errors };
 }
 
@@ -764,6 +1018,8 @@ async function regenerateDraftInner(packId) {
     token,
     frequentResponses,
     previousDraftText: previousText,
+    isFull: record.isFull,
+    shippingStatusLabel: record.shippingStatusLabel,
   });
   if (flags && flags.length) {
     console.warn(`Borrador IA del pack ${packId} marcado para revisar (${flags.join(', ')})`);
@@ -840,35 +1096,7 @@ async function publishAnswerInner(packId, answeredBy, attachments) {
   // para referenciarse aquí. Si viene vacío, se manda el mensaje sin adjuntos igual
   // que siempre.
   const attachmentFilenames = (attachments || []).map((a) => a.filename).filter(Boolean);
-  try {
-    await sendPackMessage(token, packId, SELLER_ID, record.buyerId, text, attachmentFilenames);
-  } catch (err) {
-    // Un 403 aquí casi siempre significa que Mercado Libre bloqueó la conversación
-    // justo AHORA (típicamente porque entró a mediación) — nuestro caché puede seguir
-    // mostrándola como "pendiente" hasta el próximo sync automático (hasta 2 min),
-    // dejando a la persona con un borrador que ya no se puede enviar y un error crudo
-    // sin explicación. Se refresca este pack puntual de inmediato para que la UI
-    // refleje el estado real sin esperar, y se cambia el mensaje de error por uno
-    // que sí explica qué pasó.
-    if (err.message.includes('ML API 403')) {
-      try {
-        const refreshed = await syncPackById(token, packId, { packs: { [packId]: entry } }, record.unreadCount || 0);
-        const fresh = await loadPackEntry(packId);
-        if (fresh) {
-          fresh.record = refreshed;
-          await savePackEntry(packId, fresh);
-        }
-      } catch (syncErr) {
-        console.warn('No se pudo refrescar el pack tras un 403 al publicar', packId, syncErr.message);
-      }
-      const blockedErr = new Error(
-        'Mercado Libre no permitió enviar el mensaje (403) — lo más probable es que esta conversación acabe de entrar a mediación o algún otro estado que ya no admite respuestas normales. Ya se actualizó el estado de esta conversación; revisa cómo se ve ahora.',
-      );
-      blockedErr.status = 409;
-      throw blockedErr;
-    }
-    throw err;
-  }
+  await sendPackMessage(token, packId, SELLER_ID, record.buyerId, text, attachmentFilenames);
 
   // Marcamos la conversación como leída en Mercado Libre: por defecto nuestra app
   // sincroniza con mark_as_read=false (para no marcar nada leído solo por consultar),
@@ -910,6 +1138,7 @@ async function publishAnswerInner(packId, answeredBy, attachments) {
     question: record.lastQuestion?.text || null,
     date: now,
   });
+  await bumpAnswerCount(answeredBy, now);
   return record;
 }
 
@@ -918,24 +1147,28 @@ function publishAnswer(packId, answeredBy, attachments) {
 }
 
 const app = express();
-// Necesario para que req.secure refleje la verdad detrás de un proxy/balanceador
-// (Vercel, Render, etc. reciben la conexión HTTPS y la reenvían por HTTP interno con
-// el header X-Forwarded-Proto) — si no, Express siempre ve la conexión interna como
-// no-https y req.secure sale falso aunque el usuario sí esté en https.
-app.set('trust proxy', 1);
-// El front-end sondea /api/messages (todo el catálogo de conversaciones, con su
-// historial completo) cada 20s desde cada persona que tenga la pestaña abierta — sin
-// comprimir, eso fue lo que agotó el límite gratuito de "Fast Origin Transfer" de
-// Vercel (10 GB) en unos días y pausó el sitio entero. gzip/brotli en JSON repetitivo
-// como este normalmente recorta 70-90% del peso transferido.
-app.use(compression());
 app.use(cookieParser());
 app.use(express.json());
 
 // Rutas que deben quedar accesibles SIN sesión: la propia página de login, el
 // endpoint que valida usuario/contraseña, y el cron externo (que se autentica con
 // su propio CRON_SECRET, no con una sesión de usuario).
-const PUBLIC_PATHS = new Set(['/login.html', '/api/auth/login', '/api/cron/sync']);
+const PUBLIC_PATHS = new Set([
+  '/login.html',
+  '/api/auth/login',
+  '/api/cron/sync',
+  '/api/cron/backfill-history',
+  '/api/cron/regenerate-pending-drafts',
+  '/api/cron/backfill-automation-answer-counts',
+  '/api/cron/fix-numeric-pack-ids',
+  '/api/cron/recheck-agreed-shipping-labels',
+  // Automatización n8n de refacturas/envíos acordados (ver
+  // docs/odoo-refacturas-envios-automation-plan.md) — se autentica con CRON_SECRET,
+  // mismo patrón que el cron externo, no con una sesión de usuario.
+  '/api/automation/refacturas-pendientes',
+  '/api/automation/envios-acordados-pendientes',
+  '/api/automation/marcar-planificado',
+]);
 
 function requireAuth(req, res, next) {
   if (PUBLIC_PATHS.has(req.path)) return next();
@@ -959,10 +1192,9 @@ app.post('/api/auth/login', async (req, res) => {
     const normalizedEmail = await verifyCredentials(email, password);
     res.cookie(SESSION_COOKIE, createSessionToken(normalizedEmail), {
       httpOnly: true,
-      // req.secure (no un env var atado a un hosting específico como VERCEL) para que
-      // esto funcione igual en Vercel, Render o cualquier otro lado detrás de https;
-      // en local (npm start, sin https) se desactiva sola, que es lo correcto.
-      secure: req.secure,
+      // Vercel siempre sirve por https; en local (npm start) no hay https, así que la
+      // cookie "secure" se desactiva ahí o el navegador la descartaría por completo.
+      secure: Boolean(process.env.VERCEL),
       sameSite: 'lax',
       maxAge: 30 * 24 * 60 * 60 * 1000,
     });
@@ -1029,6 +1261,16 @@ app.post('/api/sync', async (req, res) => {
     await saveLastSyncError(err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Botón "🔄 Regenerar pendientes" del header — misma acción que
+// /api/cron/regenerate-pending-drafts, pero con sesión de usuario en vez de
+// CRON_SECRET: así cualquiera del equipo ya logueado la puede disparar desde la
+// propia app, sin necesitar terminal ni conocer ningún secreto (2026-09-03, a
+// petición de Alan después de no poder correr el curl con el secreto a mano).
+app.post('/api/admin/regenerate-pending-drafts', async (req, res) => {
+  res.json({ started: true }); // puede tardar varios minutos con muchos pendientes — se revisa en logs
+  runRegeneratePendingDraftsInner().catch((err) => console.error('[regen-pendientes] Error general:', err));
 });
 
 app.post('/api/messages/:packId/regenerate-draft', async (req, res) => {
@@ -1125,6 +1367,14 @@ app.get('/api/log', async (req, res) => {
   res.json({ entries });
 });
 
+// Contador acumulado por persona/día (ver ANSWER_COUNTS_KEY) — a diferencia de
+// /api/log, esto nunca pierde historial, así que es lo que alimenta la gráfica
+// de "respuestas por persona" y el total junto a cada nombre en la Bitácora.
+app.get('/api/answer-counts', async (req, res) => {
+  const counts = await loadAnswerCounts();
+  res.json({ counts });
+});
+
 app.get('/api/response-bank', async (req, res) => {
   const entries = await loadAnswerLog();
   res.json({ bank: computeResponseBank(entries) });
@@ -1149,12 +1399,7 @@ app.get('/api/attachments/:filename', async (req, res) => {
     const siteId = req.query.siteId || 'MLM';
     const { base64, mimeType } = await fetchAttachment(token, req.params.filename, siteId);
     res.set('Content-Type', mimeType || 'image/jpeg');
-    // El contenido de un adjunto de ML nunca cambia para el mismo filename/id, así que
-    // se puede cachear en la CDN de Vercel (antes era "private", lo que obligaba a
-    // pedirlo de nuevo al servidor cada vez que CUALQUIER persona del equipo lo veía,
-    // aunque ya lo hubiera visto alguien más antes) — esto quita de encima al server
-    // (y de "Fast Origin Transfer") las vistas repetidas de la misma foto/PDF.
-    res.set('Cache-Control', 'public, max-age=86400, immutable');
+    res.set('Cache-Control', 'private, max-age=86400');
     res.send(Buffer.from(base64, 'base64'));
   } catch (err) {
     console.error(err);
@@ -1186,14 +1431,931 @@ app.get('/api/cron/sync', async (req, res) => {
   }
 });
 
-const port = process.env.PORT || 3000;
+// 2026-08-29: backfill de una sola vez — cuando Redis se quedó sin cupo y hubo que
+// empezar con una base nueva y vacía, el sync normal (fetchUnreadPacks) solo trae de
+// vuelta lo que Mercado Libre reporta como "no leído", así que las conversaciones ya
+// respondidas (~1189 en el momento del incidente) se quedan fuera del caché para
+// siempre a menos que se traigan aparte. Esta ruta recorre TODAS las ventas del
+// vendedor (no solo lo pendiente) y reconstruye tanto el caché de packs como, para
+// las ya respondidas, entradas de Bitácora — con `answeredBy`/`wasEdited` en null
+// porque eso nunca lo guardó Mercado Libre, solo nuestra app.
+async function runHistoryBackfillInner() {
+  const { access_token: token } = await getAccessToken();
+  const orders = await fetchAllSellerOrders(token, SELLER_ID);
+  // String(...): /orders/search devuelve pack_id/id como número, pero el resto de
+  // la app siempre trata packId como texto (ver comentario igual en
+  // sendFirstContactForAgreedShipping) — sin esto, un pack que nadie más vuelva a
+  // tocar por la vía normal se queda con packId numérico y el frontend nunca lo
+  // encuentra al comparar con ===.
+  const packIds = [...new Set(orders.map((o) => String(o.pack_id || o.id)))];
+  console.log(`[backfill] ${orders.length} órdenes, ${packIds.length} packs únicos a revisar`);
 
-// En Vercel el módulo se importa como función serverless (@vercel/node), sin
-// llamar a listen(); localmente (npm start) sí necesitamos el servidor real.
-if (require.main === module) {
-  app.listen(port, () => {
-    console.log(`Mensajes ML disponibles en http://localhost:${port}`);
+  const cache = await loadCache();
+  let done = 0;
+  let errors = 0;
+  let logged = 0;
+  await mapWithConcurrency(packIds, 5, async (packId) => {
+    try {
+      const record = await syncPackById(token, packId, cache, 0);
+      await savePackEntry(packId, {
+        info: {
+          orderId: record.orderId,
+          buyerName: record.buyerName,
+          buyerId: record.buyerId,
+          itemTitles: record.itemTitles,
+          itemLinks: record.itemLinks,
+          saleDate: record.saleDate,
+          isFull: record.isFull,
+          shippingStatus: record.shippingStatus,
+          shippingStatusLabel: record.shippingStatusLabel,
+          shippingSettled: record.shippingSettled,
+          shippingChecked: true,
+        },
+        record,
+      });
+
+      if (record.status === 'respondido') {
+        const msgs = record.messages || [];
+        for (let i = 0; i < msgs.length - 1; i++) {
+          if (msgs[i].sender === 'cliente' && msgs[i + 1].sender === 'vendedor') {
+            await appendAnswerLog({
+              packId,
+              buyerName: record.buyerName,
+              itemTitles: record.itemTitles,
+              answeredBy: null,
+              wasEdited: false,
+              text: msgs[i + 1].text,
+              question: msgs[i].text,
+              date: msgs[i + 1].date,
+            });
+            logged++;
+          }
+        }
+      }
+      done++;
+      if (done % 50 === 0) console.log(`[backfill] progreso: ${done}/${packIds.length}`);
+    } catch (err) {
+      errors++;
+      console.warn('[backfill] error en pack', packId, err.message);
+    }
+  });
+  console.log(`[backfill] TERMINADO: ${done} ok, ${errors} con error, ${logged} entradas de bitácora reconstruidas`);
+}
+
+function runHistoryBackfill() {
+  return withLock('lock:backfill:history', 3600000, runHistoryBackfillInner);
+}
+
+app.get('/api/cron/backfill-history', async (req, res) => {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  // No se espera a que termine (puede tardar bastante con cientos/miles de packs) —
+  // se dispara en segundo plano y se revisa el avance en los logs.
+  res.json({ started: true });
+  runHistoryBackfill().catch((err) => console.error('[backfill] Error general:', err));
+});
+
+// 2026-09-01: uso puntual — al mejorar el prompt del agente de IA (mejor comprensión
+// de la conversación completa, razonamiento activado en Flash), los borradores YA
+// generados se quedan con el texto de la versión anterior: el sync normal los trata
+// como "frescos" (mismo forQuestionDate, sin error) y nunca los vuelve a tocar, así
+// que sin esto solo las conversaciones NUEVAS verían la mejora. Esta ruta fuerza un
+// regenerateDraftInner (que sí ignora el estado "fresco") sobre cada pack pendiente
+// actual, para que el equipo vea el borrador mejorado de inmediato en vez de esperar
+// a que cada cliente vuelva a escribir.
+async function runRegeneratePendingDraftsInner() {
+  const cache = await loadCache();
+  const pending = Object.values(cache.packs)
+    .map((p) => p.record)
+    .filter((r) => r.status === 'pendiente');
+  console.log(`[regen-pendientes] ${pending.length} borradores pendientes a regenerar`);
+  let ok = 0;
+  let failed = 0;
+  await mapWithConcurrency(pending, 3, async (record) => {
+    try {
+      await regenerateDraftInner(record.packId);
+      ok++;
+    } catch (err) {
+      failed++;
+      console.warn('[regen-pendientes] error en pack', record.packId, err.message);
+    }
+  });
+  console.log(`[regen-pendientes] TERMINADO: ${ok} ok, ${failed} con error`);
+}
+
+app.get('/api/cron/regenerate-pending-drafts', async (req, res) => {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  res.json({ started: true }); // puede tardar varios minutos con muchos pendientes — se revisa en logs
+  runRegeneratePendingDraftsInner().catch((err) => console.error('[regen-pendientes] Error general:', err));
+});
+
+// 2026-09-24, uso puntual: /orders/search devuelve pack_id/id como NÚMERO — antes
+// del fix en sendFirstContactForAgreedShipping/runHistoryBackfillInner (ver
+// comentario junto a esas funciones), cualquier pack descubierto por esa vía se
+// guardaba con record.packId como número en vez de texto. El resto de la app
+// siempre compara packId con === contra un valor de texto (viene de una URL vía
+// regex, o de un atributo data-* del HTML), así que esos packs se guardaban bien
+// pero el frontend nunca los encontraba al seleccionarlos (caso real: Gracia
+// Ugalde, 2026-09-24 — el mensaje automático se mandó bien, pero el chat se veía
+// como si no existiera). Este endpoint recorre TODO el caché una sola vez y
+// corrige el tipo donde haga falta; es seguro correrlo de más (si ya no hay nada
+// que corregir, no hace ninguna escritura).
+async function fixNumericPackIdsInner() {
+  const cache = await loadCache();
+  let fixed = 0;
+  for (const [packId, entry] of Object.entries(cache.packs)) {
+    if (entry?.record && typeof entry.record.packId !== 'string') {
+      entry.record.packId = String(entry.record.packId);
+      await savePackEntry(packId, entry);
+      fixed++;
+    }
+  }
+  return { fixed, totalPacks: Object.keys(cache.packs).length };
+}
+
+app.get('/api/cron/fix-numeric-pack-ids', async (req, res) => {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const result = await fixNumericPackIdsInner();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2026-09-24, uso puntual: antes del margen de gracia agregado a
+// resolveShippingInfo (ver comentario junto a su definición), un pedido revisado
+// muy temprano por sendFirstContactForAgreedShipping podía quedar etiquetado
+// "Acordar con el vendedor" PARA SIEMPRE aunque Mercado Libre le asignara un envío
+// real (FULL u otro) poco después — una vez que resolvePackInfo cree que
+// "shippingSettled: true", nunca lo vuelve a consultar solo. Este endpoint fuerza
+// una relectura completa (orden + envío) de TODO lo que hoy esté etiquetado
+// "Acordar con el vendedor", para corregir cualquier caso ya atrapado por el bug
+// (caso real: Gracia Ugalde, 2026-09-24 — Mercado Libre la muestra como FULL con
+// guía real). Seguro de correr de más: los que de verdad son "Acordar con el
+// vendedor" simplemente se vuelven a confirmar igual.
+async function recheckAgreedShippingLabelsInner() {
+  const { access_token: token } = await getAccessToken();
+  const cache = await loadCache();
+  const candidates = Object.entries(cache.packs)
+    .filter(([, entry]) => entry.record?.shippingStatusLabel === 'Acordar con el vendedor')
+    .map(([packId]) => packId);
+
+  let corrected = 0;
+  let confirmed = 0;
+  await mapWithConcurrency(candidates, 3, async (packId) => {
+    try {
+      // cache vacío a propósito: fuerza a resolvePackInfo a volver a consultar
+      // orden + envío desde cero, en vez de confiar en shippingSettled ya guardado
+      // (que puede estar mal, justo lo que estamos corrigiendo).
+      const record = await syncPackById(token, packId, { packs: {} }, cache.packs[packId]?.record?.unreadCount || 0);
+      if (record.shippingStatusLabel !== 'Acordar con el vendedor') corrected++; else confirmed++;
+      const fresh = await loadPackEntry(packId);
+      if (!fresh) return;
+      fresh.record = record;
+      fresh.info = {
+        orderId: record.orderId,
+        buyerName: record.buyerName,
+        buyerId: record.buyerId,
+        itemTitles: record.itemTitles,
+        itemLinks: record.itemLinks,
+        saleDate: record.saleDate,
+        isFull: record.isFull,
+        shippingStatus: record.shippingStatus,
+        shippingStatusLabel: record.shippingStatusLabel,
+        shippingSettled: record.shippingSettled,
+        shippingChecked: true,
+      };
+      await savePackEntry(packId, fresh);
+    } catch (err) {
+      console.warn('[recheck-acordados] error en pack', packId, err.message);
+    }
+  });
+  return { totalCandidates: candidates.length, corrected, confirmed };
+}
+
+app.get('/api/cron/recheck-agreed-shipping-labels', async (req, res) => {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const result = await recheckAgreedShippingLabelsInner();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2026-09-22: uso puntual, una sola vez — sendAutomatedMessage() ya suma al
+// contador (bumpAnswerCount, ver comentario junto a su definición), pero eso solo
+// corrige los mensajes automáticos mandados DESPUÉS de ese fix. Los que ya se
+// habían mandado antes se quedaron en "app:answerlog" (la Bitácora) sin su
+// contraparte en "app:answercounts" — por eso el chip de cada automatización se
+// veía siempre en "(0)" aunque ya hubiera entradas reales en la lista. Este
+// endpoint recorre el log y le suma a bumpAnswerCount lo que falte, UNA VEZ (el
+// marcador en Redis evita que un segundo llamado accidental vuelva a contar lo
+// mismo dos veces).
+const AUTOMATION_ANSWERCOUNTS_BACKFILL_KEY = 'app:automation:answercounts_backfilled_v1';
+
+async function backfillAutomationAnswerCountsInner() {
+  const already = await redis.get(AUTOMATION_ANSWERCOUNTS_BACKFILL_KEY);
+  if (already) return { skipped: true, backfilledAt: already };
+
+  const entries = await loadAnswerLog();
+  let counted = 0;
+  for (const e of entries) {
+    if (!e.answeredBy || !e.date) continue;
+    if (!e.answeredBy.startsWith('Automatización')) continue; // solo lo que mandaron las automatizaciones, nunca a una persona real
+    await bumpAnswerCount(e.answeredBy, e.date);
+    counted++;
+  }
+  const backfilledAt = new Date().toISOString();
+  await redis.set(AUTOMATION_ANSWERCOUNTS_BACKFILL_KEY, backfilledAt);
+  return { skipped: false, counted, backfilledAt };
+}
+
+app.get('/api/cron/backfill-automation-answer-counts', async (req, res) => {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const result = await backfillAutomationAnswerCountsInner();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------------
+// Automatización n8n: refacturas y envíos acordados con el comprador (aprobado por
+// el gerente de Alan con alcance reducido — ver
+// docs/odoo-refacturas-envios-automation-plan.md, sección 3). n8n hace polling de
+// estos endpoints, crea la "planificación" en Odoo (una Actividad sobre la
+// cotización, para no depender de nombres de campo personalizados que todavía no
+// están confirmados con quien administra Odoo), y avisa de vuelta con
+// /marcar-planificado para que el mismo pack no se vuelva a ofrecer en la próxima
+// corrida. Las validaciones humanas de Crédito y Cobranza / Tráfico NO se tocan —
+// esto solo reemplaza el paso mecánico de capturar los datos en Odoo.
+//
+// AUTOMATION_PLANNED_KEY vive en Redis (no en el propio record del pack) para que
+// "ya se mandó a Odoo" sobreviva a un re-sync normal del pack sin más lógica.
+const AUTOMATION_PLANNED_KEY = 'app:automation:planned';
+
+async function isAlreadyPlanned(categoria, packId) {
+  return Boolean(await redis.hget(AUTOMATION_PLANNED_KEY, `${categoria}:${packId}`));
+}
+
+async function markPlanned(categoria, packId, extra) {
+  await redis.hset(AUTOMATION_PLANNED_KEY, {
+    [`${categoria}:${packId}`]: { plannedAt: new Date().toISOString(), ...extra },
   });
 }
+
+// Prefiltro barato antes de gastar una llamada a Gemini por pack: sin esto, cada
+// corrida de n8n tendría que analizar los ~1500 packs del caché en vez de solo los
+// que de verdad tienen una plantilla de este tipo de por medio. Se basa en el texto
+// de las plantillas ya aprobadas (ver RESPONSE_TEMPLATES en lib/agent.js) — si esas
+// plantillas cambian de redacción, hay que revisar estos patrones también.
+const REFACTURA_ASK_PATTERNS = [/uso de cfdi/i, /r[eé]gimen fiscal/i, /raz[oó]n social/i];
+const ENVIO_ACORDADO_ASK_PATTERNS = [/env[ií]o gratis/i, /dirección completa \(calle/i];
+
+// A pedido de Alan (2026-09-22, ajustado el mismo día tras ver un caso real): una
+// vez que el vendedor YA le entregó el PDF de la factura al cliente, esa
+// conversación debe dejar de contar como "refactura pendiente" aunque el cliente
+// vuelva a escribir después por otro tema — sin esto, isRefacturaCandidate se queda
+// en true para siempre (nunca se "des-pide" un dato una vez pedido) y una
+// conversación ya resuelta reaparecía en el filtro de refacturas solo porque el
+// hilo volvió a estar "pendiente" por una pregunta sin relación.
+//
+// A propósito NO basta con el texto solo (p.ej. "Procedemos con la facturación de
+// su compra", plantilla "Pasar a facturar") — ese mensaje es solo un aviso de que
+// está en trámite (tarda 1-3 días hábiles), el PDF real normalmente llega después
+// en un mensaje aparte, y hasta que eso pase sigue siendo trabajo pendiente de
+// verdad. Por eso se exige texto de entrega (ver plantilla aprobada "Compartir
+// factura ya generada" en RESPONSE_TEMPLATES, lib/agent.js) Y un PDF adjunto en ESE
+// MISMO mensaje — así "te envío tu factura" sin nada adjunto (un despiste, o
+// alguien escribiéndolo de más) no cierra el tema por accidente. Si el equipo cierra
+// el tema con una redacción muy distinta a estos patrones, esto no lo detecta
+// (mismo límite que cualquier prefiltro por texto, ver comentario de arriba).
+const REFACTURA_CLOSE_TEXT_PATTERNS = [
+  /te env(í|i)o (tu|su) factura/i,
+  /te enviamos (tu|su) factura/i,
+  /adjunto (tu|su) factura/i,
+  /aqu(í|i) (tu|su|est(á|a)) factura/i,
+  /factura (ya )?(enviada|generada|lista)/i,
+];
+
+function vendorAskedFor(messages, patterns) {
+  return (messages || []).some((m) => m.sender === 'vendedor' && patterns.some((p) => p.test(m.text || '')));
+}
+
+function vendorSentFacturaPdf(messages) {
+  return (messages || []).some((m) => m.sender === 'vendedor'
+    && REFACTURA_CLOSE_TEXT_PATTERNS.some((p) => p.test(m.text || ''))
+    && (m.attachments || []).some((a) => a.kind === 'pdf'));
+}
+
+// A pedido de Alan (2026-09-24, caso real: cliente "Xa Za" mandó su factura completa
+// en su primer mensaje y la conversación no aparecía en el filtro de refacturas
+// porque isRefacturaCandidate solo miraba si el VENDEDOR ya había pedido los datos
+// — si el cliente se adelanta y pide/manda su factura antes de que nadie del equipo
+// responda, antes no había ninguna señal que lo detectara). Prefiltro barato por
+// texto (no Gemini) a propósito: esto solo alimenta un filtro/chip de la interfaz
+// para que el equipo lo vea, no dispara ningún mensaje automático — el costo de un
+// falso positivo aquí es mínimo (aparece de más en la lista), así que no amerita el
+// costo/latencia de una llamada a Gemini por cada pack en cada sync, a diferencia de
+// detectsFirstFacturaRequest (que sí decide si se manda un mensaje solo).
+const CLIENT_FACTURA_MENTION_PATTERN = /factur|cfdi/i;
+
+function clientMentionedFactura(messages) {
+  return (messages || []).some((m) => m.sender === 'cliente' && CLIENT_FACTURA_MENTION_PATTERN.test(m.text || ''));
+}
+
+// ---------------------------------------------------------------------------------
+// Recordatorio automático de datos faltantes (refactura / envío acordado) — decisión
+// explícita de Alan (2026-09-10): a diferencia de la planificación en Odoo (que es
+// interna, nadie del lado del cliente la ve), ESTO SÍ le manda un mensaje directo al
+// cliente en Mercado Libre sin que nadie del equipo lo revise antes. Se acepta ese
+// riesgo porque el texto es 100% mecánico — una plantilla ya aprobada (o la lista
+// exacta de campos que faltan, tomada tal cual la escribió el cliente) — nunca texto
+// libre inventado por la IA. La única parte que usa IA es decidir QUÉ falta, no QUÉ
+// decir; si esa detección se equivoca, el peor caso es un recordatorio de más pidiendo
+// un dato que el cliente ya había dado.
+//
+// Se dispara desde el propio ciclo de sync (cada 2 minutos), no desde n8n: no
+// necesita Odoo para nada, así que no tiene sentido esperar al poll de n8n (cada 10
+// minutos) para algo que la app ya puede resolver por su cuenta.
+const AUTOMATION_REMINDED_KEY = 'app:automation:reminded';
+
+// Solo manda el recordatorio una vez por cada mensaje nuevo del cliente (mismo
+// criterio de "frescura" que ya usa el borrador de IA vía forQuestionDate) — si el
+// cliente vuelve a escribir (aunque siga incompleto), sí se le manda un recordatorio
+// actualizado; mientras no escriba de nuevo, no se le insiste con el mismo mensaje.
+async function alreadyRemindedForQuestion(categoria, packId, questionDate) {
+  const stored = await redis.hget(AUTOMATION_REMINDED_KEY, `${categoria}:${packId}`);
+  return Boolean(stored) && stored.questionDate === questionDate;
+}
+
+async function markReminded(categoria, packId, questionDate) {
+  await redis.hset(AUTOMATION_REMINDED_KEY, {
+    [`${categoria}:${packId}`]: { questionDate, remindedAt: new Date().toISOString() },
+  });
+}
+
+function buildRefacturaReminderText(missing) {
+  const bullets = missing.map((key) => `• ${REFACTURA_FIELD_LABELS[key]}`).join('\n');
+  return `Gracias por la información. Para poder emitir su factura aún nos falta que nos comparta:\n${bullets}\n\nEn cuanto recibamos los datos completos, procedemos con la emisión.`;
+}
+
+// Copia literal de la plantilla aprobada "Solicitar datos de factura" (ver
+// RESPONSE_TEMPLATES en lib/agent.js) — mismo criterio que ENVIO_ACORDADO_FIRST_CONTACT_TEXT
+// de abajo: se reutiliza tal cual en vez de referenciarla dinámicamente.
+const FACTURA_FIRST_CONTACT_TEXT = 'Buen día 🙏 Con gusto realizamos su factura. Para generarla, favor de enviarnos:\n• Constancia de situación fiscal (PDF o fotografía legible)\n• Uso de CFDI\n• Forma de pago\n\nEn cuanto recibamos la información completa, procedemos con su emisión.';
+
+// Copia literal de la plantilla aprobada "Solicitud de datos para envío gratis" (ver
+// RESPONSE_TEMPLATES en lib/agent.js) — se reutiliza tal cual en vez de
+// referenciarla dinámicamente, para no depender de que el prompt del agente de IA
+// nunca cambie esa plantilla sin querer.
+const ENVIO_ACORDADO_FIRST_CONTACT_TEXT = 'Hola, buen día. Tu pedido aplica para envío gratis 🎉 Para activarlo necesito que me envíes por mensaje los siguientes datos completos:\n• Nombre:\n• Dirección completa (calle, número, colonia, CP, ciudad y estado)\n• Referencias de domicilio\n• Teléfono\n\nEn cuanto los reciba, libero tu envío sin costo. Quedo pendiente.';
+
+// Mismo mecanismo de envío que publishAnswerInner (buyerId al vuelo si falta,
+// mandar, marcar leído, reflejar en el caché y en la bitácora), pero sin depender de
+// que exista un draftAnswer. SÍ suma al mismo contador que usa publishAnswerInner
+// (bumpAnswerCount, con el label de la automatización en vez de un email) — sin
+// esto, la automatización aparecía como chip de filtro en la Bitácora (porque
+// appendAnswerLog sí la registra) pero siempre con "(0)", porque ese número sale de
+// answerCounts, no de contar entradas del feed (ver comentario junto a renderLog en
+// public/app.js).
+async function sendAutomatedMessage(packId, text, label) {
+  const entry = await getPackEntryOrThrow(packId);
+  const record = entry.record;
+  const { access_token: token } = await getAccessToken();
+
+  if (!record.buyerId && record.orderId) {
+    try {
+      const order = await fetchOrderDetail(token, record.orderId);
+      record.buyerId = order.buyer?.id || null;
+      if (entry.info) entry.info.buyerId = record.buyerId;
+    } catch {
+      // sigue sin buyerId, cae al error de abajo
+    }
+  }
+  if (!record.buyerId) {
+    throw new Error('No se pudo identificar al comprador de esta conversación');
+  }
+
+  await sendPackMessage(token, packId, SELLER_ID, record.buyerId, text, []);
+  try {
+    await markPackMessagesRead(token, packId, SELLER_ID);
+  } catch (err) {
+    console.warn('No se pudo marcar como leído el pack', packId, err.message);
+  }
+
+  const now = new Date().toISOString();
+  record.messages.push({ sender: 'vendedor', text, date: now, hasAttachment: false, attachments: [] });
+  record.lastAnswer = { sender: 'vendedor', text, date: now, hasAttachment: false };
+  record.status = 'respondido';
+  record.draftAnswer = null;
+  record.answeredBy = label;
+  await savePackEntry(packId, entry);
+  await appendAnswerLog({
+    packId,
+    buyerName: record.buyerName,
+    itemTitles: record.itemTitles,
+    answeredBy: label,
+    wasEdited: false,
+    text,
+    question: record.lastQuestion?.text || null,
+    date: now,
+  });
+  await bumpAnswerCount(label, now);
+}
+
+async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, extractFn, buildText, label, token }) {
+  if (!vendorAskedFor(record.messages, askPatterns)) return;
+  // La factura ya se entregó (PDF real adjunto, no solo el aviso de "procedemos
+  // con la facturación") — no tiene caso seguir pidiendo datos que ya no importan,
+  // sin importar qué escriba el cliente después (aunque sea solo un "gracias").
+  // Mismo criterio que ya usa isRefacturaCandidate para el filtro de la interfaz.
+  // Caso real: Diana Karina Sánchez Hernández, 2026-09-25 — la factura ya se había
+  // mandado el 21 sep, y el recordatorio se disparó de nuevo el 25 sep solo porque
+  // el cliente escribió "gracias, excelente noche".
+  if (categoria === 'refactura' && vendorSentFacturaPdf(record.messages)) return;
+  if (await isAlreadyPlanned(categoria, record.packId)) return; // ya completo y planificado — nada que recordar
+  const questionDate = record.lastQuestion?.date || null;
+  if (!questionDate || (await alreadyRemindedForQuestion(categoria, record.packId, questionDate))) return;
+
+  const { complete, missing } = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
+  const totalFields = Object.keys(fieldLabels).length;
+  // Ni completo (no hay nada que recordar) ni en cero (el cliente todavía no
+  // contestó nada — insistir antes de que responda algo sería puro spam):
+  // recordamos solo el caso de en medio, datos parciales.
+  if (complete || missing.length === 0 || missing.length >= totalFields) return;
+
+  try {
+    await withLock(`lock:pack:${record.packId}`, 30000, () => sendAutomatedMessage(record.packId, buildText(missing), label));
+    await markReminded(categoria, record.packId, questionDate);
+  } catch (err) {
+    console.warn(`[automation] no se pudo mandar recordatorio (${categoria}) del pack`, record.packId, err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------------
+// Primer contacto automático cuando el cliente pide factura/refactura por primera
+// vez (a pedido de Alan, 2026-09-22, mismo criterio de aprobación que el primer
+// contacto de envío acordado): a diferencia de ese caso (donde el disparador es un
+// dato exacto de la API, `shipping.id` ausente), aquí el disparador es la intención
+// del CLIENTE en su propio mensaje — no hay forma de saberlo sin interpretar texto
+// libre, así que se apoya en detectsFirstFacturaRequest (lib/agent.js, vía Gemini)
+// en vez de un regex simple, para no dispararse con negaciones ("no necesito
+// factura") ni con un cliente que ya la había pedido antes en el mismo hilo.
+//
+// No hace falta descubrir packs nuevos por su cuenta (a diferencia del envío
+// acordado): el cliente pidiendo factura ya llega por el sync normal como
+// "pendiente", así que esto corre dentro del mismo lote de candidatos de
+// sendAutomationReminders(), no por separado.
+const AUTOMATION_FACTURA_FIRST_CONTACT_KEY = 'app:automation:first_contact_factura';
+
+async function isFacturaFirstContactHandled(packId) {
+  return Boolean(await redis.hget(AUTOMATION_FACTURA_FIRST_CONTACT_KEY, packId));
+}
+
+async function markFacturaFirstContactHandled(packId, questionDate) {
+  await redis.hset(AUTOMATION_FACTURA_FIRST_CONTACT_KEY, {
+    [packId]: { questionDate, handledAt: new Date().toISOString() },
+  });
+}
+
+async function sendFacturaFirstContactForRecord(record) {
+  if (process.env.AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED !== 'true') return;
+  // Caso real (2026-09-24, casos de Jose Manuel Trejo Medellin y Laura Marcela Ruiz
+  // Leos): en pedidos "Acordar con el vendedor" es muy común que el cliente pida su
+  // factura Y necesite coordinar el envío en el mismo mensaje o mensajes seguidos —
+  // el borrador de IA revisado por un humano ya combina bien los dos temas en una
+  // sola respuesta (ver REGLA GENERAL sobre MÁS DE UN TEMA PENDIENTE en el prompt de
+  // lib/agent.js), pero esta automatización solo manda la plantilla de factura sola,
+  // sin tocar el envío — mandarla aquí dejaría el tema de envío sin resolver y sin
+  // que nadie se entere. Por eso, en estos pedidos, nunca se manda automático: se
+  // deja pasar siempre a revisión humana.
+  if (record.shippingStatusLabel === 'Acordar con el vendedor') return;
+  if (!CLIENT_FACTURA_MENTION_PATTERN.test(record.lastQuestion?.text || '')) return;
+  // A pedido explícito de Alan (2026-09-24): esta plantilla SOLO es para el mensaje
+  // simple ("me pueden facturar", "necesito facturar"), nunca cuando el cliente ya
+  // mandó algún dato (aunque sea uno) o adjuntó una foto/PDF — eso se deja siempre
+  // como borrador para que alguien lo revise a mano, la plantilla genérica volvería
+  // a pedir datos que ya dio. Chequeo determinístico aparte del que hace Gemini más
+  // abajo (detectsFirstFacturaRequest) porque un adjunto sin texto no siempre se lo
+  // describe bien a la IA, y esto es más barato/confiable que depender solo de ella.
+  if (record.lastQuestion?.hasAttachment) return;
+  // El vendedor ya pidió estos datos antes en este hilo (misma señal que usa el
+  // recordatorio de refactura de abajo) — entonces esta ya no es la primera vez.
+  if (vendorAskedFor(record.messages, REFACTURA_ASK_PATTERNS)) return;
+  if (await isFacturaFirstContactHandled(record.packId)) return;
+  const questionDate = record.lastQuestion?.date || null;
+  if (!questionDate) return;
+
+  let asksForFactura;
+  try {
+    asksForFactura = await detectsFirstFacturaRequest(record.messages, process.env.GEMINI_API_KEY);
+  } catch (err) {
+    console.warn('[automation] no se pudo evaluar solicitud de factura del pack', record.packId, err.message);
+    return;
+  }
+  if (!asksForFactura) return;
+
+  try {
+    await withLock(`lock:pack:${record.packId}`, 30000, () => sendAutomatedMessage(record.packId, FACTURA_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — solicitud de factura)'));
+    await markFacturaFirstContactHandled(record.packId, questionDate);
+  } catch (err) {
+    console.warn('[automation] no se pudo mandar el primer contacto (factura) del pack', record.packId, err.message);
+  }
+}
+
+// Wrapper con su propia carga de caché, a propósito SEPARADO de
+// sendAutomationReminders() de abajo — aunque ambos recorren los mismos candidatos
+// "pendiente", cada uno tiene que apagarse con su propia variable de entorno sin
+// depender de la otra (AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED aquí,
+// AUTOMATION_REMINDERS_ENABLED allá). El chequeo de la variable también vive dentro
+// de sendFacturaFirstContactForRecord — aquí se repite antes para no gastar un
+// loadCache() completo cuando está apagada.
+async function sendFacturaFirstContact() {
+  if (process.env.AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED !== 'true') return;
+  const cache = await loadCache();
+  const candidates = Object.values(cache.packs)
+    .map((p) => p.record)
+    .filter((r) => r && r.status === 'pendiente');
+  await mapWithConcurrency(candidates, 3, (record) => sendFacturaFirstContactForRecord(record));
+}
+
+// Apagado por default a propósito: esto manda mensajes reales al cliente en
+// Mercado Libre SIN revisión humana (ver comentario de AUTOMATION_REMINDED_KEY
+// arriba). A pedido de Alan (2026-09-25): las automatizaciones se agrupan por
+// tema en un solo interruptor en vez de una variable por cada una — como esta
+// función solo manda el recordatorio de REFACTURA (el de envío se quitó, ver
+// comentario más abajo), reutiliza la misma variable que ya prende el primer
+// contacto de factura (AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED) en vez de una
+// nueva (AUTOMATION_REMINDERS_ENABLED, que nunca llegó a usarse en producción).
+async function sendAutomationReminders() {
+  if (process.env.AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED !== 'true') return;
+  const { access_token: token } = await getAccessToken();
+  const cache = await loadCache();
+  const candidates = Object.values(cache.packs)
+    .map((p) => p.record)
+    .filter((r) => r && r.status === 'pendiente');
+
+  // OJO: a pedido explícito de Alan (2026-09-21), "envío acordado" ya NO manda un
+  // recordatorio automático si el cliente contesta incompleto — en pedidos "Acordar
+  // con el vendedor" lo único que se manda sin revisión humana es el primer contacto
+  // (ver sendFirstContactForAgreedShipping). Cualquier respuesta del cliente después
+  // de eso (completa, incompleta, o cualquier otra cosa) pasa por el borrador de IA
+  // normal en la pestaña "Borradores IA", igual que el resto de casos. Solo queda el
+  // recordatorio automático de "refactura" (sin relación con envíos).
+  await mapWithConcurrency(candidates, 3, async (record) => {
+    await remindOneCategory(record, {
+      categoria: 'refactura',
+      askPatterns: REFACTURA_ASK_PATTERNS,
+      fieldLabels: REFACTURA_FIELD_LABELS,
+      extractFn: extractRefacturaData,
+      buildText: buildRefacturaReminderText,
+      label: 'Automatización (datos de refactura faltantes)',
+      token,
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------------
+// Primer contacto automático en pedidos "Acordar con el vendedor" (a pedido de Alan,
+// 2026-09-21, con visto bueno de su gerente): a diferencia del recordatorio de
+// arriba (que solo insiste sobre un pendiente que YA se le planteó al cliente),
+// esto manda el PRIMER mensaje del hilo completo, sin esperar a que el cliente
+// escriba nada — apenas se detecta la venta. El sync normal (fetchUnreadPacks) jamás
+// la encontraría por su cuenta: sin ningún mensaje todavía, Mercado Libre no la
+// reporta como "no leída". Por eso se descubre aparte, consultando ventas recientes
+// por /orders/search (mismo endpoint que runHistoryBackfillInner, pero acotado a los
+// últimos días en vez de todo el historial) y filtrando las que no tengan
+// `shipping.id` (mismo criterio exacto que resolveShippingInfo usa para reportar
+// "Acordar con el vendedor"). Ese filtro sobre el resultado de /orders/search es solo
+// un prefiltro barato para no llamar syncPackById de más: la decisión real de
+// mandar el mensaje se apoya en record.shippingStatusLabel, que sí viene del mismo
+// resolveShippingInfo ya confiable en el resto de la app.
+//
+// Igual que el recordatorio de arriba, el texto es 100% mecánico (la plantilla
+// aprobada tal cual, nunca texto libre de la IA) y queda apagado por default hasta
+// que alguien prenda AUTOMATION_FIRST_CONTACT_ENABLED=true a propósito.
+const AUTOMATION_FIRST_CONTACT_KEY = 'app:automation:first_contact_envio_acordado';
+// Ventana chica a propósito: solo hace falta alcanzar a las ventas de hoy/ayer antes
+// de que alguien las note manualmente — no es un backfill histórico.
+const FIRST_CONTACT_ORDERS_DAYS_BACK = 2;
+
+async function isFirstContactHandled(packId) {
+  return Boolean(await redis.hget(AUTOMATION_FIRST_CONTACT_KEY, packId));
+}
+
+async function markFirstContactHandled(packId, extra) {
+  await redis.hset(AUTOMATION_FIRST_CONTACT_KEY, {
+    [packId]: { handledAt: new Date().toISOString(), ...extra },
+  });
+}
+
+async function sendFirstContactForAgreedShipping() {
+  if (process.env.AUTOMATION_FIRST_CONTACT_ENABLED !== 'true') return;
+
+  const { access_token: token } = await getAccessToken();
+  const cache = await loadCache();
+  const orders = await fetchAllSellerOrders(token, SELLER_ID, FIRST_CONTACT_ORDERS_DAYS_BACK);
+  // El descubrimiento por /orders/search (últimos 2 días) es lo que sostiene esta
+  // automatización en marcha normal — pero se combina con TODO lo que ya está en
+  // caché como "Acordar con el vendedor" y pendiente, sin importar la fecha de la
+  // orden (a pedido de Alan, 2026-09-24: barrer también los pendientes de antes de
+  // que existiera esta automatización, o que por lo que sea la ventana de 2 días se
+  // haya saltado). isFirstContactHandled sigue evitando que un pack ya evaluado se
+  // vuelva a procesar en ciclos futuros, así que este barrido extra solo tiene
+  // efecto real la primera vez que corre sobre cada pack.
+  const knownAgreedShippingPending = Object.values(cache.packs)
+    .filter((p) => p.record?.status === 'pendiente' && p.record?.shippingStatusLabel === 'Acordar con el vendedor')
+    .map((p) => p.record.packId);
+  const packIds = [...new Set([
+    // String(...) a propósito: /orders/search devuelve pack_id/id como NÚMERO, pero
+    // en el resto de la app el packId siempre es texto (viene de una URL vía regex,
+    // o de un atributo data-* del HTML) — sin esto, el pack se guarda bien pero el
+    // frontend nunca lo encuentra al comparar con === (caso real: Gracia Ugalde,
+    // 2026-09-24, el mensaje se mandó bien pero el chat parecía no existir).
+    ...orders.filter((o) => !o.shipping?.id && o.status !== 'cancelled').map((o) => String(o.pack_id || o.id)),
+    ...knownAgreedShippingPending,
+  ])];
+
+  let sentEnvio = 0;
+  let sentAmbas = 0;
+  let skipped = 0;
+  await mapWithConcurrency(packIds, 3, async (packId) => {
+    if (await isFirstContactHandled(packId)) return;
+    try {
+      const record = await syncPackById(token, packId, cache, 0);
+      if (record.shippingStatusLabel !== 'Acordar con el vendedor') {
+        // Ya se confirmó que este pedido SÍ tiene un envío real gestionado por ML
+        // (dejó de mostrar "Acordar con el vendedor" porque le asignaron un
+        // shipping.id) — nada que mandar aquí.
+        skipped++;
+        await markFirstContactHandled(packId);
+        return;
+      }
+      // A pedido explícito de Alan (2026-09-24): el mensaje automático debe salir
+      // apenas se detecta la venta o apenas escribe el cliente, sin esperar a que
+      // shippingSettled confirme el tipo de envío (eso sí puede tardar hasta 1
+      // hora — ver resolveShippingInfo). Se acepta el riesgo raro de que un pedido
+      // muestre "Acordar con el vendedor" al principio y termine siendo un envío
+      // real de ML (caso real: Gracia Ugalde, ~3 de 501 casos históricos) a cambio
+      // de no retrasar el caso normal. Si eso pasa, /api/cron/recheck-agreed-
+      // shipping-labels sigue disponible para corregirlo después.
+      // El vendedor ya le contestó algo a este pack (a mano, o por otra vía) — el
+      // flujo normal ya se encarga, mandar esto encima sería un mensaje duplicado.
+      if (record.messages.some((m) => m.sender === 'vendedor')) {
+        skipped++;
+        await markFirstContactHandled(packId);
+        return;
+      }
+
+      // A pedido explícito de Alan (2026-09-24, "opción 2" del problema de la
+      // carrera con el sync): ya no exige que el hilo esté completamente vacío —
+      // si el cliente escribió primero (antes de que esta automatización alcanzara
+      // a mandar su mensaje), igual se manda la plantilla de envío, SIEMPRE Y
+      // CUANDO lo que escribió no obligue a ignorar algo importante. Un chequeo
+      // determinístico barato (adjuntos) más classifyAgreedShippingFirstContact
+      // (Gemini, lib/agent.js) deciden si es seguro mandar algo automático o si hay
+      // que abstenerse y dejarlo pasar a revisión humana.
+      let category = 'solo_envio';
+      if (record.messages.length > 0) {
+        const clientAttached = record.messages.some((m) => m.sender === 'cliente' && m.hasAttachment);
+        if (clientAttached) {
+          category = 'abstenerse';
+        } else {
+          try {
+            category = await classifyAgreedShippingFirstContact(record.messages, process.env.GEMINI_API_KEY);
+          } catch (err) {
+            console.warn('[automation] no se pudo clasificar el primer mensaje del pack', packId, err.message);
+            category = 'abstenerse';
+          }
+        }
+      }
+
+      if (category === 'abstenerse') {
+        skipped++;
+        await markFirstContactHandled(packId);
+        return;
+      }
+
+      await savePackEntry(packId, {
+        info: {
+          orderId: record.orderId,
+          buyerName: record.buyerName,
+          buyerId: record.buyerId,
+          itemTitles: record.itemTitles,
+          itemLinks: record.itemLinks,
+          saleDate: record.saleDate,
+          isFull: record.isFull,
+          shippingStatus: record.shippingStatus,
+          shippingStatusLabel: record.shippingStatusLabel,
+          shippingSettled: record.shippingSettled,
+          shippingChecked: true,
+        },
+        record,
+      });
+      await withLock(`lock:pack:${packId}`, 30000, async () => {
+        await sendAutomatedMessage(packId, ENVIO_ACORDADO_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — envío acordado)');
+        // Caso real (2026-09-24): el cliente ya pidió factura en el mismo mensaje
+        // donde apenas se está enterando del envío gratis, sin haber dado ningún
+        // dato todavía — se manda también la plantilla de factura, en un segundo
+        // mensaje aparte, en vez de dejarla pasar a revisión humana sin necesidad.
+        if (category === 'envio_y_factura') {
+          await sendAutomatedMessage(packId, FACTURA_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — solicitud de factura)');
+        }
+      });
+      if (category === 'envio_y_factura') sentAmbas++; else sentEnvio++;
+      await markFirstContactHandled(packId);
+    } catch (err) {
+      console.warn('[automation] no se pudo mandar el primer contacto (envío acordado) del pack', packId, err.message);
+    }
+  });
+  if (sentEnvio > 0 || sentAmbas > 0 || skipped > 0) {
+    console.log(`[automation] Primer contacto envío acordado: ${sentEnvio} solo envío, ${sentAmbas} envío+factura, ${skipped} sin mandar.`);
+  }
+}
+
+function checkAutomationSecret(req, res) {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    res.status(401).json({ error: 'No autorizado' });
+    return false;
+  }
+  return true;
+}
+
+async function findPendingForCategory({ categoria, askPatterns, extractFn }) {
+  const { access_token: token } = await getAccessToken();
+  const cache = await loadCache();
+  const candidates = Object.values(cache.packs)
+    .map((p) => p.record)
+    .filter((r) => r && vendorAskedFor(r.messages, askPatterns));
+
+  const results = [];
+  await mapWithConcurrency(candidates, 3, async (record) => {
+    if (await isAlreadyPlanned(categoria, record.packId)) return;
+    const { complete, data } = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
+    if (!complete) return;
+    results.push({
+      packId: record.packId,
+      orderId: record.orderId,
+      buyerName: record.buyerName,
+      itemTitles: record.itemTitles,
+      datos: data,
+    });
+  });
+  return results;
+}
+
+app.get('/api/automation/refacturas-pendientes', async (req, res) => {
+  if (!checkAutomationSecret(req, res)) return;
+  try {
+    const pendientes = await findPendingForCategory({
+      categoria: 'refactura',
+      askPatterns: REFACTURA_ASK_PATTERNS,
+      extractFn: extractRefacturaData,
+    });
+    res.json({ pendientes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/automation/envios-acordados-pendientes', async (req, res) => {
+  if (!checkAutomationSecret(req, res)) return;
+  try {
+    const pendientes = await findPendingForCategory({
+      categoria: 'envio_acordado',
+      askPatterns: ENVIO_ACORDADO_ASK_PATTERNS,
+      extractFn: extractEnvioAcordadoData,
+    });
+    res.json({ pendientes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/automation/marcar-planificado', async (req, res) => {
+  if (!checkAutomationSecret(req, res)) return;
+  try {
+    const { packId, categoria, odooActivityId } = req.body || {};
+    if (!packId || !categoria) {
+      return res.status(400).json({ error: 'Falta packId o categoria' });
+    }
+    await markPlanned(categoria, packId, odooActivityId ? { odooActivityId } : undefined);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2026-09-04: migración única de Upstash al Redis de Coolify (ver lib/redis.js,
+// lib/legacyUpstash.js y REDIS_URL) — Upstash llegó al 90% de su cupo gratuito de
+// comandos/mes en solo 3 días. Se dispara sola al arrancar, protegida por lock +
+// un chequeo de "¿ya hay datos?" (si app:users ya tiene algo en el Redis nuevo,
+// asumimos que ya se migró y no se toca nada) — así que correr esto de más nunca
+// duplica ni pisa datos ya migrados. Nunca lanza el error hacia afuera: si algo
+// falla, el servidor arranca de todos modos (mejor arrancar con lo que haya que no
+// arrancar en absoluto), pero avisa fuerte en los logs para revisarlo a mano.
+async function migrateFromUpstashIfEmpty() {
+  try {
+    await withLock('lock:migrate:upstash-to-coolify', 300000, async () => {
+      const existingUsers = await redis.hgetall('app:users');
+      if (existingUsers && Object.keys(existingUsers).length > 0) {
+        console.log('[migrate] el Redis de Coolify ya tiene datos — se omite la migración de Upstash');
+        return;
+      }
+      const legacy = legacyUpstashClient();
+      if (!legacy) {
+        console.warn('[migrate] no hay credenciales de Upstash (KV_REST_API_URL/TOKEN) — se omite la migración');
+        return;
+      }
+      console.log('[migrate] iniciando migración de Upstash al Redis de Coolify...');
+
+      // Claves de un solo valor — se copian tal cual (@upstash/redis ya las
+      // deserializa igual que nuestro wrapper nuevo, ver lib/redis.js encode()).
+      for (const key of ['ml:token', 'ml:cache:meta', 'app:lastSyncError']) {
+        const value = await legacy.get(key);
+        if (value != null) await redis.set(key, value);
+      }
+
+      // Hashes chicos: HGETALL directo no arriesga el límite de tamaño de request
+      // de Upstash (a diferencia de ml:cache:packs, mucho más grande — ver abajo).
+      // app:users es el más crítico de los tres: sin él nadie puede iniciar sesión.
+      for (const key of ['app:users', 'app:answercounts']) {
+        const value = await legacy.hgetall(key);
+        if (value && Object.keys(value).length) await redis.hset(key, value);
+      }
+
+      // app:answerlog es una lista — se lee completa (tope ya acotado a 1000) y se
+      // vuelve a insertar con RPUSH en el mismo orden de lectura, para conservar el
+      // orden original (se escribió con LPUSH: el índice 0 ya es "más nuevo primero").
+      const logEntries = await legacy.lrange('app:answerlog', 0, -1);
+      for (const entry of logEntries) await redis.rpush('app:answerlog', entry);
+
+      // ml:cache:packs puede ser grande — se lee con HSCAN en lotes chicos (mismo
+      // motivo que los scripts de corrección de datos de esta temporada: un HGETALL
+      // de golpe ya nos hizo violar el límite de tamaño de request de Upstash antes).
+      let cursor = '0';
+      let migratedPacks = 0;
+      do {
+        const [nextCursor, raw] = await legacy.hscan('ml:cache:packs', cursor, { count: 50 });
+        cursor = nextCursor;
+        // El SDK de Upstash devuelve los pares como array plano [campo, valor, ...]
+        // (igual que la respuesta nativa de Redis) — se agrupan en un objeto.
+        const chunk = {};
+        if (Array.isArray(raw)) {
+          for (let i = 0; i < raw.length; i += 2) chunk[raw[i]] = raw[i + 1];
+        } else if (raw) {
+          Object.assign(chunk, raw);
+        }
+        if (Object.keys(chunk).length) {
+          await redis.hset('ml:cache:packs', chunk);
+          migratedPacks += Object.keys(chunk).length;
+        }
+      } while (cursor !== '0');
+
+      console.log(`[migrate] TERMINADO: ${migratedPacks} packs, ${logEntries.length} entradas de bitácora, usuarios y contadores copiados`);
+    });
+  } catch (err) {
+    if (err.status !== 409) console.error('[migrate] error inesperado migrando de Upstash:', err.message);
+  }
+}
+
+// Se espera a que la migración termine ANTES de aceptar tráfico (app.listen): sin
+// esto, alguien podría intentar iniciar sesión o el sync podría correr contra un
+// Redis nuevo todavía vacío justo en la ventana entre el arranque y que termine de
+// copiarse todo.
+async function startServer() {
+  await migrateFromUpstashIfEmpty();
+  seedAnswerCountsIfEmpty().catch((err) => console.error('[answercounts] error inesperado sembrando:', err.message));
+
+  const port = process.env.PORT || 3000;
+  // En Vercel el módulo se importa como función serverless (@vercel/node), sin
+  // llamar a listen(); localmente (npm start) sí necesitamos el servidor real.
+  if (require.main === module) {
+    app.listen(port, () => {
+      console.log(`Mensajes ML disponibles en http://localhost:${port}`);
+    });
+  }
+}
+
+startServer().catch((err) => console.error('Error fatal al arrancar el servidor:', err));
 
 module.exports = app;
