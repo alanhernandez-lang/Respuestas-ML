@@ -1881,13 +1881,21 @@ async function sendAutomatedMessage(packId, text, label) {
   await bumpAnswerCount(label, now);
 }
 
-async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, extractFn, buildText, label }) {
+async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, extractFn, buildText, label, token }) {
   if (!vendorAskedFor(record.messages, askPatterns)) return;
+  // La factura ya se entregó (PDF real adjunto, no solo el aviso de "procedemos
+  // con la facturación") — no tiene caso seguir pidiendo datos que ya no importan,
+  // sin importar qué escriba el cliente después (aunque sea solo un "gracias").
+  // Mismo criterio que ya usa isRefacturaCandidate para el filtro de la interfaz.
+  // Caso real: Diana Karina Sánchez Hernández, 2026-09-25 — la factura ya se había
+  // mandado el 21 sep, y el recordatorio se disparó de nuevo el 25 sep solo porque
+  // el cliente escribió "gracias, excelente noche".
+  if (categoria === 'refactura' && vendorSentFacturaPdf(record.messages)) return;
   if (await isAlreadyPlanned(categoria, record.packId)) return; // ya completo y planificado — nada que recordar
   const questionDate = record.lastQuestion?.date || null;
   if (!questionDate || (await alreadyRemindedForQuestion(categoria, record.packId, questionDate))) return;
 
-  const { complete, missing } = await extractFn(record.messages, process.env.GEMINI_API_KEY);
+  const { complete, missing } = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
   const totalFields = Object.keys(fieldLabels).length;
   // Ni completo (no hay nada que recordar) ni en cero (el cliente todavía no
   // contestó nada — insistir antes de que responda algo sería puro spam):
@@ -1999,6 +2007,7 @@ async function sendFacturaFirstContact() {
 // nueva (AUTOMATION_REMINDERS_ENABLED, que nunca llegó a usarse en producción).
 async function sendAutomationReminders() {
   if (process.env.AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED !== 'true') return;
+  const { access_token: token } = await getAccessToken();
   const cache = await loadCache();
   const candidates = Object.values(cache.packs)
     .map((p) => p.record)
@@ -2019,6 +2028,7 @@ async function sendAutomationReminders() {
       extractFn: extractRefacturaData,
       buildText: buildRefacturaReminderText,
       label: 'Automatización (datos de refactura faltantes)',
+      token,
     });
   });
 }
@@ -2191,6 +2201,7 @@ function checkAutomationSecret(req, res) {
 }
 
 async function findPendingForCategory({ categoria, askPatterns, extractFn }) {
+  const { access_token: token } = await getAccessToken();
   const cache = await loadCache();
   const candidates = Object.values(cache.packs)
     .map((p) => p.record)
@@ -2199,7 +2210,7 @@ async function findPendingForCategory({ categoria, askPatterns, extractFn }) {
   const results = [];
   await mapWithConcurrency(candidates, 3, async (record) => {
     if (await isAlreadyPlanned(categoria, record.packId)) return;
-    const { complete, data } = await extractFn(record.messages, process.env.GEMINI_API_KEY);
+    const { complete, data } = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
     if (!complete) return;
     results.push({
       packId: record.packId,
