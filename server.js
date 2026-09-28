@@ -886,7 +886,14 @@ async function runSyncInner() {
         shippingSettled: r.shippingSettled,
         shippingChecked: true,
       },
-      record: r,
+      // El spread de cache.packs[r.packId]?.record primero, y r encima: syncPack/
+      // syncPackById nunca devuelven draftAnswer/answeredBy/wasEdited (esos los
+      // pone attachDrafts o una respuesta manual/automática, no el sync) — sin
+      // conservarlos aquí, el guardado en bloque de abajo (que ahora corre ANTES
+      // de attachDrafts, ver comentario de más abajo) borraría el borrador que ya
+      // existiera de antes de este ciclo cada vez que este pack se vuelva a
+      // sincronizar, aunque nadie haya hecho una pregunta nueva.
+      record: { ...(cache.packs[r.packId]?.record || {}), ...r },
     };
     touched.add(r.packId);
   });
@@ -1021,8 +1028,23 @@ async function runSyncInner() {
 // El sync completo toca (potencialmente) todos los packs a la vez, así que necesita
 // el lock global — si dos ciclos corrieran encimados, el que termine después podría
 // pisar drafts que el otro acababa de generar.
+//
+// A pedido de Alan (2026-09-28, caso real: a "Antonio Rodríguez", "Marco Delgado" y
+// varios más dejó de salirles el borrador de un momento a otro): este lock duraba
+// solo 90 segundos, pero un ciclo completo (sincronizar + automatizaciones +
+// generar borradores de IA para todos los pendientes) ya podía tardar varios
+// minutos incluso antes de este bug (ver caso real de "COMO FACTURO", 3 minutos
+// solo para llegar a la automatización de factura). Con el lock expirando a
+// mitad de un ciclo, el siguiente tick del cron (cada ~2 min) alcanzaba a tomar
+// el lock y arrancaba un SEGUNDO ciclo encimado con el primero — y el guardado en
+// bloque adelantado que se agregó hoy (ver runSyncInner) sobrescribía con una
+// copia sin borrador el que el otro ciclo, unos segundos antes, ya había
+// generado y guardado, borrándolo de la nada. Se sube a 5 minutos: de sobra para
+// el peor caso real observado, y sigue siendo corto si el proceso se cae a medias
+// (Coolify hace un redeploy, por ejemplo) — el sync se queda "atorado" ese rato
+// nada más, y se recupera solo en el siguiente tick del cron una vez expira.
 function runSync() {
-  return withLock('lock:ml:sync', 90000, runSyncInner);
+  return withLock('lock:ml:sync', 300000, runSyncInner);
 }
 
 async function getPackEntryOrThrow(packId) {
