@@ -1986,12 +1986,15 @@ async function sendAutomatedMessage(packId, text, label) {
   await bumpAnswerCount(label, now);
 }
 
-async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, extractFn, buildText, label, token }) {
+// Agrupa las condiciones que deciden si un pack todavía califica para el
+// recordatorio de esta categoría — se evalúan sobre un record recién refrescado
+// (ver remindOneCategory de abajo), nunca sobre la foto vieja de loadCache().
+function reminderStillApplies(record, categoria, askPatterns) {
   // A pedido de Alan (2026-09-25): el recordatorio de envío solo aplica a pedidos
   // "Acordar con el vendedor" — en el resto de los tipos de envío no hace falta
   // coordinar nada directo con el cliente.
-  if (categoria === 'envio_acordado' && record.shippingStatusLabel !== 'Acordar con el vendedor') return;
-  if (!vendorAskedFor(record.messages, askPatterns)) return;
+  if (categoria === 'envio_acordado' && record.shippingStatusLabel !== 'Acordar con el vendedor') return false;
+  if (!vendorAskedFor(record.messages, askPatterns)) return false;
   // La factura ya se entregó (PDF real adjunto, no solo el aviso de "procedemos
   // con la facturación") — no tiene caso seguir pidiendo datos que ya no importan,
   // sin importar qué escriba el cliente después (aunque sea solo un "gracias").
@@ -1999,13 +2002,35 @@ async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, 
   // Caso real: Diana Karina Sánchez Hernández, 2026-09-25 — la factura ya se había
   // mandado el 21 sep, y el recordatorio se disparó de nuevo el 25 sep solo porque
   // el cliente escribió "gracias, excelente noche".
-  if (categoria === 'refactura' && vendorSentFacturaPdf(record.messages)) return;
+  if (categoria === 'refactura' && vendorSentFacturaPdf(record.messages)) return false;
   // Mismo criterio para envío: si el vendedor ya confirmó que el envío está en
   // proceso o ya compartió la guía, ese pendiente quedó resuelto.
-  if (categoria === 'envio_acordado' && vendorConfirmedEnvioAcordado(record.messages)) return;
-  if (await isAlreadyPlanned(categoria, record.packId)) return; // ya completo y planificado — nada que recordar
+  if (categoria === 'envio_acordado' && vendorConfirmedEnvioAcordado(record.messages)) return false;
+  return true;
+}
+
+async function remindOneCategory(packId, token, cache, { categoria, askPatterns, fieldLabels, extractFn, buildText, label }) {
+  // Caso real (Mario Moriyama, 2026-09-28): el cliente mandó el PDF de su
+  // constancia + una foto de un correo en el mismo minuto en que salió el
+  // recordatorio, y el recordatorio le volvió a pedir RFC/código postal/régimen
+  // fiscal como si no hubiera mandado nada — mismo bug de fondo que ya se
+  // corrigió para sendFacturaFirstContactForRecord (el candidato venía de la foto
+  // de loadCache() tomada al inicio del ciclo, ya desactualizada para cuando le
+  // tocaba turno a este pack). Por eso ya no se decide nada sobre un record viejo:
+  // se vuelve a sincronizar este pack en particular contra Mercado Libre antes de
+  // evaluar o extraer nada.
+  let record;
+  try {
+    record = await syncPackById(token, packId, cache, cache.packs[packId]?.record?.unreadCount || 0);
+  } catch (err) {
+    console.warn(`[automation] no se pudo refrescar el pack antes de evaluar recordatorio (${categoria})`, packId, err.message);
+    return;
+  }
+  if (record.status !== 'pendiente') return;
+  if (!reminderStillApplies(record, categoria, askPatterns)) return;
+  if (await isAlreadyPlanned(categoria, packId)) return; // ya completo y planificado — nada que recordar
   const questionDate = record.lastQuestion?.date || null;
-  if (!questionDate || (await alreadyRemindedForQuestion(categoria, record.packId, questionDate))) return;
+  if (!questionDate || (await alreadyRemindedForQuestion(categoria, packId, questionDate))) return;
 
   const { data } = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
   // No confiamos ciegamente en el resultado de ESTA corrida para decidir qué falta
@@ -2013,8 +2038,8 @@ async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, 
   // junto a CONFIRMED_FIELDS_KEY). Así, un dato ya confirmado nunca se le vuelve a
   // pedir al cliente, ni siquiera si Gemini es inconsistente entre una corrida y
   // otra o si el adjunto original ya salió de la ventana de los últimos 4 archivos.
-  await addConfirmedFields(categoria, record.packId, Object.keys(data));
-  const confirmed = await getConfirmedFields(categoria, record.packId);
+  await addConfirmedFields(categoria, packId, Object.keys(data));
+  const confirmed = await getConfirmedFields(categoria, packId);
   const missing = Object.keys(fieldLabels).filter((key) => !confirmed.has(key));
   const totalFields = Object.keys(fieldLabels).length;
   // Ni completo (no hay nada que recordar) ni en cero (el cliente todavía no
@@ -2022,11 +2047,29 @@ async function remindOneCategory(record, { categoria, askPatterns, fieldLabels, 
   // recordamos solo el caso de en medio, datos parciales.
   if (missing.length === 0 || missing.length >= totalFields) return;
 
+  // Segunda sincronización justo antes de mandar: extractFn (Gemini) también
+  // tarda, y en ese rato el cliente pudo haber mandado justo el dato que le
+  // íbamos a decir que le faltaba. En vez de gastar otra llamada a Gemini
+  // re-extrayendo, si el hilo cambió desde el refresco de arriba simplemente no
+  // se manda nada en este ciclo — se vuelve a evaluar, ya con ese mensaje adentro,
+  // en el siguiente (~2 min después), en vez de arriesgarse a mandar un
+  // recordatorio pidiendo un dato que ya se acaba de dar.
+  let freshRecord;
   try {
-    await withLock(`lock:pack:${record.packId}`, 30000, () => sendAutomatedMessage(record.packId, buildText(missing), label));
-    await markReminded(categoria, record.packId, questionDate);
+    freshRecord = await syncPackById(token, packId, cache, record.unreadCount || 0);
   } catch (err) {
-    console.warn(`[automation] no se pudo mandar recordatorio (${categoria}) del pack`, record.packId, err.message);
+    console.warn(`[automation] no se pudo refrescar el pack justo antes de mandar recordatorio (${categoria})`, packId, err.message);
+    return;
+  }
+  if (freshRecord.messages.length !== record.messages.length) return;
+  if (freshRecord.status !== 'pendiente') return;
+  if (await isAlreadyPlanned(categoria, packId)) return;
+
+  try {
+    await withLock(`lock:pack:${packId}`, 30000, () => sendAutomatedMessage(packId, buildText(missing), label));
+    await markReminded(categoria, packId, questionDate);
+  } catch (err) {
+    console.warn(`[automation] no se pudo mandar recordatorio (${categoria}) del pack`, packId, err.message);
   }
 }
 
@@ -2192,20 +2235,24 @@ async function sendAutomationReminders() {
 
   const { access_token: token } = await getAccessToken();
   const cache = await loadCache();
-  const candidates = Object.values(cache.packs)
+  // Solo se usa esta foto de loadCache() para elegir CUÁLES packs revisar (barato,
+  // sin llamadas a la API) — remindOneCategory vuelve a sincronizar cada uno
+  // contra Mercado Libre antes de decidir nada (ver su propia definición), así que
+  // no importa que esta lista se vaya quedando desactualizada mientras corre el lote.
+  const packIds = Object.values(cache.packs)
     .map((p) => p.record)
-    .filter((r) => r && r.status === 'pendiente');
+    .filter((r) => r && r.status === 'pendiente')
+    .map((r) => r.packId);
 
-  await mapWithConcurrency(candidates, 3, async (record) => {
+  await mapWithConcurrency(packIds, 3, async (packId) => {
     if (facturaEnabled) {
-      await remindOneCategory(record, {
+      await remindOneCategory(packId, token, cache, {
         categoria: 'refactura',
         askPatterns: REFACTURA_ASK_PATTERNS,
         fieldLabels: REFACTURA_FIELD_LABELS,
         extractFn: extractRefacturaData,
         buildText: buildRefacturaReminderText,
         label: 'Automatización (datos de refactura faltantes)',
-        token,
       });
     }
     if (envioEnabled) {
@@ -2215,14 +2262,13 @@ async function sendAutomationReminders() {
       // plantilla fija sin distinguir qué faltaba; ahora que remindOneCategory ya
       // lista dinámicamente los datos puntuales que siguen pendientes (igual que
       // refactura), se reactiva con ese mismo criterio, más robusto.
-      await remindOneCategory(record, {
+      await remindOneCategory(packId, token, cache, {
         categoria: 'envio_acordado',
         askPatterns: ENVIO_ACORDADO_ASK_PATTERNS,
         fieldLabels: ENVIO_ACORDADO_FIELD_LABELS,
         extractFn: extractEnvioAcordadoData,
         buildText: buildEnvioAcordadoReminderText,
         label: 'Automatización (datos de envío faltantes)',
-        token,
       });
     }
   });
