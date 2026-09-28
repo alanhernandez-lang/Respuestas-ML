@@ -752,9 +752,7 @@ const MESSAGES_BACKFILL_VERSION = 3;
 
 // El borrador de IA sigue siendo válido mientras nadie haya hecho una pregunta
 // nueva desde que se generó, así que solo se regenera cuando cambia lastQuestion.
-// `touched` acumula los packIds que de verdad cambiaron este ciclo, para que
-// runSync() solo reescriba esos en Redis (no los ~170 completos cada vez).
-async function attachDrafts(packs, token, touched) {
+async function attachDrafts(packs, token) {
   const pendingEntries = Object.values(packs).filter((p) => p.record.status === 'pendiente');
   if (!pendingEntries.length) return;
 
@@ -766,10 +764,15 @@ async function attachDrafts(packs, token, touched) {
   let fresh = 0;
   let ok = 0;
   let failed = 0;
-  // OJO: este mapWithConcurrency debe correr SIEMPRE para TODOS los pendientes, incluso
-  // cuando nadie necesita un borrador nuevo — es el único lugar donde se copia el
-  // draftAnswer ya generado hacia el objeto `record` fresco de este ciclo. Si se salta,
-  // el borrador se "pierde" (queda undefined) aunque nunca haya dejado de ser válido.
+  // A pedido de Alan (2026-09-28): esta función ya guarda cada borrador por su
+  // cuenta (antes dejaba el draftAnswer escrito sobre el `record` en memoria y
+  // dependía de que el llamador hiciera un guardado en bloque al final) — así las
+  // automatizaciones que mandan mensajes reales (ver runSyncInner) ya no tienen
+  // que esperar a que esto termine de generar borradores de IA para TODOS los
+  // pendientes de la cuenta antes de poder correr, y de paso este guardado por
+  // pack ya no arriesga pisar con una foto vieja algo que otra cosa haya cambiado
+  // mientras corría generateDraftAnswer (mismo patrón que ya usan
+  // pastMediationCandidates/mediationWatchCandidates en runSyncInner).
   await mapWithConcurrency(pendingEntries, 3, async (entry) => {
     const record = entry.record;
     const questionDate = record.lastQuestion?.date || null;
@@ -777,15 +780,18 @@ async function attachDrafts(packs, token, touched) {
     // un sync completo puede tardar bastante procesando cientos de packs, y si
     // alguien le daba "Regenerar" o editaba el borrador a mano justo en esa ventana,
     // comparar contra la foto vieja terminaba pisando ese cambio reciente con el
-    // valor de antes, como si el botón "no hubiera hecho nada".
+    // valor de antes, como si el botón "no hubiera hecho nada". También sirve para
+    // no perder el tiempo generando un borrador para un pack que, en el rato que
+    // llevaba este ciclo, alguna automatización u otra persona ya dejó "respondido".
     const currentEntry = await loadPackEntry(record.packId);
-    const previousDraft = currentEntry?.record?.draftAnswer;
+    if (!currentEntry || currentEntry.record.status !== 'pendiente') return;
+    const previousDraft = currentEntry.record.draftAnswer;
     const isFresh = previousDraft && !previousDraft.error && previousDraft.forQuestionDate === questionDate;
     if (isFresh) {
-      record.draftAnswer = previousDraft;
       fresh++;
       return;
     }
+    let draftAnswer;
     try {
       const { text, imagesExcluded, flags } = await generateDraftAnswer({
         buyerName: record.buyerName,
@@ -797,17 +803,24 @@ async function attachDrafts(packs, token, touched) {
         isFull: record.isFull,
         shippingStatusLabel: record.shippingStatusLabel,
       });
-      record.draftAnswer = { text, generatedAt: new Date().toISOString(), forQuestionDate: questionDate, imagesExcluded, flags };
+      draftAnswer = { text, generatedAt: new Date().toISOString(), forQuestionDate: questionDate, imagesExcluded, flags };
       if (flags && flags.length) {
         console.warn(`Borrador IA del pack ${record.packId} marcado para revisar (${flags.join(', ')})`);
       }
       ok++;
     } catch (err) {
       console.warn('Error generando borrador IA para pack', record.packId, err.message);
-      record.draftAnswer = { error: err.message, forQuestionDate: questionDate };
+      draftAnswer = { error: err.message, forQuestionDate: questionDate };
       failed++;
     }
-    touched.add(record.packId);
+    // Se relee justo antes de escribir (no el currentEntry de arriba, que ya tiene
+    // un rato) — generateDraftAnswer también tarda, y en ese rato alguien pudo
+    // haber contestado a mano o una automatización pudo haber mandado el mensaje
+    // automático.
+    const freshest = await loadPackEntry(record.packId);
+    if (!freshest || freshest.record.status !== 'pendiente') return;
+    freshest.record.draftAnswer = draftAnswer;
+    await savePackEntry(record.packId, freshest);
   });
   if (ok > 0 || failed > 0) console.log(`Borradores IA: ${ok} generados, ${failed} con error, ${fresh} ya estaban al día.`);
 }
@@ -878,18 +891,51 @@ async function runSyncInner() {
     touched.add(r.packId);
   });
 
+  // A pedido de Alan (2026-09-28): este guardado en bloque se adelantó — antes
+  // corría hasta el final del ciclo (después de generar borradores de IA para
+  // TODOS los pendientes de la cuenta), y las automatizaciones de abajo tenían
+  // que esperar a que eso terminara para poder correr sin arriesgarse a leer un
+  // Redis desactualizado (ver el comentario que tenían junto a su llamada antes
+  // de moverse aquí). Guardando esto de inmediato, las automatizaciones ya pueden
+  // correr enseguida (ver más abajo) sin esperar la parte más lenta del ciclo, y
+  // el resto de los guardados de este ciclo (mediación, borradores) ya son todos
+  // por pack, leyendo su propia copia fresca antes de escribir, así que no
+  // necesitan este bloque para nada.
+  if (touched.size) {
+    const toWrite = {};
+    touched.forEach((id) => { toWrite[id] = packs[id]; });
+    await savePacksBulk(toWrite);
+  }
+
+  // A pedido explícito de Alan (2026-09-28, caso real: "COMO FACTURO" tardó 3
+  // minutos en vez de ~2 porque la automatización de factura tenía que esperar a
+  // que attachDrafts generara el borrador de TODAS las demás conversaciones
+  // pendientes de la cuenta antes de siquiera llegar a evaluar esta) — las
+  // automatizaciones que mandan mensajes reales corren aquí, justo después de
+  // guardar lo recién sincronizado, ANTES de la parte más lenta del ciclo
+  // (chequeos de mediación y generación de borradores de IA para revisión
+  // humana). Ya pueden correr aquí sin la condición de carrera que antes obligaba
+  // a ponerlas al final: el guardado en bloque de arriba ya dejó a Redis al día, y
+  // todo lo que sigue (mediación, borradores) se guarda por pack leyendo su
+  // propia copia fresca, así que nada de lo de abajo puede pisarle encima a un
+  // mensaje automático mandado aquí.
+  await sendAutomationReminders().catch((err) => console.error('[automation] error inesperado mandando recordatorios:', err.message));
+  await sendFirstContactForAgreedShipping().catch((err) => console.error('[automation] error inesperado mandando primer contacto:', err.message));
+  await sendFacturaFirstContact().catch((err) => console.error('[automation] error inesperado mandando primer contacto de factura:', err.message));
+
   // Igual que el refresco de arriba, pero para el historial de mediaciones YA
   // cerradas (ver checkPastMediation) — nunca se re-consulta dos veces el mismo
   // pack, así que este lote solo cubre lo que todavía no se había revisado ni una
   // vez, y termina agotándose sin quedar dando vueltas para siempre.
   //
-  // A propósito esto NO pasa por el `touched`/savePacksBulk de abajo: este lote
-  // puede tocar packs "respondido" (que el resto del sync ya no vuelve a
-  // sincronizar nunca) y con `packs` siendo una foto tomada al inicio del ciclo
-  // (hasta 90s de por medio), un savePacksBulk con esa foto podría pisar una
-  // respuesta recién publicada o un borrador recién editado por alguien del
-  // equipo mientras corría este mismo ciclo. Por eso cada pack se guarda aparte,
-  // leyendo su valor más fresco de Redis justo antes de escribir.
+  // A propósito esto NO pasa por un guardado en bloque: este lote puede tocar
+  // packs "respondido" (que el resto del sync ya no vuelve a sincronizar nunca) y
+  // con `packs` siendo una foto tomada al inicio del ciclo (que para este punto ya
+  // puede tener bastante rato encima, entre la API de Mercado Libre y las
+  // automatizaciones de arriba), guardar esa foto podría pisar una respuesta
+  // recién publicada o un borrador recién editado por alguien del equipo mientras
+  // corría este mismo ciclo. Por eso cada pack se guarda aparte, leyendo su valor
+  // más fresco de Redis justo antes de escribir.
   const pastMediationCandidates = Object.values(packs)
     .filter((p) => p.record.status !== 'mediacion' && !p.record.pastMediationChecked)
     .slice(0, PAST_MEDIATION_CHECK_BATCH);
@@ -961,28 +1007,13 @@ async function runSyncInner() {
     }
   });
 
-  await attachDrafts(packs, token, touched);
+  // attachDrafts ya no depende de un guardado en bloque al final (ver su propia
+  // definición) — guarda cada borrador por su cuenta, así que las automatizaciones
+  // de arriba no tienen que esperarlo para poder correr.
+  await attachDrafts(packs, token);
 
-  if (touched.size) {
-    const toWrite = {};
-    touched.forEach((id) => { toWrite[id] = packs[id]; });
-    await savePacksBulk(toWrite);
-  }
   const syncedAt = new Date().toISOString();
   await saveMeta({ syncedAt });
-
-  // Corre DESPUÉS de que todo lo de arriba ya se guardó (savePacksBulk) — lee su
-  // propia copia fresca de Redis en vez de reusar `packs`/`touched` de este ciclo,
-  // para no arriesgarse a que el guardado en bloque de arriba pise con datos viejos
-  // lo que esto vaya escribiendo (envía mensajes de verdad, no puede permitirse esa
-  // condición de carrera). Ver comentario junto a su definición.
-  await sendAutomationReminders().catch((err) => console.error('[automation] error inesperado mandando recordatorios:', err.message));
-  // Misma razón que el de arriba: descubre y guarda packs nuevos por su cuenta
-  // (ventas sin ningún mensaje todavía), así que corre aparte del resto del ciclo.
-  await sendFirstContactForAgreedShipping().catch((err) => console.error('[automation] error inesperado mandando primer contacto:', err.message));
-  // Independiente de sendAutomationReminders() a propósito (ver comentario junto a
-  // su definición) — se apaga con su propia variable de entorno.
-  await sendFacturaFirstContact().catch((err) => console.error('[automation] error inesperado mandando primer contacto de factura:', err.message));
 
   return { syncedAt, totalPacks: Object.keys(packs).length, errors };
 }
