@@ -2003,8 +2003,12 @@ async function markFacturaFirstContactHandled(packId, questionDate) {
   });
 }
 
-async function sendFacturaFirstContactForRecord(record) {
-  if (process.env.AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED !== 'true') return;
+// Agrupa las condiciones que deciden si un pack todavía califica para el primer
+// contacto automático de factura — se evalúan DOS veces sobre el MISMO record (ver
+// sendFacturaFirstContactForRecord de abajo), una vez recién refrescado y otra vez
+// con un refresco todavía más nuevo justo antes de mandar, así que viven en un solo
+// lugar para que las dos evaluaciones nunca se desalineen entre sí.
+function facturaFirstContactStillApplies(record) {
   // Caso real (2026-09-24, casos de Jose Manuel Trejo Medellin y Laura Marcela Ruiz
   // Leos): en pedidos "Acordar con el vendedor" es muy común que el cliente pida su
   // factura Y necesite coordinar el envío en el mismo mensaje o mensajes seguidos —
@@ -2014,13 +2018,13 @@ async function sendFacturaFirstContactForRecord(record) {
   // sin tocar el envío — mandarla aquí dejaría el tema de envío sin resolver y sin
   // que nadie se entere. Por eso, en estos pedidos, nunca se manda automático: se
   // deja pasar siempre a revisión humana.
-  if (record.shippingStatusLabel === 'Acordar con el vendedor') return;
+  if (record.shippingStatusLabel === 'Acordar con el vendedor') return false;
   // clientMentionedFactura revisa TODOS los mensajes del cliente, no solo el más
   // reciente — antes esto solo miraba record.lastQuestion, así que si el cliente
   // mencionaba "factura" en un mensaje y agregaba algo más en uno seguido (antes de
   // que nadie contestara), el prefiltro nunca lo detectaba y esta automatización
   // ni siquiera evaluaba el caso.
-  if (!clientMentionedFactura(record.messages)) return;
+  if (!clientMentionedFactura(record.messages)) return false;
   // A pedido explícito de Alan (2026-09-24): esta plantilla SOLO es para el mensaje
   // simple ("me pueden facturar", "necesito facturar"), nunca cuando el cliente ya
   // mandó algún dato (aunque sea uno) o adjuntó una foto/PDF — eso se deja siempre
@@ -2029,11 +2033,34 @@ async function sendFacturaFirstContactForRecord(record) {
   // abajo (detectsFirstFacturaRequest) porque un adjunto sin texto no siempre se lo
   // describe bien a la IA, y esto es más barato/confiable que depender solo de ella.
   // Igual que arriba, se revisan TODOS los mensajes del cliente, no solo el último.
-  if (record.messages.some((m) => m.sender === 'cliente' && m.hasAttachment)) return;
+  if (record.messages.some((m) => m.sender === 'cliente' && m.hasAttachment)) return false;
   // El vendedor ya pidió estos datos antes en este hilo (misma señal que usa el
   // recordatorio de refactura de abajo) — entonces esta ya no es la primera vez.
-  if (vendorAskedFor(record.messages, REFACTURA_ASK_PATTERNS)) return;
-  if (await isFacturaFirstContactHandled(record.packId)) return;
+  if (vendorAskedFor(record.messages, REFACTURA_ASK_PATTERNS)) return false;
+  return true;
+}
+
+async function sendFacturaFirstContactForRecord(packId, token, cache) {
+  if (process.env.AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED !== 'true') return;
+  if (await isFacturaFirstContactHandled(packId)) return;
+
+  // Caso real (Norma Elia Chapa, 2026-09-27): sendFacturaFirstContact() arma sus
+  // candidatos a partir de UN solo loadCache() tomado al principio del ciclo (cada
+  // 2 minutos) — si el cliente manda el PDF/CFDI que le faltaba mientras este pack
+  // espera su turno en mapWithConcurrency, o mientras corre la llamada a Gemini de
+  // más abajo, esta automatización nunca se entera y termina pidiendo de nuevo
+  // datos que ya dio. Por eso ya no se decide nada sobre el record de esa foto
+  // vieja: se vuelve a sincronizar este pack en particular contra Mercado Libre
+  // (igual que ya hace sendFirstContactForAgreedShipping) antes de evaluar nada.
+  let record;
+  try {
+    record = await syncPackById(token, packId, cache, cache.packs[packId]?.record?.unreadCount || 0);
+  } catch (err) {
+    console.warn('[automation] no se pudo refrescar el pack antes de evaluar factura', packId, err.message);
+    return;
+  }
+  if (record.status !== 'pendiente') return;
+  if (!facturaFirstContactStillApplies(record)) return;
   const questionDate = record.lastQuestion?.date || null;
   if (!questionDate) return;
 
@@ -2046,11 +2073,28 @@ async function sendFacturaFirstContactForRecord(record) {
   }
   if (!asksForFactura) return;
 
+  // Segunda sincronización, justo antes de mandar: la llamada a Gemini de arriba
+  // también tarda un rato, y en ese rato el cliente pudo haber mandado los datos
+  // que le faltaban (mismo motivo que el refresco de arriba, ventana de carrera
+  // distinta pero igual de real).
+  let freshRecord;
   try {
-    await withLock(`lock:pack:${record.packId}`, 30000, () => sendAutomatedMessage(record.packId, FACTURA_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — solicitud de factura)'));
-    await markFacturaFirstContactHandled(record.packId, questionDate);
+    freshRecord = await syncPackById(token, packId, cache, record.unreadCount || 0);
   } catch (err) {
-    console.warn('[automation] no se pudo mandar el primer contacto (factura) del pack', record.packId, err.message);
+    console.warn('[automation] no se pudo refrescar el pack justo antes de mandar (factura)', packId, err.message);
+    return;
+  }
+  if (freshRecord.status !== 'pendiente') return;
+  if (!facturaFirstContactStillApplies(freshRecord)) return;
+  if (await isFacturaFirstContactHandled(packId)) return;
+  const finalQuestionDate = freshRecord.lastQuestion?.date || null;
+  if (!finalQuestionDate) return;
+
+  try {
+    await withLock(`lock:pack:${packId}`, 30000, () => sendAutomatedMessage(packId, FACTURA_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — solicitud de factura)'));
+    await markFacturaFirstContactHandled(packId, finalQuestionDate);
+  } catch (err) {
+    console.warn('[automation] no se pudo mandar el primer contacto (factura) del pack', packId, err.message);
   }
 }
 
@@ -2063,11 +2107,17 @@ async function sendFacturaFirstContactForRecord(record) {
 // loadCache() completo cuando está apagada.
 async function sendFacturaFirstContact() {
   if (process.env.AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED !== 'true') return;
+  const { access_token: token } = await getAccessToken();
   const cache = await loadCache();
-  const candidates = Object.values(cache.packs)
+  // Solo se usa esta foto de loadCache() para elegir CUÁLES packs revisar (barato,
+  // sin llamadas a la API) — sendFacturaFirstContactForRecord vuelve a sincronizar
+  // cada uno contra Mercado Libre antes de decidir nada, así que no importa que
+  // esta lista se vaya quedando desactualizada mientras corre el lote.
+  const packIds = Object.values(cache.packs)
     .map((p) => p.record)
-    .filter((r) => r && r.status === 'pendiente');
-  await mapWithConcurrency(candidates, 3, (record) => sendFacturaFirstContactForRecord(record));
+    .filter((r) => r && r.status === 'pendiente')
+    .map((r) => r.packId);
+  await mapWithConcurrency(packIds, 3, (packId) => sendFacturaFirstContactForRecord(packId, token, cache));
 }
 
 // Apagado por default a propósito: esto manda mensajes reales al cliente en
