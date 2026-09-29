@@ -2412,6 +2412,7 @@ async function sendFirstContactForAgreedShipping() {
         record,
       });
       let facturaPartFailed = false;
+      let facturaPartSkipped = false;
       await withLock(`lock:pack:${packId}`, 30000, async () => {
         await sendAutomatedMessage(packId, ENVIO_ACORDADO_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — envío acordado)');
         // Caso real (2026-09-24): el cliente ya pidió factura en el mismo mensaje
@@ -2425,23 +2426,48 @@ async function sendFirstContactForAgreedShipping() {
         // pedir y nadie se enteraría. Por eso se reintenta un par de veces antes de
         // rendirse, en vez de un solo intento.
         if (category === 'envio_y_factura') {
-          const maxAttempts = 3;
-          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-              await sendAutomatedMessage(packId, FACTURA_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — solicitud de factura)');
-              break;
-            } catch (err) {
-              if (attempt === maxAttempts) {
-                facturaPartFailed = true;
-                console.warn('[automation] se mandó el envío pero falló el de factura (reintentado) para el pack', packId, err.message);
-              } else {
-                await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+          // A pedido de Alan (2026-09-29, revisión preventiva sin caso real
+          // todavía — misma familia que Norma Elia Chapa/Mario Moriyama, pero una
+          // ventana mucho más angosta): entre el classifyAgreedShippingFirstContact
+          // de arriba y este punto ya pasó una llamada a Gemini más el envío del
+          // mensaje de envío — si el cliente mandó algo nuevo justo en esa ventana
+          // (p. ej. adjuntó su constancia fiscal sin que nadie se la pidiera
+          // todavía), mandar la plantilla genérica de factura encima ya no sería lo
+          // más acertado. Se revisa una vez más contra Mercado Libre justo antes: si
+          // algo cambió, se deja pasar sin mandar este segundo mensaje —
+          // sendFacturaFirstContact() (ya con su propia protección contra esta misma
+          // carrera) lo vuelve a evaluar con datos frescos en el siguiente ciclo, en
+          // vez de arriesgarse a pedir un dato que el cliente ya acaba de dar.
+          let freshForFactura;
+          try {
+            freshForFactura = await syncPackById(token, packId, cache, 0);
+          } catch {
+            freshForFactura = null;
+          }
+          const somethingChanged = !freshForFactura
+            || freshForFactura.messages.length !== record.messages.length
+            || freshForFactura.messages.some((m) => m.sender === 'cliente' && m.hasAttachment);
+          if (somethingChanged) {
+            facturaPartSkipped = true;
+          } else {
+            const maxAttempts = 3;
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+              try {
+                await sendAutomatedMessage(packId, FACTURA_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — solicitud de factura)');
+                break;
+              } catch (err) {
+                if (attempt === maxAttempts) {
+                  facturaPartFailed = true;
+                  console.warn('[automation] se mandó el envío pero falló el de factura (reintentado) para el pack', packId, err.message);
+                } else {
+                  await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+                }
               }
             }
           }
         }
       });
-      if (category === 'envio_y_factura' && !facturaPartFailed) sentAmbas++; else sentEnvio++;
+      if (category === 'envio_y_factura' && !facturaPartFailed && !facturaPartSkipped) sentAmbas++; else sentEnvio++;
       await markFirstContactHandled(packId);
     } catch (err) {
       console.warn('[automation] no se pudo mandar el primer contacto (envío acordado) del pack', packId, err.message);
