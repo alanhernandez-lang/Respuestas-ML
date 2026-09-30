@@ -2166,15 +2166,6 @@ function facturaFirstContactStillApplies(record) {
   // que nadie contestara), el prefiltro nunca lo detectaba y esta automatización
   // ni siquiera evaluaba el caso.
   if (!clientMentionedFactura(record.messages)) return false;
-  // A pedido explícito de Alan (2026-09-24): esta plantilla SOLO es para el mensaje
-  // simple ("me pueden facturar", "necesito facturar"), nunca cuando el cliente ya
-  // mandó algún dato (aunque sea uno) o adjuntó una foto/PDF — eso se deja siempre
-  // como borrador para que alguien lo revise a mano, la plantilla genérica volvería
-  // a pedir datos que ya dio. Chequeo determinístico aparte del que hace Gemini más
-  // abajo (detectsFirstFacturaRequest) porque un adjunto sin texto no siempre se lo
-  // describe bien a la IA, y esto es más barato/confiable que depender solo de ella.
-  // Igual que arriba, se revisan TODOS los mensajes del cliente, no solo el último.
-  if (record.messages.some((m) => m.sender === 'cliente' && m.hasAttachment)) return false;
   // El vendedor ya pidió estos datos antes en este hilo (misma señal que usa el
   // recordatorio de refactura de abajo) — entonces esta ya no es la primera vez.
   if (vendorAskedFor(record.messages, REFACTURA_ASK_PATTERNS)) return false;
@@ -2214,10 +2205,42 @@ async function sendFacturaFirstContactForRecord(packId, token, cache) {
   }
   if (!asksForFactura) return;
 
-  // Segunda sincronización, justo antes de mandar: la llamada a Gemini de arriba
-  // también tarda un rato, y en ese rato el cliente pudo haber mandado los datos
-  // que le faltaban (mismo motivo que el refresco de arriba, ventana de carrera
-  // distinta pero igual de real).
+  // A pedido explícito de Alan (2026-09-30, caso real: Salvador Reyes): antes,
+  // CUALQUIER adjunto del cliente en su primer mensaje hacía que esto se
+  // abstuviera siempre y dejara pasar el caso a revisión humana, por miedo a que
+  // la plantilla genérica volviera a pedir un dato que ya venía en la foto/PDF.
+  // Ahora que extractRefacturaData ya lee adjuntos de forma confiable (ver su
+  // propio comentario en lib/agent.js), en vez de abstenerse se extrae lo que ya
+  // trae el adjunto y se manda la plantilla que corresponda:
+  //   - si no queda NADA pendiente, se deja pasar a revisión humana igual (no hay
+  //     nada que automatizar: ya se dio todo, no hace falta pedir nada).
+  //   - si falta ALGO pero no todo, se manda el recordatorio dinámico con
+  //     exactamente lo que falta (no la plantilla genérica completa).
+  //   - si el adjunto no trajo ningún dato útil (missing === todos los campos),
+  //     se manda la plantilla genérica de siempre, igual que si no hubiera
+  //     adjuntado nada.
+  let textToSend = FACTURA_FIRST_CONTACT_TEXT;
+  let label = 'Automatización (primer contacto — solicitud de factura)';
+  const totalFields = Object.keys(REFACTURA_FIELD_LABELS).length;
+  if (record.messages.some((m) => m.sender === 'cliente' && m.hasAttachment)) {
+    const { data } = await extractRefacturaData(record.messages, token, process.env.GEMINI_API_KEY);
+    await addConfirmedFields('refactura', packId, Object.keys(data));
+    const confirmed = await getConfirmedFields('refactura', packId);
+    const missing = Object.keys(REFACTURA_FIELD_LABELS).filter((key) => !confirmed.has(key));
+    if (missing.length === 0) return;
+    if (missing.length < totalFields) {
+      textToSend = buildRefacturaReminderText(missing);
+      label = 'Automatización (primer contacto — datos de refactura faltantes)';
+    }
+  }
+
+  // Segunda sincronización, justo antes de mandar: tanto la clasificación de
+  // arriba como la extracción (si hubo adjunto) tardan, y en ese rato el cliente
+  // pudo haber mandado más datos (mismo motivo que el refresco de arriba, ventana
+  // de carrera distinta pero igual de real). Si el hilo cambió desde que se armó
+  // textToSend, se deja pasar sin mandar nada — como todavía no se marca
+  // "handled", el siguiente ciclo lo vuelve a evaluar completo, ya con los
+  // mensajes nuevos adentro.
   let freshRecord;
   try {
     freshRecord = await syncPackById(token, packId, cache, record.unreadCount || 0);
@@ -2225,6 +2248,7 @@ async function sendFacturaFirstContactForRecord(packId, token, cache) {
     console.warn('[automation] no se pudo refrescar el pack justo antes de mandar (factura)', packId, err.message);
     return;
   }
+  if (freshRecord.messages.length !== record.messages.length) return;
   if (freshRecord.status !== 'pendiente') return;
   if (!facturaFirstContactStillApplies(freshRecord)) return;
   if (await isFacturaFirstContactHandled(packId)) return;
@@ -2232,7 +2256,7 @@ async function sendFacturaFirstContactForRecord(packId, token, cache) {
   if (!finalQuestionDate) return;
 
   try {
-    await withLock(`lock:pack:${packId}`, 30000, () => sendAutomatedMessage(packId, FACTURA_FIRST_CONTACT_TEXT, 'Automatización (primer contacto — solicitud de factura)'));
+    await withLock(`lock:pack:${packId}`, 30000, () => sendAutomatedMessage(packId, textToSend, label));
     await markFacturaFirstContactHandled(packId, finalQuestionDate);
   } catch (err) {
     console.warn('[automation] no se pudo mandar el primer contacto (factura) del pack', packId, err.message);
