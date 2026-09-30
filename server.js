@@ -1818,6 +1818,23 @@ function vendorSentFacturaPdf(messages) {
     && (m.attachments || []).some((a) => a.kind === 'pdf'));
 }
 
+// Plantilla aprobada "Pasar a facturar" (ver RESPONSE_TEMPLATES en lib/agent.js):
+// un humano la manda cuando ya decidió que tiene lo necesario para proceder con la
+// factura, avisándole al cliente que le llega en 1 a 3 días hábiles. A propósito
+// NO cuenta como "factura entregada" para isRefacturaCandidate/el filtro de
+// Refacturas del sidebar (el PDF real todavía no se manda, sigue siendo trabajo
+// pendiente de verdad — ver comentario junto a vendorSentFacturaPdf), pero SÍ debe
+// apagar el RECORDATORIO automático de datos faltantes: un humano ya decidió que
+// tiene lo que necesita, y el bot no debe contradecirlo pidiendo de vuelta un dato
+// que ya se dio por bueno. Caso real: Azhela Del Ángel Ibarra, 2026-09-22/29 — el
+// vendedor mandó esta plantilla el 22-sep aceptando los datos como suficientes, y
+// el recordatorio automático igual volvió a pedir "Uso de CFDI" el 29-sep, sobre
+// un mensaje del cliente que ni siquiera era sobre factura (pedía la ficha técnica
+// del producto).
+function vendorHandedOffToFacturacion(messages) {
+  return (messages || []).some((m) => m.sender === 'vendedor' && /procedemos con la facturaci[oó]n/i.test(m.text || ''));
+}
+
 // Mismo criterio que REFACTURA_CLOSE_TEXT_PATTERNS, pero para envío acordado: una
 // vez que el vendedor confirma que el envío ya está en proceso o comparte el
 // número de guía (plantillas aprobadas "Después de compartir datos de envío" y
@@ -2002,7 +2019,13 @@ function reminderStillApplies(record, categoria, askPatterns) {
   // Caso real: Diana Karina Sánchez Hernández, 2026-09-25 — la factura ya se había
   // mandado el 21 sep, y el recordatorio se disparó de nuevo el 25 sep solo porque
   // el cliente escribió "gracias, excelente noche".
-  if (categoria === 'refactura' && vendorSentFacturaPdf(record.messages)) return false;
+  //
+  // vendorHandedOffToFacturacion es una señal APARTE, solo para el recordatorio
+  // (no para isRefacturaCandidate — ver su propio comentario): un humano ya dio
+  // los datos por suficientes y le avisó al cliente que procede con su factura,
+  // así que el bot ya no debe seguir pidiéndole nada de vuelta, aunque el PDF real
+  // todavía no se haya mandado.
+  if (categoria === 'refactura' && (vendorSentFacturaPdf(record.messages) || vendorHandedOffToFacturacion(record.messages))) return false;
   // Mismo criterio para envío: si el vendedor ya confirmó que el envío está en
   // proceso o ya compartió la guía, ese pendiente quedó resuelto.
   if (categoria === 'envio_acordado' && vendorConfirmedEnvioAcordado(record.messages)) return false;
@@ -2032,6 +2055,10 @@ async function remindOneCategory(packId, token, cache, { categoria, askPatterns,
   const questionDate = record.lastQuestion?.date || null;
   if (!questionDate || (await alreadyRemindedForQuestion(categoria, packId, questionDate))) return;
 
+  // Se guarda ANTES de extraer/confirmar nada más, para poder distinguir abajo si
+  // esta corrida en particular de verdad aportó algo nuevo.
+  const confirmedBefore = await getConfirmedFields(categoria, packId);
+
   const { data } = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
   // No confiamos ciegamente en el resultado de ESTA corrida para decidir qué falta
   // — se combina con todo lo que alguna vez se haya confirmado antes (ver comentario
@@ -2046,6 +2073,24 @@ async function remindOneCategory(packId, token, cache, { categoria, askPatterns,
   // contestó nada — insistir antes de que responda algo sería puro spam):
   // recordamos solo el caso de en medio, datos parciales.
   if (missing.length === 0 || missing.length >= totalFields) return;
+  // Caso real (Azhela Del Ángel Ibarra, 2026-09-29): questionDate cambia con
+  // CUALQUIER mensaje nuevo del cliente, sin importar el tema — le pidió al
+  // vendedor la ficha técnica del producto (nada que ver con su factura) y aun así
+  // se disparó el recordatorio pidiéndole de vuelta el Uso de CFDI. Si esta
+  // corrida no confirmó ningún dato que no tuviéramos ya de antes, lo más
+  // probable es que el mensaje nuevo no tenga nada que ver con lo que falta —
+  // mandar el recordatorio ahí sería un despropósito sin relación con lo que el
+  // cliente en realidad preguntó. Se deja pasar sin mandar nada (el humano que
+  // revise el borrador normal sí ve y contesta la pregunta real), y se vuelve a
+  // evaluar en el siguiente ciclo si el cliente escribe algo más.
+  const newlyConfirmed = Object.keys(data).filter((key) => !confirmedBefore.has(key));
+  if (newlyConfirmed.length === 0) {
+    // Se marca igual (sin mandar nada) para no repetir esta misma extracción de
+    // Gemini en cada ciclo mientras el cliente no vuelva a escribir — en cuanto
+    // mande un mensaje nuevo, questionDate cambia y esto se vuelve a evaluar.
+    await markReminded(categoria, packId, questionDate);
+    return;
+  }
 
   // Segunda sincronización justo antes de mandar: extractFn (Gemini) también
   // tarda, y en ese rato el cliente pudo haber mandado justo el dato que le
