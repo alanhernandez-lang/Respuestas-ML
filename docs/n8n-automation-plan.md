@@ -1,9 +1,16 @@
-# Plan de automatización con n8n (borrador, en pausa)
+# Plan de automatización con n8n (cancelado — referencia de diseño)
 
-Estado: **En pausa** — a la espera de que Alan confirme con la persona con la que
-lleva trabajando el tema de ML cómo va a arrancar la automatización (reunión
-agendada para la semana del 24 de agosto de 2026). Este documento es la base de
-diseño para retomar la conversación en ese momento, no una decisión final.
+Estado: **Cancelado el enfoque de n8n (2026-09-21)** — Alan confirmó explícitamente
+que n8n no se va a usar en este proyecto y que toda automatización se maneja dentro
+de la app ya construida (Node/Express en Coolify), no con herramientas externas
+nuevas, capitalizando el tiempo ya invertido en ella. La sección 3 (arquitectura con
+n8n como orquestador) y la sección 6 (bloqueante del conector de n8n) **ya no
+aplican**.
+
+Este documento queda como referencia de diseño: los objetivos de las secciones 2
+(filtro de confianza para auto-publicar), 4 (extracción de datos de factura) y 5
+(visibilidad de mediaciones) siguen siendo válidos si se retoman — pero
+implementados directamente en `server.js`/`lib/agent.js`, no orquestados por n8n.
 
 ## 1. Objetivo
 
@@ -39,7 +46,7 @@ OAuth, resolución de mediaciones/Full/estatus de envío, subida de adjuntos, et
 Esa lógica ya tiene meses de bugs reales corregidos uno por uno.
 
 En su lugar:
-- El Node app (hoy en Render, `respuestas-ml.onrender.com`) se queda corriendo como
+- El Node app (hoy en Coolify, `mensajes-post-venta-ml.coolify.marvelsa.com`) se queda corriendo como
   "motor" — expone por API lo que ya hace (traer mensajes, generar borrador con
   Gemini, consultar el banco de respuestas, publicar una respuesta).
 - n8n orquesta CUÁNDO se llama cada cosa, aplica el filtro de confianza de la

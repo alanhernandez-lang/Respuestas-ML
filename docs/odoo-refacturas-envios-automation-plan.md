@@ -1,20 +1,26 @@
-# Automatizar refacturas y envíos acordados (Odoo + n8n)
+# Automatizar refacturas y envíos acordados (Odoo)
 
-Estado: **Aprobado (2026-09-10)** — el gerente de Alan aprobó la propuesta de
-alcance angosto de la sección 3 (solo automatizar la planificación mecánica,
-sin tocar las validaciones humanas de Crédito y Cobranza / Tráfico). Ya existe:
+Estado: **Aprobado (2026-09-10) en alcance, pero rediseñando el orquestador
+(2026-09-21)** — el gerente de Alan aprobó la propuesta de alcance angosto de la
+sección 3 (solo automatizar la planificación mecánica, sin tocar las validaciones
+humanas de Crédito y Cobranza / Tráfico). Eso sigue vigente. Lo que cambió: Alan
+confirmó que n8n queda descartado por completo — todo se maneja dentro de la app ya
+construida, no con herramientas externas nuevas. Ya existe:
 
-- Los endpoints de automatización en la app (ver sección 5).
-- Un borrador de workflow de n8n listo para importar:
-  [docs/n8n/refacturas-envios-acordados.workflow.json](n8n/refacturas-envios-acordados.workflow.json).
+- Los endpoints de automatización en la app (ver sección 5) — siguen siendo válidos,
+  no dependen de n8n.
+- ~~Un borrador de workflow de n8n listo para importar~~ — **obsoleto**, ya no se va
+  a usar. El paso que faltaba (que algo llame periódicamente a estos endpoints y
+  escriba en Odoo) se implementará como un scheduler interno dentro de la propia
+  app (mismo patrón que el cron de sincronización con Mercado Libre cada 2 min), no
+  como un workflow de n8n.
 
 **Todavía falta antes de poder activarlo de verdad** (ver checklist de la
 sección 4, ítems 2-4): un usuario/API key dedicado de Odoo, y confirmar con
 quien administra Odoo los nombres técnicos exactos de los campos (sobre todo
-cómo se busca la cotización a partir del número de pedido de Mercado Libre).
-Mientras tanto, el workflow crea una Actividad de Odoo (`mail.activity`) sobre
-la cotización en vez de escribir campos personalizados — eso no depende de esa
-confirmación pendiente.
+cómo se busca la cotización a partir del número de pedido de Mercado Libre). El
+punto 8 del checklist (cómo se dispara cada paso) queda resuelto por el cambio de
+arriba: scheduler interno de la app en vez de n8n.
 
 ## 1. Los dos procesos, tal como los explicó Alan
 
