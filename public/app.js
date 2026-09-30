@@ -1535,12 +1535,15 @@ function isEnvioAcordado(r) {
   return r.shippingStatusLabel === 'Acordar con el vendedor';
 }
 
-// Estas dos categorías son listas de "trabajo pendiente" (para la automatización de
-// Odoo, entre otras cosas) — nunca deben mostrar casos ya respondidos, y tampoco los
-// que estén en mediación (esos se manejan por el flujo de reclamos, no respondiendo
-// el chat normal; mezclar los dos confunde qué necesita acción y por dónde). Por eso
-// el conteo y el filtro exigen status === 'pendiente' a propósito, no solo la
-// categoría — ver también matchesCategory en render().
+// Este contador representa "trabajo pendiente" (para la automatización de Odoo,
+// entre otras cosas) — por eso exige status === 'pendiente' a propósito, no solo
+// la categoría, para no inflarse con casos ya respondidos o en mediación que ya
+// no necesitan acción por esta vía. A diferencia de esto, el FILTRO de categoría
+// en matchesCategory (render()) ya NO exige 'pendiente' — se puede combinar con
+// cualquier estado (p. ej. "Respondidos" + "Refacturas", para auditar casos ya
+// contestados que igual quedaron sin el PDF real de la factura, caso real: Edgar
+// Sanchez Navarro, 2026-09-30) — así que este número puede no coincidir con
+// cuántos resultados da un filtro combinado, a propósito.
 // Sin chip propio de "Todas las categorías" — el "Todas (N)" de statusCountsHtml ya
 // limpia los dos filtros a la vez (ver el click handler), así que un segundo botón
 // de "reset" aquí solo sería un chip más ocupando espacio sin agregar nada; para
@@ -1702,11 +1705,18 @@ function render() {
       || (r.lastQuestion?.text || '').toLowerCase().includes(q)
       || String(r.orderId || '').toLowerCase().includes(q);
     const matchesStatus = !state.statusFilter || r.status === state.statusFilter;
-    // Solo pendientes por responder — nunca respondidos ni en mediación (ver
-    // comentario junto a categoryCountsHtml).
+    // A pedido de Alan (2026-09-30, caso real: Edgar Sanchez Navarro — factura
+    // pendiente de mandar de verdad aunque el chat ya esté "Respondido") — antes
+    // esto exigía status === 'pendiente' además de la categoría, así que combinar
+    // "Respondidos"/"Mediaciones" con "Refacturas"/"Acordados" nunca mostraba
+    // nada. Ya no se exige aquí: el filtro de categoría ahora se combina con
+    // CUALQUIER estado que esté activo (matchesStatus ya se encarga de ese
+    // filtro por separado). El contador de arriba (categoryCountsHtml) sigue
+    // contando solo lo "pendiente" a propósito — ese número representa trabajo
+    // pendiente de verdad (para la automatización de Odoo, entre otras cosas),
+    // no cuántos resultados va a dar este filtro combinado.
     const matchesCategory = !state.categoryFilter
-      || (r.status === 'pendiente'
-        && (state.categoryFilter === 'refactura' ? r.isRefacturaCandidate : isEnvioAcordado(r)));
+      || (state.categoryFilter === 'refactura' ? r.isRefacturaCandidate : isEnvioAcordado(r));
     const matchesFlag = !state.showFlaggedOnly || state.flags.has(r.packId);
     // "No leídos"/"Leídos" es el concepto de Mercado Libre (¿hay mensajes sin abrir
     // en ML?), no el estado pendiente/mediación/respondido de esta app — por eso se
