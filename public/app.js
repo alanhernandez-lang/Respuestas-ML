@@ -1699,7 +1699,8 @@ function render() {
     const matchesQ = !q
       || r.buyerName.toLowerCase().includes(q)
       || r.itemTitles.join(' ').toLowerCase().includes(q)
-      || (r.lastQuestion?.text || '').toLowerCase().includes(q);
+      || (r.lastQuestion?.text || '').toLowerCase().includes(q)
+      || String(r.orderId || '').toLowerCase().includes(q);
     const matchesStatus = !state.statusFilter || r.status === state.statusFilter;
     // Solo pendientes por responder — nunca respondidos ni en mediación (ver
     // comentario junto a categoryCountsHtml).
