@@ -1750,7 +1750,22 @@ app.get('/api/cron/debug-order', async (req, res) => {
     } catch (err) {
       ordersShipments = { error: err.message };
     }
-    res.json({ order, shipment, ordersShipments, customShipment });
+    // La pantalla de "Entregado / Podrás usar este dinero a partir de..." parece
+    // ser del lado de Mercado Pago (liberación de dinero), no de envíos — se
+    // prueba también el detalle completo del pago asociado.
+    let payment = null;
+    const paymentId = order.payments?.[0]?.id;
+    if (paymentId) {
+      try {
+        const payResp = await fetch(`https://api.mercadolibre.com/v1/payments/${paymentId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        payment = { status: payResp.status, body: payResp.ok ? await payResp.json() : await payResp.text() };
+      } catch (err) {
+        payment = { error: err.message };
+      }
+    }
+    res.json({ order, shipment, ordersShipments, customShipment, payment });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
