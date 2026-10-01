@@ -1730,7 +1730,27 @@ app.get('/api/cron/debug-order', async (req, res) => {
     if (order.shipping?.id) {
       shipment = await fetchShipmentDetail(token, order.shipping.id);
     }
-    res.json({ order, shipment });
+    // Para "Acordar con el vendedor" (envío personalizado), el shipment vive en
+    // un recurso aparte, no en order.shipping.id — ver /orders/{id}/shipments
+    // (doc oficial de Mercado Libre, "Envíos Personalizados").
+    let ordersShipments = null;
+    let customShipment = null;
+    try {
+      const resp = await fetch(`https://api.mercadolibre.com/orders/${orderId}/shipments`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      ordersShipments = { status: resp.status, body: resp.ok ? await resp.json() : await resp.text() };
+      const customShipmentId = ordersShipments.body?.id || ordersShipments.body?.[0]?.id;
+      if (resp.ok && customShipmentId) {
+        const shipResp = await fetch(`https://api.mercadolibre.com/shipments/${customShipmentId}`, {
+          headers: { Authorization: `Bearer ${token}`, 'x-format-new': 'true' },
+        });
+        customShipment = { status: shipResp.status, body: shipResp.ok ? await shipResp.json() : await shipResp.text() };
+      }
+    } catch (err) {
+      ordersShipments = { error: err.message };
+    }
+    res.json({ order, shipment, ordersShipments, customShipment });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
