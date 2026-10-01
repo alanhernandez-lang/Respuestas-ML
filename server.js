@@ -1215,6 +1215,7 @@ const PUBLIC_PATHS = new Set([
   '/api/cron/backfill-automation-answer-counts',
   '/api/cron/fix-numeric-pack-ids',
   '/api/cron/recheck-agreed-shipping-labels',
+  '/api/cron/debug-order',
   // Automatización n8n de refacturas/envíos acordados (ver
   // docs/odoo-refacturas-envios-automation-plan.md) — se autentica con CRON_SECRET,
   // mismo patrón que el cron externo, no con una sesión de usuario.
@@ -1704,6 +1705,32 @@ app.get('/api/cron/recheck-agreed-shipping-labels', async (req, res) => {
   try {
     const result = await recheckAgreedShippingLabelsInner();
     res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Endpoint temporal de diagnóstico (2026-10-01, a quitar después) — a pedido de
+// Alan: necesitamos ver el JSON real que devuelve Mercado Libre para una orden
+// "Acordar con el vendedor" que el equipo ya marcó como entregada a mano desde
+// la propia interfaz de ML, para saber qué campo exacto refleja eso (no hay
+// documentación nuestra sobre esto todavía). Devuelve la orden completa y, si
+// ya trae shipping.id, también el detalle del envío.
+app.get('/api/cron/debug-order', async (req, res) => {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { orderId } = req.query;
+  if (!orderId) return res.status(400).json({ error: 'Falta orderId' });
+  try {
+    const { access_token: token } = await getAccessToken();
+    const order = await fetchOrderDetail(token, orderId);
+    let shipment = null;
+    if (order.shipping?.id) {
+      shipment = await fetchShipmentDetail(token, order.shipping.id);
+    }
+    res.json({ order, shipment });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
