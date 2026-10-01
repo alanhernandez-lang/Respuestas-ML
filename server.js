@@ -1757,7 +1757,7 @@ app.get('/api/cron/debug-order', async (req, res) => {
     const paymentId = order.payments?.[0]?.id;
     if (paymentId) {
       try {
-        const payResp = await fetch(`https://api.mercadolibre.com/v1/payments/${paymentId}`, {
+        const payResp = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         payment = { status: payResp.status, body: payResp.ok ? await payResp.json() : await payResp.text() };
