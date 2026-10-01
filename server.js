@@ -1221,6 +1221,7 @@ const PUBLIC_PATHS = new Set([
   '/api/automation/refacturas-pendientes',
   '/api/automation/envios-acordados-pendientes',
   '/api/automation/marcar-planificado',
+  '/api/automation/quitar-planificado',
 ]);
 
 function requireAuth(req, res, next) {
@@ -1772,6 +1773,14 @@ async function markPlanned(categoria, packId, extra) {
   await redis.hset(AUTOMATION_PLANNED_KEY, {
     [`${categoria}:${packId}`]: { plannedAt: new Date().toISOString(), ...extra },
   });
+}
+
+// Contraparte de markPlanned — para corregir a mano una marca puesta por error
+// (caso real: 2026-10-01, se marcó "planificado" un pedido de prueba que en
+// realidad ya llevaba meses cerrado en Odoo, sin que la marca tuviera nada que
+// ver con el estado real del pedido).
+async function unmarkPlanned(categoria, packId) {
+  await redis.hdel(AUTOMATION_PLANNED_KEY, `${categoria}:${packId}`);
 }
 
 // Prefiltro barato antes de gastar una llamada a Gemini por pack: sin esto, cada
@@ -2615,6 +2624,22 @@ app.post('/api/automation/marcar-planificado', async (req, res) => {
       return res.status(400).json({ error: 'Falta packId o categoria' });
     }
     await markPlanned(categoria, packId, odooActivityId ? { odooActivityId } : undefined);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Contraparte de /marcar-planificado — para corregir a mano una marca puesta
+// por error (ver comentario junto a unmarkPlanned).
+app.post('/api/automation/quitar-planificado', async (req, res) => {
+  if (!checkAutomationSecret(req, res)) return;
+  try {
+    const { packId, categoria } = req.body || {};
+    if (!packId || !categoria) {
+      return res.status(400).json({ error: 'Falta packId o categoria' });
+    }
+    await unmarkPlanned(categoria, packId);
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
