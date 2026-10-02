@@ -752,6 +752,17 @@ const MESSAGES_BACKFILL_VERSION = 3;
 
 // El borrador de IA sigue siendo válido mientras nadie haya hecho una pregunta
 // nueva desde que se generó, así que solo se regenera cuando cambia lastQuestion.
+//
+// A pedido de Alan (2026-10-02, por consumo alto de la API): un borrador que falló
+// antes nunca contaba como "al día", así que un pack con un error persistente
+// (bloqueo de seguridad, timeout recurrente, 400) se volvía a mandar a Gemini en
+// cada ciclo del sync (cada 2 minutos), cada vez con sus propios reintentos. Ahora
+// se intenta como máximo MAX_DRAFT_ATTEMPTS_PER_QUESTION veces por cada pregunta
+// del cliente; después se queda el error visible en la interfaz y alguien puede
+// darle "Regenerar" a mano (regenerateDraftInner no tiene este tope). En cuanto el
+// cliente escribe algo nuevo, questionDate cambia y el contador vuelve a empezar.
+const MAX_DRAFT_ATTEMPTS_PER_QUESTION = 3;
+
 async function attachDrafts(packs, token) {
   const pendingEntries = Object.values(packs).filter((p) => p.record.status === 'pendiente');
   if (!pendingEntries.length) return;
@@ -764,6 +775,7 @@ async function attachDrafts(packs, token) {
   let fresh = 0;
   let ok = 0;
   let failed = 0;
+  let gaveUp = 0;
   // A pedido de Alan (2026-09-28): esta función ya guarda cada borrador por su
   // cuenta (antes dejaba el draftAnswer escrito sobre el `record` en memoria y
   // dependía de que el llamador hiciera un guardado en bloque al final) — así las
@@ -786,9 +798,15 @@ async function attachDrafts(packs, token) {
     const currentEntry = await loadPackEntry(record.packId);
     if (!currentEntry || currentEntry.record.status !== 'pendiente') return;
     const previousDraft = currentEntry.record.draftAnswer;
-    const isFresh = previousDraft && !previousDraft.error && previousDraft.forQuestionDate === questionDate;
+    const sameQuestion = Boolean(previousDraft) && previousDraft.forQuestionDate === questionDate;
+    const isFresh = sameQuestion && !previousDraft.error;
     if (isFresh) {
       fresh++;
+      return;
+    }
+    const previousAttempts = sameQuestion && previousDraft.error ? (previousDraft.attempts || 1) : 0;
+    if (previousAttempts >= MAX_DRAFT_ATTEMPTS_PER_QUESTION) {
+      gaveUp++;
       return;
     }
     let draftAnswer;
@@ -810,7 +828,7 @@ async function attachDrafts(packs, token) {
       ok++;
     } catch (err) {
       console.warn('Error generando borrador IA para pack', record.packId, err.message);
-      draftAnswer = { error: err.message, forQuestionDate: questionDate };
+      draftAnswer = { error: err.message, forQuestionDate: questionDate, attempts: previousAttempts + 1 };
       failed++;
     }
     // Se relee justo antes de escribir (no el currentEntry de arriba, que ya tiene
@@ -822,7 +840,7 @@ async function attachDrafts(packs, token) {
     freshest.record.draftAnswer = draftAnswer;
     await savePackEntry(record.packId, freshest);
   });
-  if (ok > 0 || failed > 0) console.log(`Borradores IA: ${ok} generados, ${failed} con error, ${fresh} ya estaban al día.`);
+  if (ok > 0 || failed > 0) console.log(`Borradores IA: ${ok} generados, ${failed} con error, ${fresh} ya estaban al día, ${gaveUp} sin reintentar (tope de ${MAX_DRAFT_ATTEMPTS_PER_QUESTION} intentos).`);
 }
 
 async function runSyncInner() {
@@ -2130,7 +2148,9 @@ async function remindOneCategory(packId, token, cache, { categoria, askPatterns,
   // esta corrida en particular de verdad aportó algo nuevo.
   const confirmedBefore = await getConfirmedFields(categoria, packId);
 
-  const { data } = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
+  const { data, failed } = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
+  // Gemini falló (caído/timeout): no se marca nada, se reintenta en el siguiente ciclo.
+  if (failed) return;
   // No confiamos ciegamente en el resultado de ESTA corrida para decidir qué falta
   // — se combina con todo lo que alguna vez se haya confirmado antes (ver comentario
   // junto a CONFIRMED_FIELDS_KEY). Así, un dato ya confirmado nunca se le vuelve a
@@ -2143,7 +2163,16 @@ async function remindOneCategory(packId, token, cache, { categoria, askPatterns,
   // Ni completo (no hay nada que recordar) ni en cero (el cliente todavía no
   // contestó nada — insistir antes de que responda algo sería puro spam):
   // recordamos solo el caso de en medio, datos parciales.
-  if (missing.length === 0 || missing.length >= totalFields) return;
+  // A pedido de Alan (2026-10-02, por consumo alto de la API): estos dos casos
+  // antes salían sin marcar nada, así que el mismo pack se volvía a extraer con
+  // Gemini (con adjuntos) cada 2 minutos mientras siguiera pendiente — mientras el
+  // cliente no escriba algo nuevo, la respuesta no puede cambiar. Se marca con el
+  // mismo criterio que el caso de abajo (newlyConfirmed vacío): en cuanto el
+  // cliente mande un mensaje nuevo, questionDate cambia y se vuelve a evaluar.
+  if (missing.length === 0 || missing.length >= totalFields) {
+    await markReminded(categoria, packId, questionDate);
+    return;
+  }
   // Caso real (Azhela Del Ángel Ibarra, 2026-09-29): questionDate cambia con
   // CUALQUIER mensaje nuevo del cliente, sin importar el tema — le pidió al
   // vendedor la ficha técnica del producto (nada que ver con su factura) y aun así
@@ -2215,6 +2244,27 @@ async function markFacturaFirstContactHandled(packId, questionDate) {
   });
 }
 
+// A pedido de Alan (2026-10-02, por consumo alto de la API): a diferencia de
+// AUTOMATION_FACTURA_FIRST_CONTACT_KEY (que marca "ya se mandó, nunca más"), esto
+// marca "ya se evaluó con Gemini para ESTE mensaje del cliente y no tocaba mandar
+// nada" — antes, un pack pendiente que mencionaba "factura" pero no calificaba
+// (detectsFirstFacturaRequest en false, o adjunto con todos los datos ya dados) se
+// volvía a mandar a Gemini en cada ciclo del sync (cada 2 minutos) hasta que
+// alguien lo contestara. Mismo criterio de frescura que alreadyRemindedForQuestion:
+// en cuanto el cliente escribe algo nuevo, questionDate cambia y se reevalúa.
+const AUTOMATION_FACTURA_EVALUATED_KEY = 'app:automation:first_contact_factura_evaluated';
+
+async function facturaFirstContactEvaluatedFor(packId, questionDate) {
+  const stored = await redis.hget(AUTOMATION_FACTURA_EVALUATED_KEY, packId);
+  return Boolean(stored) && stored.questionDate === questionDate;
+}
+
+async function markFacturaFirstContactEvaluated(packId, questionDate) {
+  await redis.hset(AUTOMATION_FACTURA_EVALUATED_KEY, {
+    [packId]: { questionDate, evaluatedAt: new Date().toISOString() },
+  });
+}
+
 // Agrupa las condiciones que deciden si un pack todavía califica para el primer
 // contacto automático de factura — se evalúan DOS veces sobre el MISMO record (ver
 // sendFacturaFirstContactForRecord de abajo), una vez recién refrescado y otra vez
@@ -2266,6 +2316,7 @@ async function sendFacturaFirstContactForRecord(packId, token, cache) {
   if (!facturaFirstContactStillApplies(record)) return;
   const questionDate = record.lastQuestion?.date || null;
   if (!questionDate) return;
+  if (await facturaFirstContactEvaluatedFor(packId, questionDate)) return;
 
   let asksForFactura;
   try {
@@ -2274,7 +2325,12 @@ async function sendFacturaFirstContactForRecord(packId, token, cache) {
     console.warn('[automation] no se pudo evaluar solicitud de factura del pack', record.packId, err.message);
     return;
   }
-  if (!asksForFactura) return;
+  // null = Gemini falló: no se marca, se reintenta en el siguiente ciclo.
+  if (asksForFactura === null) return;
+  if (!asksForFactura) {
+    await markFacturaFirstContactEvaluated(packId, questionDate);
+    return;
+  }
 
   // A pedido explícito de Alan (2026-09-30, caso real: Salvador Reyes): antes,
   // CUALQUIER adjunto del cliente en su primer mensaje hacía que esto se
@@ -2294,11 +2350,15 @@ async function sendFacturaFirstContactForRecord(packId, token, cache) {
   let label = 'Automatización (primer contacto — solicitud de factura)';
   const totalFields = Object.keys(REFACTURA_FIELD_LABELS).length;
   if (record.messages.some((m) => m.sender === 'cliente' && m.hasAttachment)) {
-    const { data } = await extractRefacturaData(record.messages, token, process.env.GEMINI_API_KEY);
+    const { data, failed } = await extractRefacturaData(record.messages, token, process.env.GEMINI_API_KEY);
+    if (failed) return; // Gemini falló: se reintenta en el siguiente ciclo
     await addConfirmedFields('refactura', packId, Object.keys(data));
     const confirmed = await getConfirmedFields('refactura', packId);
     const missing = Object.keys(REFACTURA_FIELD_LABELS).filter((key) => !confirmed.has(key));
-    if (missing.length === 0) return;
+    if (missing.length === 0) {
+      await markFacturaFirstContactEvaluated(packId, questionDate);
+      return;
+    }
     if (missing.length < totalFields) {
       textToSend = buildRefacturaReminderText(missing);
       label = 'Automatización (primer contacto — datos de refactura faltantes)';
