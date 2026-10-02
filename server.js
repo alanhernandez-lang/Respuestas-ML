@@ -2007,6 +2007,41 @@ async function alreadyRemindedForQuestion(categoria, packId, questionDate) {
   return Boolean(stored) && stored.questionDate === questionDate;
 }
 
+// A pedido de Alan (2026-10-02, por consumo alto de la API de Gemini): mismo tope
+// que ya tienen los borradores (MAX_DRAFT_ATTEMPTS_PER_QUESTION), ahora para las
+// extracciones y clasificaciones de las automatizaciones. Una llamada que falla
+// (Gemini caído, timeout, tope de gasto agotado) no se marca como evaluada y se
+// reintenta en el siguiente ciclo — sin tope, una falla que se repite siempre con
+// el mismo hilo (un adjunto que siempre tarda demasiado, por ejemplo) volvería a
+// llamar a Gemini cada 2 minutos para siempre. Se cuentan las fallas por pack y por
+// `key` (el questionDate o la huella del hilo): al cambiar, el contador empieza de
+// nuevo. A diferencia de los borradores (que tienen "Regenerar pendientes"), aquí
+// no hay botón para reintentar a mano, así que al llegar al tope no se abandona
+// para siempre: se espera AUTOMATION_GEMINI_FAILURE_COOLDOWN_MS y se permite UN
+// intento más (si vuelve a fallar, otra espera). Así un tope de gasto que se sube
+// después se recupera solo, a lo mucho una llamada por hora por pack mientras falle.
+const AUTOMATION_GEMINI_FAILURES_KEY = 'app:automation:gemini_failures';
+const MAX_AUTOMATION_GEMINI_FAILURES = 3;
+const AUTOMATION_GEMINI_FAILURE_COOLDOWN_MS = 60 * 60 * 1000;
+
+async function automationGeminiBlocked(kind, packId, key) {
+  const stored = await redis.hget(AUTOMATION_GEMINI_FAILURES_KEY, `${kind}:${packId}`);
+  if (!stored || stored.key !== key || stored.count < MAX_AUTOMATION_GEMINI_FAILURES) return false;
+  return Date.now() - new Date(stored.lastFailedAt).getTime() < AUTOMATION_GEMINI_FAILURE_COOLDOWN_MS;
+}
+
+async function recordAutomationGeminiFailure(kind, packId, key) {
+  const field = `${kind}:${packId}`;
+  const stored = await redis.hget(AUTOMATION_GEMINI_FAILURES_KEY, field);
+  const count = stored && stored.key === key ? stored.count + 1 : 1;
+  await redis.hset(AUTOMATION_GEMINI_FAILURES_KEY, {
+    [field]: { key, count, lastFailedAt: new Date().toISOString() },
+  });
+  if (count === MAX_AUTOMATION_GEMINI_FAILURES) {
+    console.warn(`[automation] ${kind} del pack ${packId}: ${count} fallas de Gemini seguidas, se reintenta en 1 hora`);
+  }
+}
+
 async function markReminded(categoria, packId, questionDate) {
   await redis.hset(AUTOMATION_REMINDED_KEY, {
     [`${categoria}:${packId}`]: { questionDate, remindedAt: new Date().toISOString() },
@@ -2172,9 +2207,15 @@ async function remindOneCategory(packId, token, cache, { categoria, askPatterns,
   // esta corrida en particular de verdad aportó algo nuevo.
   const confirmedBefore = await getConfirmedFields(categoria, packId);
 
+  const failureKind = `recordatorio-${categoria}`;
+  if (await automationGeminiBlocked(failureKind, packId, questionDate)) return;
   const { data, failed } = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
-  // Gemini falló (caído/timeout): no se marca nada, se reintenta en el siguiente ciclo.
-  if (failed) return;
+  // Gemini falló (caído/timeout): no se marca como evaluado, se reintenta en el
+  // siguiente ciclo — hasta el tope de AUTOMATION_GEMINI_FAILURES_KEY.
+  if (failed) {
+    await recordAutomationGeminiFailure(failureKind, packId, questionDate);
+    return;
+  }
   // No confiamos ciegamente en el resultado de ESTA corrida para decidir qué falta
   // — se combina con todo lo que alguna vez se haya confirmado antes (ver comentario
   // junto a CONFIRMED_FIELDS_KEY). Así, un dato ya confirmado nunca se le vuelve a
@@ -2341,6 +2382,7 @@ async function sendFacturaFirstContactForRecord(packId, token, cache) {
   const questionDate = record.lastQuestion?.date || null;
   if (!questionDate) return;
   if (await facturaFirstContactEvaluatedFor(packId, questionDate)) return;
+  if (await automationGeminiBlocked('factura-primer-contacto', packId, questionDate)) return;
 
   let asksForFactura;
   try {
@@ -2349,8 +2391,12 @@ async function sendFacturaFirstContactForRecord(packId, token, cache) {
     console.warn('[automation] no se pudo evaluar solicitud de factura del pack', record.packId, err.message);
     return;
   }
-  // null = Gemini falló: no se marca, se reintenta en el siguiente ciclo.
-  if (asksForFactura === null) return;
+  // null = Gemini falló: no se marca como evaluado, se reintenta en el siguiente
+  // ciclo — hasta el tope de AUTOMATION_GEMINI_FAILURES_KEY.
+  if (asksForFactura === null) {
+    await recordAutomationGeminiFailure('factura-primer-contacto', packId, questionDate);
+    return;
+  }
   if (!asksForFactura) {
     await markFacturaFirstContactEvaluated(packId, questionDate);
     return;
@@ -2375,7 +2421,10 @@ async function sendFacturaFirstContactForRecord(packId, token, cache) {
   const totalFields = Object.keys(REFACTURA_FIELD_LABELS).length;
   if (record.messages.some((m) => m.sender === 'cliente' && m.hasAttachment)) {
     const { data, failed } = await extractRefacturaData(record.messages, token, process.env.GEMINI_API_KEY);
-    if (failed) return; // Gemini falló: se reintenta en el siguiente ciclo
+    if (failed) { // Gemini falló: se reintenta en el siguiente ciclo, hasta el tope
+      await recordAutomationGeminiFailure('factura-primer-contacto', packId, questionDate);
+      return;
+    }
     await addConfirmedFields('refactura', packId, Object.keys(data));
     const confirmed = await getConfirmedFields('refactura', packId);
     const missing = Object.keys(REFACTURA_FIELD_LABELS).filter((key) => !confirmed.has(key));
@@ -2730,8 +2779,14 @@ async function extractWithCache(categoria, record, extractFn, token) {
   const fingerprint = threadFingerprint(record.messages);
   const cached = await redis.hget(AUTOMATION_EXTRACTION_CACHE_KEY, field);
   if (cached && cached.fingerprint === fingerprint) return cached.result;
+  const failureKind = `pendientes-${categoria}`;
+  if (await automationGeminiBlocked(failureKind, record.packId, fingerprint)) {
+    return { complete: false, data: {}, failed: true };
+  }
   const result = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
-  if (!result.failed) {
+  if (result.failed) {
+    await recordAutomationGeminiFailure(failureKind, record.packId, fingerprint);
+  } else {
     await redis.hset(AUTOMATION_EXTRACTION_CACHE_KEY, {
       [field]: { fingerprint, result, extractedAt: new Date().toISOString() },
     });
