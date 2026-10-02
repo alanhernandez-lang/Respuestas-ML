@@ -2623,14 +2623,31 @@ async function sendFirstContactForAgreedShipping() {
         await markFirstContactHandled(packId);
         return;
       }
-      // A pedido explícito de Alan (2026-09-24): el mensaje automático debe salir
+      // A pedido explícito de Alan (2026-10-02, caso real: Jose Luis Garcia Salas,
+      // pedido FULL): se revierte la decisión anterior (2026-09-24, ver abajo) de
+      // mandar sin esperar shippingSettled — Mercado Libre puede tardar hasta 1
+      // hora en asignar el shipping.id real de un pedido FULL (ver
+      // resolveShippingInfo), y mandarle a un cliente FULL la plantilla de "tu
+      // pedido aplica para envío gratis, mándame tu dirección" generó un reclamo
+      // real (Mercado Libre bloqueó la conversación). El riesgo que se había
+      // aceptado antes (~3 de 501 casos históricos, ver comentario de abajo)
+      // resultó más caro de lo esperado. No se marca "handled" — se vuelve a
+      // evaluar en el siguiente ciclo (~2 min) hasta que shippingSettled confirme
+      // de verdad que es Acordar con el vendedor, o hasta que Mercado Libre le
+      // asigne antes un shipping.id real (entonces cae en el if de arriba).
+      if (!record.shippingSettled) {
+        skipped++;
+        return;
+      }
+      // A pedido explícito de Alan (2026-09-24): el mensaje automático debía salir
       // apenas se detecta la venta o apenas escribe el cliente, sin esperar a que
       // shippingSettled confirme el tipo de envío (eso sí puede tardar hasta 1
-      // hora — ver resolveShippingInfo). Se acepta el riesgo raro de que un pedido
-      // muestre "Acordar con el vendedor" al principio y termine siendo un envío
+      // hora — ver resolveShippingInfo). Se aceptó el riesgo raro de que un pedido
+      // mostrara "Acordar con el vendedor" al principio y terminara siendo un envío
       // real de ML (caso real: Gracia Ugalde, ~3 de 501 casos históricos) a cambio
-      // de no retrasar el caso normal. Si eso pasa, /api/cron/recheck-agreed-
-      // shipping-labels sigue disponible para corregirlo después.
+      // de no retrasar el caso normal — ver el gate de shippingSettled de arriba,
+      // que revierte esto. Si de cualquier forma algo se escapa, /api/cron/recheck-
+      // agreed-shipping-labels sigue disponible para corregirlo después.
       // El vendedor ya le contestó algo a este pack (a mano, o por otra vía) — el
       // flujo normal ya se encarga, mandar esto encima sería un mensaje duplicado.
       if (record.messages.some((m) => m.sender === 'vendedor')) {
