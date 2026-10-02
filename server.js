@@ -843,6 +843,10 @@ async function attachDrafts(packs, token) {
   if (ok > 0 || failed > 0) console.log(`Borradores IA: ${ok} generados, ${failed} con error, ${fresh} ya estaban al día, ${gaveUp} sin reintentar (tope de ${MAX_DRAFT_ATTEMPTS_PER_QUESTION} intentos).`);
 }
 
+// Campos del record que nunca escribe el sync (los ponen attachDrafts, una
+// respuesta manual o una automatización) — ver el guardado en bloque de runSyncInner.
+const SYNC_UNOWNED_RECORD_FIELDS = ['draftAnswer', 'answeredBy', 'wasEdited'];
+
 async function runSyncInner() {
   const tokenStore = await getAccessToken();
   const token = tokenStore.access_token;
@@ -926,9 +930,29 @@ async function runSyncInner() {
   // el resto de los guardados de este ciclo (mediación, borradores) ya son todos
   // por pack, leyendo su propia copia fresca antes de escribir, así que no
   // necesitan este bloque para nada.
+  //
+  // A pedido de Alan (2026-10-02, por consumo alto de la API de Gemini): el spread
+  // de arriba conserva draftAnswer/answeredBy/wasEdited, pero de la foto de
+  // loadCache() tomada al INICIO del ciclo. Si mientras tanto otro ciclo encimado
+  // (el lock de 5 min expira en un ciclo largo), un "Regenerar" o una publicación
+  // guardó un borrador más nuevo, este guardado lo pisaba con la versión vieja (o
+  // sin borrador) y attachDrafts lo volvía a generar con Gemini sin que hubiera
+  // ningún mensaje nuevo del cliente. Por eso, justo antes de escribir, esos campos
+  // se toman de la copia MÁS FRESCA en Redis — el sync nunca es dueño de ellos.
   if (touched.size) {
+    const ids = [...touched];
+    const latestEntries = await redis.hmget(CACHE_PACKS_KEY, ids);
     const toWrite = {};
-    touched.forEach((id) => { toWrite[id] = packs[id]; });
+    ids.forEach((id, i) => {
+      const entry = packs[id];
+      const latestRecord = parseMaybeJson(latestEntries[i])?.record;
+      if (latestRecord) {
+        SYNC_UNOWNED_RECORD_FIELDS.forEach((field) => {
+          if (field in latestRecord) entry.record[field] = latestRecord[field];
+        });
+      }
+      toWrite[id] = entry;
+    });
     await savePacksBulk(toWrite);
   }
 
@@ -2687,6 +2711,34 @@ function checkAutomationSecret(req, res) {
   return true;
 }
 
+// A pedido de Alan (2026-10-02, por consumo alto de la API de Gemini): estos
+// endpoints recorren TODOS los packs en caché donde el vendedor pidió datos
+// (incluidos los ya contestados), y antes mandaban cada uno a Gemini en CADA
+// llamada aunque el hilo no hubiera cambiado. Ahora el resultado de la extracción
+// se guarda por pack junto con una huella del hilo (cantidad de mensajes + fecha del
+// último): mientras no llegue un mensaje nuevo, se reutiliza sin llamar a Gemini.
+// Una extracción fallida (Gemini caído) no se guarda, para reintentarla la próxima vez.
+const AUTOMATION_EXTRACTION_CACHE_KEY = 'app:automation:extraction_cache';
+
+function threadFingerprint(messages) {
+  const list = messages || [];
+  return `${list.length}:${list[list.length - 1]?.date || ''}`;
+}
+
+async function extractWithCache(categoria, record, extractFn, token) {
+  const field = `${categoria}:${record.packId}`;
+  const fingerprint = threadFingerprint(record.messages);
+  const cached = await redis.hget(AUTOMATION_EXTRACTION_CACHE_KEY, field);
+  if (cached && cached.fingerprint === fingerprint) return cached.result;
+  const result = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
+  if (!result.failed) {
+    await redis.hset(AUTOMATION_EXTRACTION_CACHE_KEY, {
+      [field]: { fingerprint, result, extractedAt: new Date().toISOString() },
+    });
+  }
+  return result;
+}
+
 async function findPendingForCategory({ categoria, askPatterns, extractFn }) {
   const { access_token: token } = await getAccessToken();
   const cache = await loadCache();
@@ -2697,7 +2749,7 @@ async function findPendingForCategory({ categoria, askPatterns, extractFn }) {
   const results = [];
   await mapWithConcurrency(candidates, 3, async (record) => {
     if (await isAlreadyPlanned(categoria, record.packId)) return;
-    const { complete, data } = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
+    const { complete, data } = await extractWithCache(categoria, record, extractFn, token);
     if (!complete) return;
     results.push({
       packId: record.packId,
