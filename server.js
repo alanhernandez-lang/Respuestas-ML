@@ -29,6 +29,7 @@ const {
   REFACTURA_FIELD_LABELS,
   ENVIO_ACORDADO_FIELD_LABELS,
 } = require('./lib/agent');
+const { planRefactura } = require('./lib/odoo');
 const { redis, withLock } = require('./lib/redis');
 const { legacyUpstashClient } = require('./lib/legacyUpstash');
 const { SESSION_COOKIE, verifyCredentials, createSessionToken, verifySessionToken } = require('./lib/auth');
@@ -971,6 +972,7 @@ async function runSyncInner() {
   await sendAutomationReminders().catch((err) => console.error('[automation] error inesperado mandando recordatorios:', err.message));
   await sendFirstContactForAgreedShipping().catch((err) => console.error('[automation] error inesperado mandando primer contacto:', err.message));
   await sendFacturaFirstContact().catch((err) => console.error('[automation] error inesperado mandando primer contacto de factura:', err.message));
+  await planRefacturasPendientes().catch((err) => console.error('[automation] error inesperado planificando refacturas en Odoo:', err.message));
 
   // Igual que el refresco de arriba, pero para el historial de mediaciones YA
   // cerradas (ver checkPastMediation) — nunca se re-consulta dos veces el mismo
@@ -2832,6 +2834,121 @@ async function findPendingForCategory({ categoria, askPatterns, extractFn }) {
     });
   });
   return results;
+}
+
+// ---------------------------------------------------------------------------------
+// Planificación automática en Odoo de refacturas con datos completos — reemplaza el
+// paso mecánico que antes hacía a mano la compañera de Ecommerce (ver
+// docs/odoo-refacturas-envios-automation-plan.md). Valid a mano antes de
+// automatizar con pedidos reales (Humberto, Beimar como envío acordado; Edgar
+// Sánchez, Gabriela Ortiz, Edith Robles, Dorado Motors como refactura — texto, PDF e
+// imágenes). A propósito SOLO refactura por ahora (a pedido de Alan, 2026-10-06):
+// envío acordado queda para una fase aparte. Las validaciones humanas de Crédito y
+// Cobranza NO se tocan — esto solo sube los datos/adjuntos y crea la Actividad.
+const REFACTURA_PLANNED_CLIENT_TEXT = 'Gracias 🙏 Procedemos con la facturación de su compra. El proceso toma de 1 a 3 días hábiles. Si después de este plazo no ha recibido su factura, favor de comunicarse nuevamente por este medio. Saludos.';
+
+// Junta los adjuntos (PDF o foto) que el CLIENTE mandó a partir del primer mensaje
+// donde el vendedor pidió los datos fiscales — antes de ese punto, cualquier
+// foto/PDF es de otro tema (ej. una falla del producto) y no debe subirse a Odoo
+// como si fuera la constancia fiscal.
+function collectRefacturaAttachmentRefs(messages) {
+  const list = messages || [];
+  const askIndex = list.findIndex((m) => m.sender === 'vendedor' && REFACTURA_ASK_PATTERNS.some((p) => p.test(m.text || '')));
+  if (askIndex === -1) return [];
+  const refs = [];
+  list.slice(askIndex).forEach((m) => {
+    if (m.sender !== 'cliente') return;
+    (m.attachments || []).forEach((att) => {
+      if (att.kind === 'pdf' || att.kind === 'image') refs.push(att);
+    });
+  });
+  return refs;
+}
+
+async function planOneRefactura(packId, token, cache) {
+  if (await isAlreadyPlanned('refactura', packId)) return;
+
+  // Mismo criterio de frescura que remindOneCategory: se vuelve a sincronizar este
+  // pack en particular antes de decidir nada, para no actuar sobre una foto del
+  // pack ya desactualizada (loadCache() se toma una sola vez al inicio del ciclo).
+  let record;
+  try {
+    record = await syncPackById(token, packId, cache, cache.packs[packId]?.record?.unreadCount || 0);
+  } catch (err) {
+    console.warn('[automation] no se pudo refrescar el pack antes de planificar en Odoo', packId, err.message);
+    return;
+  }
+  if (!record.orderId) return;
+
+  const { complete, data } = await extractWithCache('refactura', record, extractRefacturaData, token);
+  if (!complete) return;
+
+  // Segunda sincronización justo antes de actuar: extractWithCache (Gemini) también
+  // tarda, y en ese rato alguien pudo haber planificado este pack a mano. Si el
+  // hilo cambió, se deja pasar — se vuelve a evaluar en el siguiente ciclo (~2 min).
+  let freshRecord;
+  try {
+    freshRecord = await syncPackById(token, packId, cache, record.unreadCount || 0);
+  } catch (err) {
+    console.warn('[automation] no se pudo refrescar el pack justo antes de planificar en Odoo', packId, err.message);
+    return;
+  }
+  if (freshRecord.messages.length !== record.messages.length) return;
+  if (await isAlreadyPlanned('refactura', packId)) return;
+
+  const attachmentRefs = collectRefacturaAttachmentRefs(record.messages).slice(-4);
+  const attachments = [];
+  await mapWithConcurrency(attachmentRefs, 2, async (ref) => {
+    try {
+      const { base64, mimeType } = await fetchAttachment(token, ref.filename, ref.siteId);
+      const effectiveMimeType = mimeType || ref.mimeType;
+      const ext = effectiveMimeType === 'application/pdf' ? 'pdf' : 'jpg';
+      attachments.push({
+        filename: `Constancia_situacion_fiscal_${(record.buyerName || 'cliente').replace(/\s+/g, '_')}_${attachments.length + 1}.${ext}`,
+        base64,
+        mimeType: effectiveMimeType,
+      });
+    } catch (err) {
+      console.warn('[automation] no se pudo bajar adjunto de refactura para subir a Odoo', packId, err.message);
+    }
+  });
+
+  let planResult;
+  try {
+    planResult = await withLock(`lock:odoo-plan:${packId}`, 30000, () => planRefactura({
+      meliOrderId: record.orderId,
+      datos: data,
+      attachments,
+    }));
+  } catch (err) {
+    console.warn('[automation] no se pudo planificar refactura en Odoo', packId, err.message);
+    return;
+  }
+
+  await markPlanned('refactura', packId, { odooOrderId: planResult.odooOrderId, odooActivityId: planResult.odooActivityId });
+
+  try {
+    await withLock(`lock:pack:${packId}`, 30000, () => sendAutomatedMessage(packId, REFACTURA_PLANNED_CLIENT_TEXT, 'Automatización (Odoo)'));
+  } catch (err) {
+    console.warn('[automation] se planificó en Odoo pero no se pudo avisar al cliente', packId, err.message);
+  }
+}
+
+async function planRefacturasPendientes() {
+  if (process.env.AUTOMATION_ODOO_REFACTURA_ENABLED !== 'true') return;
+  const { access_token: token } = await getAccessToken();
+  const cache = await loadCache();
+  const candidates = Object.values(cache.packs)
+    .map((p) => p.record)
+    .filter((r) => r && r.status === 'pendiente' && vendorAskedFor(r.messages, REFACTURA_ASK_PATTERNS));
+
+  await mapWithConcurrency(candidates, 2, async (record) => {
+    try {
+      await planOneRefactura(record.packId, token, cache);
+    } catch (err) {
+      console.warn('[automation] error inesperado planificando refactura en Odoo', record.packId, err.message);
+    }
+  });
 }
 
 app.get('/api/automation/refacturas-pendientes', async (req, res) => {
