@@ -2209,15 +2209,20 @@ async function remindOneCategory(packId, token, cache, { categoria, askPatterns,
   // esta corrida en particular de verdad aportó algo nuevo.
   const confirmedBefore = await getConfirmedFields(categoria, packId);
 
-  const failureKind = `recordatorio-${categoria}`;
-  if (await automationGeminiBlocked(failureKind, packId, questionDate)) return;
-  const { data, failed } = await extractFn(record.messages, token, process.env.GEMINI_API_KEY);
+  // A pedido de Alan (2026-10-06, por consumo de la API de Gemini): usa el mismo
+  // caché por huella de hilo que ya usa planOneRefactura (ver extractWithCache) en
+  // vez de llamar a extractFn directo — antes, en el mismo ciclo, un pack de
+  // refactura podía gastar DOS llamadas a Gemini para exactamente los mismos datos
+  // (una aquí, para el recordatorio, y otra en planOneRefactura, para planificar en
+  // Odoo). Con el mismo caché compartido (clave: categoria+packId+huella del
+  // hilo), la que corra primero en el ciclo (este recordatorio, que corre antes)
+  // deja el resultado listo para que planOneRefactura lo reutilice sin llamar a
+  // Gemini otra vez, mientras no llegue un mensaje nuevo.
+  const { data, failed } = await extractWithCache(categoria, record, extractFn, token);
   // Gemini falló (caído/timeout): no se marca como evaluado, se reintenta en el
-  // siguiente ciclo — hasta el tope de AUTOMATION_GEMINI_FAILURES_KEY.
-  if (failed) {
-    await recordAutomationGeminiFailure(failureKind, packId, questionDate);
-    return;
-  }
+  // siguiente ciclo — hasta el tope de AUTOMATION_GEMINI_FAILURES_KEY (el cooldown
+  // de fallas ya lo maneja extractWithCache internamente).
+  if (failed) return;
   // No confiamos ciegamente en el resultado de ESTA corrida para decidir qué falta
   // — se combina con todo lo que alguna vez se haya confirmado antes (ver comentario
   // junto a CONFIRMED_FIELDS_KEY). Así, un dato ya confirmado nunca se le vuelve a
