@@ -1268,6 +1268,7 @@ const PUBLIC_PATHS = new Set([
   '/api/automation/envios-acordados-pendientes',
   '/api/automation/marcar-planificado',
   '/api/automation/quitar-planificado',
+  '/api/automation/quitar-evaluacion-factura',
 ]);
 
 function requireAuth(req, res, next) {
@@ -2488,24 +2489,28 @@ async function sendFacturaFirstContactForRecord(packId, token, cache) {
     return;
   }
 
-  // A pedido explícito de Alan (2026-09-30, caso real: Salvador Reyes): antes,
-  // CUALQUIER adjunto del cliente en su primer mensaje hacía que esto se
-  // abstuviera siempre y dejara pasar el caso a revisión humana, por miedo a que
-  // la plantilla genérica volviera a pedir un dato que ya venía en la foto/PDF.
-  // Ahora que extractRefacturaData ya lee adjuntos de forma confiable (ver su
-  // propio comentario en lib/agent.js), en vez de abstenerse se extrae lo que ya
-  // trae el adjunto y se manda la plantilla que corresponda:
+  // A pedido explícito de Alan (2026-09-30, caso real: Salvador Reyes, con PDF
+  // adjunto) y corregido a fondo el 2026-10-07 (caso real: Javier Martínez, que
+  // dio nombre/dirección/CP/RFC por TEXTO, no por adjunto, en el mismo mensaje
+  // donde pidió su factura): antes, esta extracción solo corría si el cliente
+  // había ADJUNTADO algo — un cliente que escribe sus datos fiscales a mano (sin
+  // ninguna foto/PDF) nunca entraba aquí, y como detectsFirstFacturaRequest
+  // también exige ahora que no se descarte por tener datos ya dados (ver su
+  // propio comentario en buildFacturaIntentPrompt, lib/agent.js), ese caso
+  // simplemente nunca recibía ningún mensaje automático ni quedaba bien evaluado.
+  // Ahora se extrae SIEMPRE que se llega hasta aquí (asksForFactura ya es true),
+  // sin importar si los datos vinieron en texto, en adjunto, o en ambos — y se
+  // manda la plantilla que corresponda:
   //   - si no queda NADA pendiente, se deja pasar a revisión humana igual (no hay
   //     nada que automatizar: ya se dio todo, no hace falta pedir nada).
   //   - si falta ALGO pero no todo, se manda el recordatorio dinámico con
   //     exactamente lo que falta (no la plantilla genérica completa).
-  //   - si el adjunto no trajo ningún dato útil (missing === todos los campos),
-  //     se manda la plantilla genérica de siempre, igual que si no hubiera
-  //     adjuntado nada.
+  //   - si no se extrajo ningún dato útil (missing === todos los campos), se
+  //     manda la plantilla genérica de siempre.
   let textToSend = FACTURA_FIRST_CONTACT_TEXT;
   let label = 'Automatización (primer contacto — solicitud de factura)';
   const totalFields = Object.keys(REFACTURA_FIELD_LABELS).length;
-  if (record.messages.some((m) => m.sender === 'cliente' && m.hasAttachment)) {
+  {
     const { data, failed } = await extractRefacturaData(record.messages, token, process.env.GEMINI_API_KEY);
     if (failed) { // Gemini falló: se reintenta en el siguiente ciclo, hasta el tope
       await recordAutomationGeminiFailure('factura-primer-contacto', packId, questionDate);
@@ -2525,12 +2530,12 @@ async function sendFacturaFirstContactForRecord(packId, token, cache) {
   }
 
   // Segunda sincronización, justo antes de mandar: tanto la clasificación de
-  // arriba como la extracción (si hubo adjunto) tardan, y en ese rato el cliente
-  // pudo haber mandado más datos (mismo motivo que el refresco de arriba, ventana
-  // de carrera distinta pero igual de real). Si el hilo cambió desde que se armó
-  // textToSend, se deja pasar sin mandar nada — como todavía no se marca
-  // "handled", el siguiente ciclo lo vuelve a evaluar completo, ya con los
-  // mensajes nuevos adentro.
+  // arriba como la extracción tardan, y en ese rato el cliente pudo haber mandado
+  // más datos (mismo motivo que el refresco de arriba, ventana de carrera
+  // distinta pero igual de real). Si el hilo cambió desde que se armó textToSend,
+  // se deja pasar sin mandar nada — como todavía no se marca "handled", el
+  // siguiente ciclo lo vuelve a evaluar completo, ya con los mensajes nuevos
+  // adentro.
   let freshRecord;
   try {
     freshRecord = await syncPackById(token, packId, cache, record.unreadCount || 0);
@@ -3101,6 +3106,26 @@ app.post('/api/automation/quitar-planificado', async (req, res) => {
       return res.status(400).json({ error: 'Falta packId o categoria' });
     }
     await unmarkPlanned(categoria, packId);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Contraparte de markFacturaFirstContactEvaluated — para corregir a mano una
+// marca de "ya evaluado, no calificaba" que quedó mal puesta por un bug ya
+// corregido (caso real: Javier Martínez, 2026-10-07, evaluado con la versión
+// vieja de detectsFirstFacturaRequest antes de que se corrigiera). Sin esto, el
+// pack se queda saltado para siempre con este mismo mensaje, aunque el código ya
+// esté bien, porque questionDate no cambia solo porque el cliente no vuelva a
+// escribir. No manda ningún mensaje por sí sola — solo deja que el siguiente
+// ciclo normal lo vuelva a evaluar desde cero.
+app.post('/api/automation/quitar-evaluacion-factura', async (req, res) => {
+  if (!checkAutomationSecret(req, res)) return;
+  try {
+    const { packId } = req.body || {};
+    if (!packId) return res.status(400).json({ error: 'Falta packId' });
+    await redis.hdel(AUTOMATION_FACTURA_EVALUATED_KEY, packId);
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
