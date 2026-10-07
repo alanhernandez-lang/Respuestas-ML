@@ -2975,9 +2975,20 @@ async function planRefacturasPendientes() {
   if (process.env.AUTOMATION_ODOO_REFACTURA_ENABLED !== 'true') return;
   const { access_token: token } = await getAccessToken();
   const cache = await loadCache();
+  // A pedido de Alan (2026-10-07, caso real: Componentes Carrillo SA de CV,
+  // Leticia Aguilar ×2, Javier Martínez) — antes esto solo consideraba candidato
+  // un pack si el VENDEDOR ya había pedido los datos fiscales en ese hilo
+  // (vendorAskedFor). Un cliente que da sus datos fiscales completos sin que
+  // nadie se los pidiera primero (p. ej. pidiendo modificar/corregir una factura
+  // ya emitida, adjuntando su constancia directamente) nunca entraba a esta
+  // lista, aunque isRefacturaCandidate (el mismo flag que ya usa el filtro
+  // "Refacturas" del sidebar) sí lo marcara correctamente como candidato. Se
+  // reutiliza ese mismo flag aquí, para que la planificación en Odoo no se le
+  // escape a estos casos solo porque el cliente se adelantó sin que se lo
+  // pidieran.
   const candidates = Object.values(cache.packs)
     .map((p) => p.record)
-    .filter((r) => r && r.status === 'pendiente' && vendorAskedFor(r.messages, REFACTURA_ASK_PATTERNS));
+    .filter((r) => r && r.status === 'pendiente' && r.isRefacturaCandidate);
 
   await mapWithConcurrency(candidates, 2, async (record) => {
     try {
