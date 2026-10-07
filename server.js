@@ -1929,19 +1929,6 @@ async function unmarkPlanned(categoria, packId) {
 const REFACTURA_ASK_PATTERNS = [/uso de cfdi/i, /r[eé]gimen fiscal/i, /raz[oó]n social/i];
 const ENVIO_ACORDADO_ASK_PATTERNS = [/env[ií]o gratis/i, /dirección completa \(calle/i];
 
-// A pedido explícito de Alan (2026-10-07, caso real: Componentes Carrillo SA de
-// CV — pidió "¿me puedes modificar la factura?" con todos los datos fiscales
-// completos en el mismo hilo): planificar en Odoo requiere datos completos, pero
-// eso no basta — modificar/corregir una factura YA EMITIDA es un proceso
-// administrativo distinto (cancelar y reemitir, nota de crédito, etc. según las
-// reglas del SAT) que debe revisar una persona, nunca automatizarse como si fuera
-// una solicitud nueva de refactura. Regex determinístico (no Gemini) porque la
-// señal es un puñado de verbos explícitos, igual de confiable y más barato.
-const REFACTURA_MODIFICATION_PATTERN = /\b(modificar|corregir|cambiar|editar)\b.{0,30}\bfactura|\bfactura\b.{0,30}\b(modificar|corregir|cambiar|editar)/i;
-function clientAsksToModifyFactura(messages) {
-  return (messages || []).some((m) => m.sender === 'cliente' && REFACTURA_MODIFICATION_PATTERN.test(m.text || ''));
-}
-
 // A pedido de Alan (2026-09-22, ajustado el mismo día tras ver un caso real): una
 // vez que el vendedor YA le entregó el PDF de la factura al cliente, esa
 // conversación debe dejar de contar como "refactura pendiente" aunque el cliente
@@ -2997,19 +2984,14 @@ async function planRefacturasPendientes() {
   // mismo flag que ya usa el filtro "Refacturas" del sidebar) sí lo marcara
   // correctamente como candidato. Se reutiliza ese mismo flag aquí, para que la
   // planificación en Odoo no se le escape a estos casos solo porque el cliente
-  // se adelantó sin que se lo pidieran.
-  //
-  // PERO (2026-10-07, mismo caso real: Componentes Carrillo SA de CV pidió
-  // "¿me puedes modificar la factura?" con todos los datos completos) — ampliar
-  // a isRefacturaCandidate sin más estuvo a punto de hacer que esto planificara
-  // y le mandara un mensaje automático de "ya facturamos" a alguien que en
-  // realidad pedía corregir/reemitir una factura YA EMITIDA, un trámite distinto
-  // (cancelación y reemisión, nota de crédito, según reglas del SAT) que necesita
-  // que una persona lo revise, nunca automatizarse como si fuera una refactura
-  // nueva. Se excluyen esos casos con clientAsksToModifyFactura.
+  // se adelantó sin que se lo pidieran. Esto incluye a propósito las solicitudes
+  // de "modifícame/corrígeme la factura" (caso real: Componentes Carrillo SA de
+  // CV, 2026-10-07) — confirmado con Alan que el proceso es el mismo sin
+  // importar si es una factura nueva o una corrección: se piden los mismos datos,
+  // y si ya están completos, se planifica y se manda la misma plantilla.
   const candidates = Object.values(cache.packs)
     .map((p) => p.record)
-    .filter((r) => r && r.status === 'pendiente' && r.isRefacturaCandidate && !clientAsksToModifyFactura(r.messages));
+    .filter((r) => r && r.status === 'pendiente' && r.isRefacturaCandidate);
 
   await mapWithConcurrency(candidates, 2, async (record) => {
     try {
