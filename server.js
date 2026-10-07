@@ -1878,6 +1878,7 @@ app.get('/api/cron/debug-factura-first-contact', async (req, res) => {
         lastQuestionDate: questionDate,
         messageCount: record.messages.length,
         clientHasAttachment: record.messages.some((m) => m.sender === 'cliente' && m.hasAttachment),
+        messages: record.messages.map((m) => ({ sender: m.sender, text: m.text, hasAttachment: m.hasAttachment, date: m.date })),
       },
       checks: {
         clientMentionedFactura: clientMentionedFactura(record.messages),
