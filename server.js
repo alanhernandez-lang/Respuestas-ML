@@ -1260,6 +1260,7 @@ const PUBLIC_PATHS = new Set([
   '/api/cron/fix-numeric-pack-ids',
   '/api/cron/recheck-agreed-shipping-labels',
   '/api/cron/debug-order',
+  '/api/cron/debug-factura-first-contact',
   // Automatización n8n de refacturas/envíos acordados (ver
   // docs/odoo-refacturas-envios-automation-plan.md) — se autentica con CRON_SECRET,
   // mismo patrón que el cron externo, no con una sesión de usuario.
@@ -1842,6 +1843,51 @@ app.get('/api/cron/debug-order', async (req, res) => {
       }
     }
     res.json({ order, shipment, ordersShipments, customShipment, payment });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Endpoint temporal de diagnóstico (2026-10-07, a quitar después) — PURAMENTE DE
+// LECTURA: no manda ningún mensaje, no planifica nada en Odoo, no marca nada como
+// "handled"/"evaluated". Se resincroniza el pack contra Mercado Libre (lo mismo
+// que ya hace el sync normal cada 2 min) y se reporta, sin actuar, exactamente
+// qué condición de sendFacturaFirstContactForRecord está bloqueando el primer
+// contacto automático de factura para un pack puntual — para diagnosticar casos
+// como Javier Martínez (2026-10-07, 2+ horas sin recibir el primer contacto)
+// sin tener que adivinar ni disparar la automatización real para probarla.
+app.get('/api/cron/debug-factura-first-contact', async (req, res) => {
+  const secret = req.query.secret || req.headers['x-cron-secret'];
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { packId } = req.query;
+  if (!packId) return res.status(400).json({ error: 'Falta packId' });
+  try {
+    const { access_token: token } = await getAccessToken();
+    const cache = await loadCache();
+    const record = await syncPackById(token, packId, cache, 0);
+    const questionDate = record.lastQuestion?.date || null;
+    res.json({
+      env: {
+        AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED: process.env.AUTOMATION_FACTURA_FIRST_CONTACT_ENABLED || null,
+      },
+      record: {
+        status: record.status,
+        shippingStatusLabel: record.shippingStatusLabel,
+        lastQuestionDate: questionDate,
+        messageCount: record.messages.length,
+        clientHasAttachment: record.messages.some((m) => m.sender === 'cliente' && m.hasAttachment),
+      },
+      checks: {
+        clientMentionedFactura: clientMentionedFactura(record.messages),
+        vendorAskedForRefacturaPatterns: vendorAskedFor(record.messages, REFACTURA_ASK_PATTERNS),
+        facturaFirstContactStillApplies: facturaFirstContactStillApplies(record),
+        isFacturaFirstContactHandled: await isFacturaFirstContactHandled(packId),
+        facturaFirstContactEvaluatedForThisQuestion: questionDate ? await facturaFirstContactEvaluatedFor(packId, questionDate) : null,
+        geminiBlockedForThisQuestion: questionDate ? await automationGeminiBlocked('factura-primer-contacto', packId, questionDate) : null,
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
