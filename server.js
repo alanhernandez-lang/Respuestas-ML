@@ -1624,24 +1624,44 @@ app.get('/api/cron/backfill-history', async (req, res) => {
 // regenerateDraftInner (que sí ignora el estado "fresco") sobre cada pack pendiente
 // actual, para que el equipo vea el borrador mejorado de inmediato en vez de esperar
 // a que cada cliente vuelva a escribir.
-async function runRegeneratePendingDraftsInner() {
+// `categoria` opcional (2026-10-07, a pedido de Alan: validar el ajuste del
+// prompt de factura sin gastar de más regenerando los ~95 pendientes completos,
+// sobre todo recién salidos del tope de gasto de Gemini) — 'refactura' solo
+// toca packs con isRefacturaCandidate, 'envio_acordado' solo los que muestran
+// "Acordar con el vendedor"; sin categoría, se comporta igual que antes (todos
+// los pendientes).
+async function runRegeneratePendingDraftsInner(categoria) {
   const cache = await loadCache();
-  const pending = Object.values(cache.packs)
+  let pending = Object.values(cache.packs)
     .map((p) => p.record)
     .filter((r) => r.status === 'pendiente');
-  console.log(`[regen-pendientes] ${pending.length} borradores pendientes a regenerar`);
+  if (categoria === 'refactura') {
+    pending = pending.filter((r) => r.isRefacturaCandidate);
+  } else if (categoria === 'envio_acordado') {
+    pending = pending.filter((r) => r.shippingStatusLabel === 'Acordar con el vendedor');
+  }
+  console.log(`[regen-pendientes] ${pending.length} borradores pendientes a regenerar${categoria ? ` (categoria=${categoria})` : ''}`);
   let ok = 0;
   let failed = 0;
+  const changed = [];
   await mapWithConcurrency(pending, 3, async (record) => {
     try {
-      await regenerateDraftInner(record.packId);
+      const previousText = record.draftAnswer?.text || null;
+      const draft = await regenerateDraftInner(record.packId);
       ok++;
+      if (previousText && draft?.text && draft.text !== previousText) {
+        changed.push({ packId: record.packId, buyerName: record.buyerName, orderId: record.orderId });
+      }
     } catch (err) {
       failed++;
       console.warn('[regen-pendientes] error en pack', record.packId, err.message);
     }
   });
-  console.log(`[regen-pendientes] TERMINADO: ${ok} ok, ${failed} con error`);
+  console.log(`[regen-pendientes] TERMINADO: ${ok} ok, ${failed} con error, ${changed.length} cambiaron de texto`);
+  if (changed.length) {
+    console.log(`[regen-pendientes] packs que cambiaron: ${changed.map((c) => `${c.packId} (${c.buyerName}, pedido ${c.orderId})`).join(' | ')}`);
+  }
+  return { total: pending.length, ok, failed, changed };
 }
 
 app.get('/api/cron/regenerate-pending-drafts', async (req, res) => {
@@ -1649,8 +1669,20 @@ app.get('/api/cron/regenerate-pending-drafts', async (req, res) => {
   if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
   }
+  const { categoria, wait } = req.query;
+  // `wait=1` opcional: espera el resultado en vez de solo disparar en segundo
+  // plano — útil para un lote acotado (una categoría) donde sí es práctico
+  // esperar la respuesta con el resumen de qué cambió.
+  if (wait === '1') {
+    try {
+      const result = await runRegeneratePendingDraftsInner(categoria);
+      return res.json(result);
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
   res.json({ started: true }); // puede tardar varios minutos con muchos pendientes — se revisa en logs
-  runRegeneratePendingDraftsInner().catch((err) => console.error('[regen-pendientes] Error general:', err));
+  runRegeneratePendingDraftsInner(categoria).catch((err) => console.error('[regen-pendientes] Error general:', err));
 });
 
 // 2026-09-24, uso puntual: /orders/search devuelve pack_id/id como NÚMERO — antes
