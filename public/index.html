@@ -18,22 +18,46 @@
   <a href="#mainContent" class="skip-link">Saltar al contenido</a>
 
   <header>
-    <div class="brand">
-      <span class="brand-mark">AB</span>
-      <h1>Mensajes post-venta <span class="brand-sep">·</span> Agrobolder</h1>
+    <div class="header-top">
+      <div class="brand">
+        <span class="brand-mark">AB</span>
+        <h1>Mensajes post-venta <span class="brand-sep">·</span> Agrobolder</h1>
+      </div>
+      <nav class="view-switch" aria-label="Vista" role="tablist">
+        <button class="view-tab" id="tabMessages" type="button" role="tab" aria-selected="true" tabindex="0" aria-controls="viewMessages">💬 Mensajes</button>
+        <button class="view-tab" id="tabLog" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="viewLog">📋 Bitácora</button>
+        <button class="view-tab" id="tabBank" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="viewBank">📚 Banco de respuestas</button>
+      </nav>
+      <div class="header-top-actions">
+        <button id="shortcutsBtn" class="icon-btn" type="button" aria-label="Ver atajos de teclado" title="Atajos de teclado (?)">⌨</button>
+        <button id="themeToggle" class="icon-btn" type="button" aria-label="Cambiar a tema oscuro" title="Cambiar tema claro/oscuro">🌙</button>
+        <div class="account-menu-wrap">
+          <button id="accountMenuBtn" class="account-trigger" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Cuenta">
+            <span id="userAvatar" class="avatar" aria-hidden="true"></span>
+          </button>
+          <div id="accountMenu" class="popover account-menu" role="menu" hidden>
+            <p id="userEmail" class="account-menu-email"></p>
+            <a href="/api/auth/logout" class="logout-link account-menu-logout">Cerrar sesión</a>
+          </div>
+        </div>
+      </div>
     </div>
-    <nav class="view-switch" aria-label="Vista" role="tablist">
-      <button class="view-tab" id="tabMessages" type="button" role="tab" aria-selected="true" tabindex="0" aria-controls="viewMessages">💬 Mensajes</button>
-      <button class="view-tab" id="tabLog" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="viewLog">📋 Bitácora</button>
-      <button class="view-tab" id="tabBank" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="viewBank">📚 Banco de respuestas</button>
-    </nav>
-    <div class="toolbar">
-      <button id="syncBtn" type="button">Sincronizar</button>
-      <span id="syncInfo" class="sync-info" role="status" aria-live="polite"></span>
-      <button id="shortcutsBtn" class="icon-btn" type="button" aria-label="Ver atajos de teclado" title="Atajos de teclado (?)">⌨</button>
-      <button id="themeToggle" class="icon-btn" type="button" aria-label="Cambiar a tema oscuro" title="Cambiar tema claro/oscuro">🌙</button>
-      <span id="userEmail" class="user-email"></span>
-      <a href="/api/auth/logout" class="logout-link">Cerrar sesión</a>
+    <div class="header-actions">
+      <div class="header-actions-inner">
+        <div class="sync-group">
+          <button id="syncBtn" type="button">🔄 Sincronizar</button>
+          <div class="sync-status">
+            <span id="syncInfo" class="sync-info" role="status" aria-live="polite"></span>
+            <span id="syncWarning" class="sync-warning" role="status" hidden></span>
+          </div>
+        </div>
+        <div class="header-filters">
+          <div id="statusCounts" class="status-counts" role="group" aria-label="Filtrar por estado"></div>
+          <span class="chip-divider" aria-hidden="true"></span>
+          <div id="categoryCounts" class="status-counts category-counts" role="group" aria-label="Filtrar por categoría"></div>
+        </div>
+        <button id="regenPendingBtn" type="button" class="btn-secondary" title="Vuelve a generar el borrador de TODAS las conversaciones pendientes con el prompt más reciente del agente de IA">✨ Regenerar pendientes</button>
+      </div>
     </div>
   </header>
 
@@ -41,19 +65,21 @@
     <div id="viewMessages" class="chat-layout" role="tabpanel" aria-labelledby="tabMessages">
       <aside class="chat-sidebar">
         <div class="sidebar-toolbar">
-          <label for="search" class="visually-hidden">Buscar cliente o producto</label>
-          <input id="search" type="search" placeholder="Buscar cliente o producto... (/)" />
-          <div class="sidebar-controls">
-            <label for="sortMode" class="visually-hidden">Ordenar conversaciones</label>
-            <select id="sortMode" title="Ordenar conversaciones">
-              <option value="reciente">Más recientes</option>
-              <option value="urgencia">Más urgentes</option>
-            </select>
-            <button id="flagFilterBtn" class="chip-toggle" type="button" aria-pressed="false">⭐ Marcados (0)</button>
-            <button id="readFilterBtn" class="chip-toggle" type="button" aria-pressed="false" title="Filtrar por leído/no leído en Mercado Libre, dentro de lo que ya estés viendo (Pendientes, Mediación, etc.)">☰ Todos</button>
+          <div class="sidebar-search-row">
+            <label for="search" class="visually-hidden">Buscar cliente o producto</label>
+            <input id="search" type="search" placeholder="Buscar cliente o producto... (/)" />
+            <button id="filtersMenuBtn" class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Más filtros: ordenar, marcados y leído/no leído" title="Más filtros">⋯</button>
+            <div id="filtersMenu" class="popover filters-menu" role="menu" hidden>
+              <label for="sortMode" class="filters-menu-label">Ordenar</label>
+              <select id="sortMode" title="Ordenar conversaciones">
+                <option value="reciente">Más recientes</option>
+                <option value="urgencia">Más urgentes</option>
+              </select>
+              <button id="flagFilterBtn" class="chip-toggle filters-menu-toggle" type="button" aria-pressed="false">⭐ Marcados (0)</button>
+              <button id="readFilterBtn" class="chip-toggle filters-menu-toggle" type="button" aria-pressed="false" title="Filtrar por leído/no leído en Mercado Libre, dentro de lo que ya estés viendo (Pendientes, Mediación, etc.)">☰ Todos</button>
+            </div>
           </div>
         </div>
-        <div id="statusCounts" class="status-counts" role="group" aria-label="Filtrar por estado"></div>
         <div id="conversationList" class="conversation-list"></div>
         <p id="emptyState" class="empty-state" hidden><span class="empty-state-icon" aria-hidden="true">📭</span>No hay conversaciones. Presiona "Sincronizar" para traerlas de Mercado Libre.</p>
       </aside>

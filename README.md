@@ -27,15 +27,18 @@ En la pestaña **"Borradores IA"** se muestra, para cada pregunta pendiente, una
 respuesta sugerida generada por Google Gemini a partir del historial de la
 conversación — incluyendo las fotos que haya mandado el cliente (el agente las
 descarga de Mercado Libre y las analiza, hasta las últimas 4 más recientes por
-borrador). **El agente nunca publica nada en Mercado Libre** — solo la ves ahí,
-la copias con el botón "Copiar" y la pegas tú mismo donde corresponda si te
-convence. Puedes pedir otra sugerencia con "Regenerar".
+borrador). Puedes editar el borrador, pedir otra sugerencia con "Regenerar", o
+hacer clic en **"Publicar ↗"** para mandarlo de verdad a Mercado Libre — el botón
+llama directo a la API de ML, no es una simulación. El agente nunca publica por su
+cuenta: siempre requiere que una persona del equipo lo dispare (con la única
+excepción del recordatorio mecánico de datos faltantes, ver
+`docs/arquitectura-y-operacion.md`).
 
 Para activarlo, agrega tu API key de Google AI Studio en `.env`:
 
 ```
 GEMINI_API_KEY=tu_api_key
-GEMINI_MODEL=gemini-2.5-flash   # opcional, puedes cambiar el modelo
+GEMINI_MODEL=gemini-3.1-flash-lite   # opcional, puedes cambiar el modelo
 ```
 
 Si dejas `GEMINI_API_KEY` vacío, el resto de la app (sync y visor de mensajes)
